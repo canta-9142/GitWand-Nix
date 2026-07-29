@@ -3,6 +3,8 @@
   appimageTools,
   fetchurl,
   nix-update-script,
+  makeWrapper,
+  wayland,
 }:
 
 let
@@ -25,6 +27,11 @@ appimageTools.wrapType2 {
     git
     openssh
     libsecret
+    wayland
+  ];
+
+  nativeBuildInputs = [
+    makeWrapper
   ];
 
   extraInstallCommands = ''
@@ -36,12 +43,12 @@ appimageTools.wrapType2 {
         -quit
     )"
 
-    if [ -n "$desktop_file ]; then
+    if [ -n "$desktop_file" ]; then
       install -Dm444 \
         "$desktop_file" \
         "$out/share/applications/gitwand.desktop"
-      
-      subtituteInPlace "$out/share/applications/gitwand.desktop" \
+
+      substituteInPlace "$out/share/applications/gitwand.desktop" \
         --replace-warn "Exec=AppRun" "Exec=gitwand" \
         --replace-warn "Exec=gitwand-desktop" "Exec=gitwand"
     fi
@@ -50,6 +57,11 @@ appimageTools.wrapType2 {
       mkdir -p "$out/share"
       cp -r "${appimageContents}/usr/share/icons" "$out/share/"
     fi
+
+    wrapProgram "$out/bin/gitwand" \
+      --prefix LD_PRELOAD : "${lib.getLib wayland}/lib/libwayland-client.so.0" \
+      --set-default WEBLIT_DISABLE_DMABUF_RENDERER 1 \
+      --set-default WEBLIT_DISABLE_COMPOSITING_MODE 1
   '';
 
   passthru.updateScript = nix-update-script { };
@@ -58,7 +70,7 @@ appimageTools.wrapType2 {
     description = "Native Git client with smart confilict resorution";
     homepage = "https://github.com/devlint/GitWand";
     changelog = "https://github.com/devlint/GitWand/releases/tag/v${version}";
-    license = lib.license.mit;
+    license = lib.licenses.mit;
     mainProgram = "gitwand";
     platforms = [ "x86_64-linux" ];
     sourceProvenance = with lib.sourceTypes; [
