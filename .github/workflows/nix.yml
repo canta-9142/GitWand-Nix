@@ -1,0 +1,28 @@
+name: Nix
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+    
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+    
+      - name: Check flake
+        run: nix flake check --print-build-logs
+    
+      - name: Build GitWand
+        run: nix build .#gitwand --print-build-logs
