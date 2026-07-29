@@ -66,3 +66,6 @@ website/.vitepress/.temp
 
 .gitwandrc
 visibility-pack/
+
+# Nix
+result/
