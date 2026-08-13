@@ -1,0 +1,78 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream/main into a pull request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream changes
+        env:
+          UPSTREAM_URL: https://github.com/devlint/GitWand.git
+          SYNC_BRANCH: sync/upstream-main
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+
+          git switch -C "$SYNC_BRANCH" origin/main
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort
+            echo "::error::upstream/main conflicts with this fork and must be merged manually."
+            exit 1
+          fi
+
+          git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_BRANCH: sync/upstream-main
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            exit 0
+          fi
+
+          if gh pr list \
+            --head "$SYNC_BRANCH" \
+            --base main \
+            --state open \
+            --json number \
+            --jq 'length > 0' | grep -qx true; then
+            echo "An upstream sync pull request is already open."
+            exit 0
+          fi
+
+          gh pr create \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --title "chore: sync changes from upstream" \
+            --body "Automated merge of the latest changes from [devlint/GitWand](https://github.com/devlint/GitWand)."
