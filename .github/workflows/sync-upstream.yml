@@ -53,6 +53,7 @@ jobs:
       - name: Open pull request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           SYNC_BRANCH: sync/upstream-main
         run: |
           set -euo pipefail
