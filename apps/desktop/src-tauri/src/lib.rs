@@ -214,7 +214,7 @@ pub fn git_log_parity(
 }
 
 pub fn git_branches_parity(cwd: String) -> Result<Vec<types::GitBranch>, String> {
-    tauri::async_runtime::block_on(commands::ops::git_branches(cwd))
+    tauri::async_runtime::block_on(commands::ops::git_branches(cwd, None))
 }
 
 pub fn git_stash_list_parity(cwd: String) -> Result<Vec<types::StashEntry>, String> {
@@ -283,6 +283,43 @@ fn get_or_create_install_id() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // On some Linux setups (VMs, older Mesa drivers, missing GPU passthrough)
+    // WebKitGTK fails to create a hardware-accelerated EGL context and
+    // aborts the whole process with `Could not create default EGL display:
+    // EGL_BAD_PARAMETER. Aborting...` before any window is ever shown —
+    // reported as a terminal-visible abort on Ubuntu 26.04 (#135) and as a
+    // silent "app won't open" when launched from a .deb-installed GUI
+    // launcher on Linux Mint 22 (#139). These env vars must be set before
+    // the webview is created (WebKitGTK reads them at that point), so this
+    // has to run before `tauri::Builder::default()...run(...)` below.
+    // Forcing software rendering here lets the app degrade gracefully
+    // instead of aborting. No-op on macOS/Windows.
+    #[cfg(target_os = "linux")]
+    {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // #135 follow-up: the two vars above only steer WebKitGTK's compositing
+        // path, not EGL *display acquisition* itself — force Mesa's software
+        // rasterizer as a broader fallback for systems where EGL_BAD_PARAMETER
+        // originates earlier (e.g. native Wayland/Gnome). Never override a value
+        // the user or environment already set deliberately.
+        if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+        // #135 follow-up 2: LIBGL_ALWAYS_SOFTWARE forces the GL renderer once an
+        // EGL context exists, but doesn't help when the failure happens earlier,
+        // at EGL *platform display* acquisition under native Wayland. Confirmed
+        // via `ldd` from an affected user that this isn't an AppImage-bundled-library
+        // issue (EGL/GL/Mesa all resolved to the host system, not the bundle) but a
+        // genuine native-Wayland EGL negotiation failure. Forcing GTK onto XWayland
+        // sidesteps that negotiation entirely, at the cost of native Wayland's
+        // fractional scaling and lower input latency. Never override a value the
+        // user or environment already set deliberately.
+        if std::env::var("GDK_BACKEND").is_err() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+    }
+
     // macOS GUI apps launched from Finder/Dock get a minimal launchd env
     // (no SSH_AUTH_SOCK, GH_TOKEN, XDG_*, or anything from ~/.zshrc).
     // Subprocess like `gh`, `claude`, `codex` then hang on auth/network

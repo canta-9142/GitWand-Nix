@@ -896,16 +896,24 @@ export async function gitPush(
 export type PullStrategy = "merge" | "rebase" | "ff-only";
 
 /**
- * Pull from remote with an explicit strategy.
+ * Pull from remote with an explicit strategy. `autostash` parks any dirty
+ * working-tree changes for the duration of the pull via `git --autostash` —
+ * git itself (not GitWand) re-applies them afterward, including after a
+ * `rebase --continue` / `merge --continue` / `--abort` if the pull stopped
+ * mid-operation.
  */
-export async function gitPull(cwd: string, strategy: PullStrategy = "merge"): Promise<GitPushPullResult> {
+export async function gitPull(
+  cwd: string,
+  strategy: PullStrategy = "merge",
+  autostash: boolean = false,
+): Promise<GitPushPullResult> {
   if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_pull", { cwd, strategy }, IPC_TIMEOUT.NETWORK);
+    return tauriInvoke<GitPushPullResult>("git_pull", { cwd, strategy, autostash }, IPC_TIMEOUT.NETWORK);
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-pull`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, strategy }),
+    body: JSON.stringify({ cwd, strategy, autostash }),
   });
   return res.json();
 }
@@ -1304,8 +1312,14 @@ export interface GitBranch {
 
 /**
  * List all branches (local + remote).
+ *
+ * `defaultBranch` (Settings > Git > Default Branch, from `useSettings`) is
+ * tried first when resolving the repo's mainline for ahead/behind counts,
+ * before the `main`/`master`/`origin/main`/`origin/master` fallback chain
+ * (#136 — repos whose mainline is e.g. `develop`/`trunk` used to make this
+ * command fail outright with `fatal: failed to find 'main'`).
  */
-export async function getGitBranches(cwd: string): Promise<GitBranch[]> {
+export async function getGitBranches(cwd: string, defaultBranch?: string): Promise<GitBranch[]> {
   if (isTauri()) {
     const raw = await tauriInvoke<
       Array<{
@@ -1319,7 +1333,7 @@ export async function getGitBranches(cwd: string): Promise<GitBranch[]> {
         last_commit: string;
         last_commit_date: string;
       }>
-    >("git_branches", { cwd });
+    >("git_branches", { cwd, defaultBranch: defaultBranch ?? null });
 
     return raw.map((b) => ({
       name: b.name,
@@ -1334,7 +1348,9 @@ export async function getGitBranches(cwd: string): Promise<GitBranch[]> {
     }));
   }
 
-  const res = await devFetch(`${DEV_SERVER}/api/git-branches?cwd=${encodeURIComponent(cwd)}`);
+  const params = new URLSearchParams({ cwd });
+  if (defaultBranch) params.set("defaultBranch", defaultBranch);
+  const res = await devFetch(`${DEV_SERVER}/api/git-branches?${params.toString()}`);
   if (!res.ok) throw new Error(`Failed to get branches: ${res.status}`);
   return res.json();
 }
@@ -1995,21 +2011,27 @@ export interface BranchTopAuthor {
  * Top contributor (most commits) for each given branch. Powers the
  * per-branch contributor avatar in the branch picker. Branches with no
  * resolvable author are omitted from the result.
+ *
+ * `defaultBranch` (Settings > Git > Default Branch) is tried first when
+ * resolving the mainline used as the base of each `<base>..<branch>` range
+ * (#136).
  */
 export async function getGitBranchTopAuthors(
   cwd: string,
   branches: string[],
+  defaultBranch?: string,
 ): Promise<BranchTopAuthor[]> {
   if (branches.length === 0) return [];
   if (isTauri()) {
     return await tauriInvoke<BranchTopAuthor[]>("git_branch_top_authors", {
       cwd,
       branches,
+      defaultBranch: defaultBranch ?? null,
     });
   }
-  const res = await fetch(
-    `${DEV_SERVER}/api/git-branch-top-authors?cwd=${encodeURIComponent(cwd)}&branches=${encodeURIComponent(branches.join(","))}`,
-  );
+  const params = new URLSearchParams({ cwd, branches: branches.join(",") });
+  if (defaultBranch) params.set("defaultBranch", defaultBranch);
+  const res = await fetch(`${DEV_SERVER}/api/git-branch-top-authors?${params.toString()}`);
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(body.error ?? `git branch top authors failed: ${res.status}`);
@@ -3628,13 +3650,16 @@ export async function mcpUninstallServer(
  * Return the names of local branches that are fully merged into the repo's
  * default branch (equivalent to `git branch --merged <default>`), excluding
  * the current branch and the default branch itself.
+ *
+ * `defaultBranch` (Settings > Git > Default Branch) is tried first when
+ * resolving which branch counts as "default" (#136).
  */
-export async function gitBranchMerged(cwd: string): Promise<string[]> {
-  if (isTauri()) return tauriInvoke<string[]>("git_branch_merged", { cwd });
+export async function gitBranchMerged(cwd: string, defaultBranch?: string): Promise<string[]> {
+  if (isTauri()) return tauriInvoke<string[]>("git_branch_merged", { cwd, defaultBranch: defaultBranch ?? null });
   const res = await devFetch(`${DEV_SERVER}/api/git-branch-merged`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd }),
+    body: JSON.stringify({ cwd, defaultBranch: defaultBranch ?? null }),
   });
   if (!res.ok) throw new Error("git_branch_merged failed");
   return res.json();
