@@ -3,22 +3,42 @@
 //! Wraps the official `glab` CLI (gitlab.com/gitlab-org/cli) for MR workflows:
 //! list, create, checkout, merge, diff, pipelines, notes, approvals.
 //!
-//! **Auth**: managed by `glab auth login` — the PAT is stored in glab's own
-//! config (`~/.config/glab-cli/config.yml`). GitWand never touches the token
-//! directly; `glab` handles all credential lookup.
+//! **Auth**: managed by `glab auth login` — the PAT is normally stored in
+//! glab's own config (`~/.config/glab-cli/config.yml`) and `glab` handles
+//! credential lookup itself. Exception: `--use-keyring` mode stores the PAT
+//! in the macOS keychain instead, which hangs when `glab` is spawned from a
+//! signed Tauri app (same ACL mismatch as the `gh` keychain issue, #149) —
+//! `shell_env.rs` preloads a `GITLAB_TOKEN` env var at startup to make
+//! `hidden_cmd` bypass that path, same as it already does for `gh`.
 //!
 //! **Project resolution**: `glab api` substitutes `:fullpath` with the
 //! URL-encoded `namespace%2Frepo` of the repo in `cwd`, so we never need to
 //! hard-code project IDs in endpoint strings.
 //!
-//! **Pattern**: mirrors `commands/gh.rs` exactly — every command is a thin
-//! synchronous `hidden_cmd("glab")` wrapper with JSON parsing. No new HTTP
-//! or async dependencies required.
+//! **Pattern**: every command delegates its blocking `hidden_cmd("glab")`
+//! work to a private sync `_inner` fn run via `tauri::async_runtime::spawn_blocking`
+//! (matching `commands/gh.rs`, see its `gh.rs:16-21`) so a slow `glab` never
+//! parks a Tokio worker thread. The primary invocation of each command is
+//! further bounded by `output_with_timeout` (`GLAB_TIMEOUT` = 20s, under the
+//! frontend's 30s IPC timeout) so a hung subprocess is killed rather than
+//! orphaned (#149).
 
-use crate::git::hidden_cmd;
+use crate::git::{hidden_cmd, output_with_timeout};
 use crate::types::*;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// Timeout for the primary `glab` invocation of a command (#149). Chosen to
+/// leave headroom under the frontend's 30s IPC race (`backend-core.ts`
+/// `IPC_TIMEOUT.DEFAULT`) so the Rust "timed out" error surfaces instead of
+/// the frontend's generic "IPC timeout after 30000ms" message.
+const GLAB_TIMEOUT: Duration = Duration::from_secs(20);
+/// Timeout for best-effort `glab api` helpers (`gl_pipeline_rollup`,
+/// `glab_api_json`) — these already degrade gracefully on any error.
+const GLAB_API_TIMEOUT: Duration = Duration::from_secs(5);
+/// Overall wall-clock budget for the per-MR pipeline fan-out in `gl_list_mrs`.
+const ROLLUP_BUDGET: Duration = Duration::from_secs(5);
 
 // ─── JSON field helpers ────────────────────────────────────────────────────────
 
@@ -86,6 +106,23 @@ fn gl_state(state: &str) -> String {
     }
 }
 
+/// Map our canonical MR state ("opened"/"closed"/"merged"/"all") to the
+/// corresponding `glab mr list` boolean flag.
+///
+/// Unlike `gh`, `glab mr list` has no generic `--state <value>` flag — it
+/// exposes one boolean flag per state (`--opened` is the CLI's own default,
+/// plus `--closed` / `--merged` / `--all`). Passing `--state <value>` (the
+/// `gh` convention) is rejected by `glab` with "Unknown flag: --state"
+/// (issue #138).
+fn gl_state_flag(state: &str) -> &'static str {
+    match state {
+        "closed" => "--closed",
+        "merged" => "--merged",
+        "all" => "--all",
+        _ => "--opened",
+    }
+}
+
 // ─── MR → PullRequest mapping ─────────────────────────────────────────────────
 
 /// Map a GitLab MR JSON object to a PullRequest.
@@ -130,6 +167,39 @@ fn gl_mr_to_pr(mr: &serde_json::Value) -> PullRequest {
     }
 }
 
+/// Map GitLab's merge-status fields to our canonical MERGEABLE / CONFLICTING
+/// / UNKNOWN (#161).
+///
+/// `merge_status` was deprecated in GitLab 15.6 in favor of
+/// `detailed_merge_status`: the old field is binary in practice (only
+/// `can_be_merged` means yes), lumping every other reason a merge might be
+/// blocked — CI still running, approvals pending, unresolved discussions —
+/// together with "not yet computed" (`unchecked`, `checking`). Treating all
+/// of those as `CONFLICTING` (the previous mapping) put a false-positive
+/// merge-conflict warning on almost every MR, since `unchecked` is the
+/// common resting state until something triggers a recheck. Only an actual
+/// `conflict` (or the legacy `cannot_be_merged*` values when
+/// `detailed_merge_status` isn't present) is a real conflict; anything else
+/// maps to `UNKNOWN`, which the frontend already renders as a neutral dash
+/// rather than a warning (see `isMergeConflict` in `usePrPanel.ts`).
+fn gl_mergeable_state(mr: &serde_json::Value) -> String {
+    let detailed = js(mr, "detailed_merge_status");
+    if !detailed.is_empty() {
+        return match detailed.as_str() {
+            "mergeable" => "MERGEABLE",
+            "conflict" => "CONFLICTING",
+            _ => "UNKNOWN",
+        }
+        .to_string();
+    }
+    match js(mr, "merge_status").as_str() {
+        "can_be_merged" => "MERGEABLE",
+        "cannot_be_merged" | "cannot_be_merged_recheck" => "CONFLICTING",
+        _ => "UNKNOWN",
+    }
+    .to_string()
+}
+
 /// Map a GitLab MR JSON object to a PullRequestDetail (richer fields).
 fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
     let state = js(mr, "state");
@@ -154,12 +224,7 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
         })
         .unwrap_or(0);
 
-    let mergeable = if js(mr, "merge_status") == "can_be_merged" {
-        "MERGEABLE"
-    } else {
-        "CONFLICTING"
-    }
-    .to_string();
+    let mergeable = gl_mergeable_state(mr);
 
     PullRequestDetail {
         number: ji(mr, "iid"),
@@ -200,46 +265,57 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
 // ─── Tauri commands ────────────────────────────────────────────────────────────
 
 /// Detect if `glab` CLI is installed and accessible.
-#[tauri::command]
-pub(crate) async fn detect_glab(cwd: String) -> bool {
-    hidden_cmd("glab")
-        .arg("--version")
-        .current_dir(&cwd)
-        .output()
+///
+/// Short timeout (`GLAB_API_TIMEOUT`, 5s): this is a `--version` probe on the
+/// repo-open path, and a 20s hang here would stall forge detection for every
+/// panel.
+fn detect_glab_inner(cwd: String) -> bool {
+    let mut cmd = hidden_cmd("glab");
+    cmd.arg("--version").current_dir(&cwd);
+    output_with_timeout(cmd, GLAB_API_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[tauri::command]
+pub(crate) async fn detect_glab(cwd: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || detect_glab_inner(cwd))
+        .await
+        .unwrap_or(false)
+}
+
+/// `--per-page` value for a `limit`/`offset` window, clamped to GitLab's
+/// 100-per-page ceiling (#161) — see `gl_mr_list_per_page_tests` above for
+/// the background-prefetch failure this fixes.
+fn gl_mr_list_per_page(limit: Option<i64>, offset: Option<i64>) -> i64 {
+    let page = limit.unwrap_or(10).max(1);
+    let off = offset.unwrap_or(0).max(0);
+    (page + off).min(100)
 }
 
 /// List merge requests using `glab mr list`.
 ///
 /// `state` accepts "opened" (default), "closed", "merged", "all".
 /// Pagination: naïve slice — glab doesn't support cursor pagination via CLI.
-#[tauri::command]
-pub(crate) async fn gl_list_mrs(
+fn gl_list_mrs_inner(
     cwd: String,
     state: String,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<PullRequest>, String> {
-    let st = match state.as_str() {
-        "closed" => "closed",
-        "merged" => "merged",
-        "all" => "all",
-        _ => "opened",
-    };
-    let page = limit.unwrap_or(10).max(1);
+    let flag = gl_state_flag(&state);
     let off = offset.unwrap_or(0).max(0);
-    let total = (page + off).to_string();
+    let total = gl_mr_list_per_page(limit, offset).to_string();
 
-    let output = hidden_cmd("glab")
-        .args([
-            "mr", "list",
-            "--state", st,
-            "--per-page", &total,
-            "--output", "json",
-        ])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args([
+        "mr", "list",
+        flag,
+        "--per-page", &total,
+        "--output", "json",
+    ])
+    .current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("Failed to run glab mr list (is glab installed?): {}", e))?;
 
     if !output.status.success() {
@@ -274,12 +350,17 @@ pub(crate) async fn gl_list_mrs(
             Some((iid, status))
         })
         .collect();
+    // Overall wall-clock budget for the fan-out, not just a per-call cap:
+    // rollups are already best-effort (empty on any error), so degrading to
+    // "no CI dot" past the deadline is a behavior the code already supports.
+    let rollup_deadline = Instant::now() + ROLLUP_BUDGET;
     let rollups: HashMap<i64, String> = mrs
         .par_iter()
         .filter_map(|mr| {
             let rollup = match embedded.get(&mr.number) {
                 Some(s) => gl_status_to_rollup(s),
-                None => gl_pipeline_rollup(&cwd, mr.number),
+                None if Instant::now() < rollup_deadline => gl_pipeline_rollup(&cwd, mr.number),
+                None => String::new(),
             };
             if rollup.is_empty() { None } else { Some((mr.number, rollup)) }
         })
@@ -293,22 +374,90 @@ pub(crate) async fn gl_list_mrs(
     Ok(mrs)
 }
 
-/// Count MRs. Fetches up to 100 via list endpoint (GitLab REST has no free totalCount).
-///
-/// Returns 0 on non-fatal errors so the Launchpad badge can still render.
 #[tauri::command]
-pub(crate) async fn gl_mr_count(cwd: String, state: String) -> Result<i64, String> {
-    let st = match state.as_str() {
+pub(crate) async fn gl_list_mrs(
+    cwd: String,
+    state: String,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<PullRequest>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_list_mrs_inner(cwd, state, limit, offset))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Map our canonical state to the GitLab REST `state` query value used by
+/// `gl_mr_count_inner`'s `X-Total` lookup (distinct from `gl_state_flag`,
+/// which returns a `glab mr list` CLI flag, not a query string value).
+fn gl_state_query(state: &str) -> &'static str {
+    match state {
         "closed" => "closed",
         "merged" => "merged",
         "all" => "all",
         _ => "opened",
+    }
+}
+
+/// Parse the `X-Total` value out of `glab api --include`'s curl-style
+/// "headers, blank line, body" output. Header name match is case-insensitive
+/// and tolerant of `\r\n` line endings; stops scanning at the first blank
+/// line (end of headers) so it never accidentally matches something in the
+/// JSON body.
+fn gl_parse_x_total(output: &str) -> Option<i64> {
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        // The status line ("HTTP/2 200") has no colon — skip it rather than
+        // bailing out of the whole scan via `?`.
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("x-total") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Count MRs.
+///
+/// Prefers the REST list endpoint's `X-Total` response header (GitLab's
+/// standard offset-pagination total, exposed via `glab api --include`) — a
+/// single cheap `per_page=1` call regardless of how many MRs actually exist.
+/// Falls back to fetching up to 100 via `glab mr list` and counting the
+/// array (the old behavior, silently capped at 100) only if the header is
+/// ever absent, e.g. an old self-hosted GitLab or a project forced onto
+/// keyset-only pagination (#161 — the old approach was the *only* path and
+/// capped every repo with over 100 open MRs at exactly 100).
+///
+/// Returns 0 on non-fatal errors so the Launchpad badge can still render.
+fn gl_mr_count_inner(cwd: String, state: String) -> Result<i64, String> {
+    let endpoint = format!(
+        "projects/:fullpath/merge_requests?state={}&per_page=1",
+        gl_state_query(&state)
+    );
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "--include", &endpoint]).current_dir(&cwd);
+    if let Ok(output) = output_with_timeout(cmd, GLAB_TIMEOUT) {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(total) = gl_parse_x_total(&stdout) {
+                return Ok(total);
+            }
+        }
+    }
+
+    // Fallback: no X-Total header available.
+    let flag = gl_state_flag(&state);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["mr", "list", flag, "--per-page", "100", "--output", "json"])
+        .current_dir(&cwd);
+    let output = match output_with_timeout(cmd, GLAB_TIMEOUT) {
+        Ok(o) => o,
+        Err(_) => return Ok(0),
     };
-    let output = hidden_cmd("glab")
-        .args(["mr", "list", "--state", st, "--per-page", "100", "--output", "json"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr count: {}", e))?;
 
     if !output.status.success() {
         return Ok(0);
@@ -320,14 +469,19 @@ pub(crate) async fn gl_mr_count(cwd: String, state: String) -> Result<i64, Strin
     Ok(arr.as_array().map(|a| a.len() as i64).unwrap_or(0))
 }
 
-/// Get detailed MR info using `glab mr view`.
 #[tauri::command]
-pub(crate) async fn gl_get_mr(cwd: String, iid: i64) -> Result<PullRequestDetail, String> {
-    let output = hidden_cmd("glab")
-        .args(["mr", "view", &iid.to_string(), "--output", "json"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr view: {}", e))?;
+pub(crate) async fn gl_mr_count(cwd: String, state: String) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_count_inner(cwd, state))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Get detailed MR info using `glab mr view`.
+fn gl_get_mr_inner(cwd: String, iid: i64) -> Result<PullRequestDetail, String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["mr", "view", &iid.to_string(), "--output", "json"])
+        .current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab mr view: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -353,20 +507,75 @@ pub(crate) async fn gl_get_mr(cwd: String, iid: i64) -> Result<PullRequestDetail
     } else {
         gl_status_to_rollup(&embedded)
     };
+    // GitLab's MR resource carries no line-level stats (#161 — `diff_stats`
+    // read by `gl_mr_to_detail` never exists on a real GitLab payload, so it
+    // always fell through to 0/0). One extra call, only on the detail path.
+    let (additions, deletions) = gl_mr_diff_stats(&cwd, iid);
+    detail.additions = additions;
+    detail.deletions = deletions;
     Ok(detail)
+}
+
+/// Sum real `+`/`-` line counts out of each file's unified-diff hunk text,
+/// as returned by the `/merge_requests/:iid/diffs` endpoint (#161). File
+/// header lines (`--- a/...`, `+++ b/...`) are skipped so they're never
+/// miscounted as a deletion/addition of their own.
+fn gl_diff_stats_from_files(files: &[serde_json::Value]) -> (i64, i64) {
+    let mut additions = 0i64;
+    let mut deletions = 0i64;
+    for f in files {
+        let diff = f.get("diff").and_then(|d| d.as_str()).unwrap_or("");
+        for line in diff.lines() {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            if line.starts_with('+') {
+                additions += 1;
+            } else if line.starts_with('-') {
+                deletions += 1;
+            }
+        }
+    }
+    (additions, deletions)
+}
+
+/// Fetch a MR's diffs and reduce them to (additions, deletions). Best-effort
+/// — (0, 0) on any error, same non-fatal pattern as `gl_pipeline_rollup`,
+/// since a stats miss shouldn't block the rest of the MR detail from
+/// rendering.
+fn gl_mr_diff_stats(cwd: &str, iid: i64) -> (i64, i64) {
+    let endpoint = format!("projects/:fullpath/merge_requests/{}/diffs?per_page=100", iid);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(cwd);
+    let out = match output_with_timeout(cmd, GLAB_API_TIMEOUT) {
+        Ok(o) if o.status.success() => o,
+        _ => return (0, 0),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or(serde_json::Value::Array(vec![]));
+    match v.as_array() {
+        Some(files) => gl_diff_stats_from_files(files),
+        None => (0, 0),
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn gl_get_mr(cwd: String, iid: i64) -> Result<PullRequestDetail, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_get_mr_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Get a MR's diff refs (F1, v3.6.0) — `base_sha`/`start_sha`/`head_sha`,
 /// required to correctly anchor inline discussion comments (old/new-side
 /// positioning) via the Discussions API. Same `glab mr view --output json`
 /// fetch pattern as `gl_mr_to_detail`.
-#[tauri::command]
-pub(crate) async fn gl_mr_diff_refs(cwd: String, iid: i64) -> Result<MrDiffRefs, String> {
-    let output = hidden_cmd("glab")
-        .args(["mr", "view", &iid.to_string(), "--output", "json"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr view: {}", e))?;
+fn gl_mr_diff_refs_inner(cwd: String, iid: i64) -> Result<MrDiffRefs, String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["mr", "view", &iid.to_string(), "--output", "json"])
+        .current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab mr view: {}", e))?;
     if !output.status.success() {
         return Err(format!(
             "glab mr view failed: {}",
@@ -387,14 +596,30 @@ pub(crate) async fn gl_mr_diff_refs(cwd: String, iid: i64) -> Result<MrDiffRefs,
     })
 }
 
-/// Get the unified diff of a MR using `glab mr diff`.
 #[tauri::command]
-pub(crate) async fn gl_mr_diff(cwd: String, iid: i64) -> Result<String, String> {
-    let output = hidden_cmd("glab")
-        .args(["mr", "diff", &iid.to_string()])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr diff: {}", e))?;
+pub(crate) async fn gl_mr_diff_refs(cwd: String, iid: i64) -> Result<MrDiffRefs, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_diff_refs_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Build the `glab mr diff` argument list (#161).
+///
+/// `--raw` is required: `glab`'s default (non-raw) diff output is a
+/// decorated/summarized rendering, not the git-compatible unified-diff
+/// format (`diff --git a/... b/...` headers) the frontend's
+/// `indexDiffFiles`/`parseFileDiff` parsers expect. Without it, those
+/// parsers silently see zero files — no error, just an empty result — and
+/// the UI renders "no diff available" regardless of what the MR contains.
+fn gl_mr_diff_args(iid: i64) -> Vec<String> {
+    vec!["mr".to_string(), "diff".to_string(), iid.to_string(), "--raw".to_string()]
+}
+
+/// Get the unified diff of a MR using `glab mr diff`.
+fn gl_mr_diff_inner(cwd: String, iid: i64) -> Result<String, String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(gl_mr_diff_args(iid)).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab mr diff: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -406,20 +631,25 @@ pub(crate) async fn gl_mr_diff(cwd: String, iid: i64) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_mr_diff(cwd: String, iid: i64) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_diff_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Get CI pipeline status for a MR using `glab api`.
 ///
 /// Returns the most-recent pipeline as a single-entry list (GitLab only has
 /// one "active" pipeline per MR at a time). Each job maps to a CICheck entry.
-#[tauri::command]
-pub(crate) async fn gl_mr_pipelines(cwd: String, iid: i64) -> Result<Vec<CICheck>, String> {
+fn gl_mr_pipelines_inner(cwd: String, iid: i64) -> Result<Vec<CICheck>, String> {
     let endpoint = format!(
         "projects/:fullpath/merge_requests/{}/pipelines",
         iid
     );
-    let output = hidden_cmd("glab")
-        .args(["api", &endpoint])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab api pipelines: {}", e))?;
 
     if !output.status.success() {
@@ -460,6 +690,13 @@ pub(crate) async fn gl_mr_pipelines(cwd: String, iid: i64) -> Result<Vec<CICheck
         .collect())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_mr_pipelines(cwd: String, iid: i64) -> Result<Vec<CICheck>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_pipelines_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Reduce a GitLab pipeline `status` to a rollup state the frontend colours:
 /// `FAILURE` (red) / `PENDING` (yellow) / `SUCCESS` (green), or `""` (no CI).
 fn gl_status_to_rollup(status: &str) -> String {
@@ -479,7 +716,9 @@ fn gl_status_to_rollup(status: &str) -> String {
 /// best-effort (empty on any error) so it's safe to fan out under rayon.
 fn gl_pipeline_rollup(cwd: &str, iid: i64) -> String {
     let endpoint = format!("projects/:fullpath/merge_requests/{}/pipelines", iid);
-    let out = match hidden_cmd("glab").args(["api", &endpoint]).current_dir(cwd).output() {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(cwd);
+    let out = match output_with_timeout(cmd, GLAB_API_TIMEOUT) {
         Ok(o) if o.status.success() => o,
         _ => return String::new(),
     };
@@ -498,11 +737,9 @@ fn gl_pipeline_rollup(cwd: &str, iid: i64) -> String {
 /// Helper — run `glab api <endpoint>` and parse the JSON response.
 /// Returns `None` on any failure (non-fatal pattern, like gl_mr_pipelines).
 fn glab_api_json(cwd: &str, endpoint: &str) -> Option<serde_json::Value> {
-    let output = hidden_cmd("glab")
-        .args(["api", endpoint])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", endpoint]).current_dir(cwd);
+    let output = output_with_timeout(cmd, GLAB_API_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -522,8 +759,7 @@ fn glab_api_json(cwd: &str, endpoint: &str) -> Option<serde_json::Value> {
 ///   4. Map Code Climate severity → failure / warning / notice
 ///
 /// Non-fatal everywhere: no pipeline / no report → `[]`.
-#[tauri::command]
-pub(crate) fn gl_mr_annotations(cwd: String, iid: i64) -> Result<Vec<CIAnnotation>, String> {
+fn gl_mr_annotations_inner(cwd: String, iid: i64) -> Result<Vec<CIAnnotation>, String> {
     // 1. Latest pipeline.
     let pipelines = match glab_api_json(
         &cwd,
@@ -618,6 +854,18 @@ pub(crate) fn gl_mr_annotations(cwd: String, iid: i64) -> Result<Vec<CIAnnotatio
     Ok(annotations)
 }
 
+/// Converted from a non-async fn (#149, §1e): per `tauri-macros`, a
+/// non-`async` command defaults to `ExecutionContext::Blocking`, executed
+/// inline in the invoke handler rather than offloaded — this fetches up to
+/// 2 + N_jobs `glab api` calls, so it needs the same `spawn_blocking`
+/// treatment as everything else in this module.
+#[tauri::command]
+pub(crate) async fn gl_mr_annotations(cwd: String, iid: i64) -> Result<Vec<CIAnnotation>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_annotations_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // ─── Issue → Issue mapping ────────────────────────────────────────────────────
 
 /// Map a GitLab issue JSON object to an Issue.
@@ -650,8 +898,7 @@ fn gl_issue_to_issue(v: &serde_json::Value) -> crate::types::Issue {
 ///
 /// `filter` accepts "assigned" (assigned to me), "created" (created by me), or "" (all open).
 /// Pagination: glab's `--per-page` to limit results.
-#[tauri::command]
-pub(crate) async fn gl_list_issues(
+fn gl_list_issues_inner(
     cwd: String,
     filter: String,
     limit: Option<i64>,
@@ -671,10 +918,9 @@ pub(crate) async fn gl_list_issues(
         // "mentioned" has no native glab flag → fall back to all-open.
         _ => {}
     }
-    let output = hidden_cmd("glab")
-        .args(&args)
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab not available: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -687,9 +933,19 @@ pub(crate) async fn gl_list_issues(
     Ok(arr.iter().map(gl_issue_to_issue).collect())
 }
 
-/// Create a MR using `glab mr create`.
 #[tauri::command]
-pub(crate) async fn gl_create_mr(
+pub(crate) async fn gl_list_issues(
+    cwd: String,
+    filter: String,
+    limit: Option<i64>,
+) -> Result<Vec<crate::types::Issue>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_list_issues_inner(cwd, filter, limit))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Create a MR using `glab mr create`.
+fn gl_create_mr_inner(
     cwd: String,
     title: String,
     body: String,
@@ -728,10 +984,9 @@ pub(crate) async fn gl_create_mr(
         }
     }
 
-    let output = hidden_cmd("glab")
-        .args(&args)
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("Failed to create MR: {}", e))?;
 
     if !output.status.success() {
@@ -748,11 +1003,28 @@ pub(crate) async fn gl_create_mr(
     Ok(gl_mr_to_pr(&mr))
 }
 
+#[tauri::command]
+pub(crate) async fn gl_create_mr(
+    cwd: String,
+    title: String,
+    body: String,
+    source_branch: String,
+    target_branch: String,
+    draft: bool,
+    reviewers: Option<Vec<String>>,
+) -> Result<PullRequest, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gl_create_mr_inner(cwd, title, body, source_branch, target_branch, draft, reviewers)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Merge a MR using `glab mr merge`.
 ///
 /// `method` accepts "merge" (default), "squash", "rebase".
 #[tauri::command]
-pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result<(), String> {
+fn gl_merge_mr_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
     let mut args: Vec<String> = vec!["mr".to_string(), "merge".to_string(), iid.to_string()];
 
     match method.as_str() {
@@ -764,11 +1036,9 @@ pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result
     args.push("--yes".to_string());
     args.push("--delete-source-branch".to_string());
 
-    let output = hidden_cmd("glab")
-        .args(&args)
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr merge: {}", e))?;
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab mr merge: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -779,14 +1049,19 @@ pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_merge_mr_inner(cwd, iid, method))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Checkout a MR branch locally using `glab mr checkout`.
 #[tauri::command]
-pub(crate) async fn gl_checkout_mr(cwd: String, iid: i64) -> Result<(), String> {
-    let output = hidden_cmd("glab")
-        .args(["mr", "checkout", &iid.to_string()])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr checkout: {}", e))?;
+fn gl_checkout_mr_inner(cwd: String, iid: i64) -> Result<(), String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["mr", "checkout", &iid.to_string()]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab mr checkout: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -797,13 +1072,18 @@ pub(crate) async fn gl_checkout_mr(cwd: String, iid: i64) -> Result<(), String> 
     Ok(())
 }
 
-/// Convert a draft MR to ready-for-review using `glab mr update --draft=false`.
 #[tauri::command]
-pub(crate) async fn gl_convert_draft_to_ready(cwd: String, iid: i64) -> Result<(), String> {
-    let output = hidden_cmd("glab")
-        .args(["mr", "update", &iid.to_string(), "--draft=false"])
-        .current_dir(&cwd)
-        .output()
+pub(crate) async fn gl_checkout_mr(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_checkout_mr_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Convert a draft MR to ready-for-review using `glab mr update --draft=false`.
+fn gl_convert_draft_to_ready_inner(cwd: String, iid: i64) -> Result<(), String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["mr", "update", &iid.to_string(), "--draft=false"]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab mr update (draft→ready): {}", e))?;
 
     if !output.status.success() {
@@ -815,22 +1095,46 @@ pub(crate) async fn gl_convert_draft_to_ready(cwd: String, iid: i64) -> Result<(
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_convert_draft_to_ready(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_convert_draft_to_ready_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Flatten a `/discussions` response into the flat note-array shape
+/// `/notes` used to return, preserving each note's own fields — notably
+/// `resolvable`/`resolved`, which the flat endpoint never carried (#161).
+fn gl_flatten_discussions(discussions: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut notes = Vec::new();
+    for d in discussions {
+        if let Some(arr) = d.get("notes").and_then(|n| n.as_array()) {
+            notes.extend(arr.iter().cloned());
+        }
+    }
+    notes
+}
+
 /// List notes (comments) for a MR via `glab api`.
 ///
 /// Returns raw JSON array — parsed TypeScript-side into PrReviewComment[].
-/// GitLab notes are simpler than GitHub review comments: no diff-line
-/// anchoring in v2.10 (that requires the Discussions API).
+/// Uses the Discussions API (`/discussions`, flattened back to a flat note
+/// array by `gl_flatten_discussions`) rather than the flat `/notes` endpoint
+/// this used to call: `/notes` has no concept of a resolved thread at all,
+/// so a resolved discussion's notes were indistinguishable from a live one
+/// (#161). Diff-line anchoring for the notes *listing* is still not wired
+/// up (`path`/`line` stay empty TypeScript-side) — only *creating* an
+/// anchored comment already used the Discussions API, via
+/// `gl_mr_create_discussion`.
 #[tauri::command]
-pub(crate) async fn gl_mr_notes(cwd: String, iid: i64) -> Result<serde_json::Value, String> {
+fn gl_mr_notes_inner(cwd: String, iid: i64) -> Result<serde_json::Value, String> {
     let endpoint = format!(
-        "projects/:fullpath/merge_requests/{}/notes?sort=asc&per_page=100",
+        "projects/:fullpath/merge_requests/{}/discussions?per_page=100",
         iid
     );
-    let output = hidden_cmd("glab")
-        .args(["api", &endpoint])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab api notes: {}", e))?;
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api discussions: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -840,23 +1144,27 @@ pub(crate) async fn gl_mr_notes(cwd: String, iid: i64) -> Result<serde_json::Val
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim()).map_err(|e| format!("Parse notes: {}", e))
+    let discussions: Vec<serde_json::Value> =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("Parse discussions: {}", e))?;
+    Ok(serde_json::Value::Array(gl_flatten_discussions(&discussions)))
+}
+
+#[tauri::command]
+pub(crate) async fn gl_mr_notes(cwd: String, iid: i64) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_notes_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Create a note (comment) on a MR via `glab api`.
 ///
 /// Returns the created note as raw JSON — parsed TypeScript-side.
-#[tauri::command]
-pub(crate) async fn gl_mr_create_note(
-    cwd: String,
-    iid: i64,
-    body: String,
-) -> Result<serde_json::Value, String> {
+fn gl_mr_create_note_inner(cwd: String, iid: i64, body: String) -> Result<serde_json::Value, String> {
     let endpoint = format!("projects/:fullpath/merge_requests/{}/notes", iid);
-    let output = hidden_cmd("glab")
-        .args(["api", "-X", "POST", &endpoint, "-f", &format!("body={}", body)])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "-X", "POST", &endpoint, "-f", &format!("body={}", body)])
+        .current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab api create note: {}", e))?;
 
     if !output.status.success() {
@@ -870,22 +1178,27 @@ pub(crate) async fn gl_mr_create_note(
     serde_json::from_str(stdout.trim()).map_err(|e| format!("Parse created note: {}", e))
 }
 
-/// Update a note on a MR via `glab api`.
 #[tauri::command]
-pub(crate) async fn gl_mr_update_note(
+pub(crate) async fn gl_mr_create_note(
     cwd: String,
     iid: i64,
-    note_id: i64,
     body: String,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_create_note_inner(cwd, iid, body))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Update a note on a MR via `glab api`.
+fn gl_mr_update_note_inner(cwd: String, iid: i64, note_id: i64, body: String) -> Result<(), String> {
     let endpoint = format!(
         "projects/:fullpath/merge_requests/{}/notes/{}",
         iid, note_id
     );
-    let output = hidden_cmd("glab")
-        .args(["api", "-X", "PUT", &endpoint, "-f", &format!("body={}", body)])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "-X", "PUT", &endpoint, "-f", &format!("body={}", body)])
+        .current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab api update note: {}", e))?;
 
     if !output.status.success() {
@@ -897,21 +1210,27 @@ pub(crate) async fn gl_mr_update_note(
     Ok(())
 }
 
-/// Delete a note on a MR via `glab api`.
 #[tauri::command]
-pub(crate) async fn gl_mr_delete_note(
+pub(crate) async fn gl_mr_update_note(
     cwd: String,
     iid: i64,
     note_id: i64,
+    body: String,
 ) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_update_note_inner(cwd, iid, note_id, body))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Delete a note on a MR via `glab api`.
+fn gl_mr_delete_note_inner(cwd: String, iid: i64, note_id: i64) -> Result<(), String> {
     let endpoint = format!(
         "projects/:fullpath/merge_requests/{}/notes/{}",
         iid, note_id
     );
-    let output = hidden_cmd("glab")
-        .args(["api", "-X", "DELETE", &endpoint])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "-X", "DELETE", &endpoint]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab api delete note: {}", e))?;
 
     if !output.status.success() {
@@ -923,14 +1242,23 @@ pub(crate) async fn gl_mr_delete_note(
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_mr_delete_note(
+    cwd: String,
+    iid: i64,
+    note_id: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_delete_note_inner(cwd, iid, note_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Approve a MR using `glab mr approve`.
 #[tauri::command]
-pub(crate) async fn gl_approve_mr(cwd: String, iid: i64) -> Result<(), String> {
-    let output = hidden_cmd("glab")
-        .args(["mr", "approve", &iid.to_string()])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab mr approve: {}", e))?;
+fn gl_approve_mr_inner(cwd: String, iid: i64) -> Result<(), String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["mr", "approve", &iid.to_string()]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab mr approve: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -941,20 +1269,24 @@ pub(crate) async fn gl_approve_mr(cwd: String, iid: i64) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_approve_mr(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_approve_mr_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Get approval status for a MR via `glab api`.
 ///
 /// Returns raw JSON — parsed TypeScript-side into PrReview[].
-#[tauri::command]
-pub(crate) async fn gl_list_reviews(cwd: String, iid: i64) -> Result<serde_json::Value, String> {
+fn gl_list_reviews_inner(cwd: String, iid: i64) -> Result<serde_json::Value, String> {
     let endpoint = format!(
         "projects/:fullpath/merge_requests/{}/approvals",
         iid
     );
-    let output = hidden_cmd("glab")
-        .args(["api", &endpoint])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab api approvals: {}", e))?;
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api approvals: {}", e))?;
 
     if !output.status.success() {
         // Not all GitLab tiers have the approvals API — return empty gracefully.
@@ -965,14 +1297,18 @@ pub(crate) async fn gl_list_reviews(cwd: String, iid: i64) -> Result<serde_json:
     serde_json::from_str(stdout.trim()).map_err(|e| format!("Parse approvals: {}", e))
 }
 
-/// Get the current GitLab user via `glab api /user`.
 #[tauri::command]
-pub(crate) async fn gl_current_user(cwd: String) -> Result<String, String> {
-    let output = hidden_cmd("glab")
-        .args(["api", "/user"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab api /user: {}", e))?;
+pub(crate) async fn gl_list_reviews(cwd: String, iid: i64) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_list_reviews_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Get the current GitLab user via `glab api /user`.
+fn gl_current_user_inner(cwd: String) -> Result<String, String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "/user"]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api /user: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -992,14 +1328,18 @@ pub(crate) async fn gl_current_user(cwd: String) -> Result<String, String> {
         .to_string())
 }
 
-/// List reviewer candidates (project members with push access) via `glab api`.
 #[tauri::command]
-pub(crate) async fn gl_reviewer_candidates(cwd: String) -> Result<Vec<ReviewerCandidate>, String> {
-    let output = hidden_cmd("glab")
-        .args(["api", "projects/:fullpath/members/all?per_page=100"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("glab api members: {}", e))?;
+pub(crate) async fn gl_current_user(cwd: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_current_user_inner(cwd))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// List reviewer candidates (project members with push access) via `glab api`.
+fn gl_reviewer_candidates_inner(cwd: String) -> Result<Vec<ReviewerCandidate>, String> {
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "projects/:fullpath/members/all?per_page=100"]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api members: {}", e))?;
 
     if !output.status.success() {
         return Ok(Vec::new()); // Non-fatal
@@ -1039,15 +1379,21 @@ pub(crate) async fn gl_reviewer_candidates(cwd: String) -> Result<Vec<ReviewerCa
     Ok(candidates)
 }
 
+#[tauri::command]
+pub(crate) async fn gl_reviewer_candidates(cwd: String) -> Result<Vec<ReviewerCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_reviewer_candidates_inner(cwd))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Resolve a GitLab username to its numeric member id within the current
 /// project — the merge-request update endpoint takes `reviewer_ids`
 /// (numeric), not usernames.
 fn gl_resolve_member_id(cwd: &str, username: &str) -> Option<i64> {
-    let output = hidden_cmd("glab")
-        .args(["api", &format!("projects/:fullpath/members/all?query={}", username)])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &format!("projects/:fullpath/members/all?query={}", username)])
+        .current_dir(cwd);
+    let output = output_with_timeout(cmd, GLAB_API_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1078,9 +1424,8 @@ pub(crate) async fn gl_request_reviewers(cwd: String, iid: i64, usernames: Vec<S
         for id in &ids {
             cmd.args(["-f", &format!("reviewer_ids[]={}", id)]);
         }
-        let output = cmd
-            .current_dir(&cwd)
-            .output()
+        cmd.current_dir(&cwd);
+        let output = output_with_timeout(cmd, GLAB_TIMEOUT)
             .map_err(|e| format!("glab api request reviewers: {}", e))?;
         if !output.status.success() {
             return Err(format!(
@@ -1096,8 +1441,7 @@ pub(crate) async fn gl_request_reviewers(cwd: String, iid: i64, usernames: Vec<S
 
 /// List branch names for the project via `glab api`. Paginated at 100/page,
 /// deduped, case-insensitively sorted. Non-fatal on failure (returns partial).
-#[tauri::command]
-pub(crate) async fn gl_branches(cwd: String) -> Result<Vec<String>, String> {
+fn gl_branches_inner(cwd: String) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for page in 1..=10 {
@@ -1105,10 +1449,9 @@ pub(crate) async fn gl_branches(cwd: String) -> Result<Vec<String>, String> {
             "projects/:fullpath/repository/branches?per_page=100&page={}",
             page
         );
-        let output = hidden_cmd("glab")
-            .args(["api", &endpoint])
-            .current_dir(&cwd)
-            .output()
+        let mut cmd = hidden_cmd("glab");
+        cmd.args(["api", &endpoint]).current_dir(&cwd);
+        let output = output_with_timeout(cmd, GLAB_TIMEOUT)
             .map_err(|e| format!("glab api branches: {}", e))?;
         if !output.status.success() {
             break;
@@ -1137,17 +1480,22 @@ pub(crate) async fn gl_branches(cwd: String) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// List file paths changed in a MR via `glab api` (diffs endpoint).
 #[tauri::command]
-pub(crate) async fn gl_mr_files(cwd: String, iid: i64) -> Result<Vec<String>, String> {
+pub(crate) async fn gl_branches(cwd: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_branches_inner(cwd))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// List file paths changed in a MR via `glab api` (diffs endpoint).
+fn gl_mr_files_inner(cwd: String, iid: i64) -> Result<Vec<String>, String> {
     let endpoint = format!(
         "projects/:fullpath/merge_requests/{}/diffs?per_page=100",
         iid
     );
-    let output = hidden_cmd("glab")
-        .args(["api", &endpoint])
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab api mr diffs: {}", e))?;
 
     if !output.status.success() {
@@ -1169,6 +1517,13 @@ pub(crate) async fn gl_mr_files(cwd: String, iid: i64) -> Result<Vec<String>, St
         .collect())
 }
 
+#[tauri::command]
+pub(crate) async fn gl_mr_files(cwd: String, iid: i64) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_files_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Create a diff-line anchored discussion on a MR via the GitLab Discussions API.
 ///
 /// This provides parité with GitHub's inline review comment anchoring.
@@ -1180,8 +1535,7 @@ pub(crate) async fn gl_mr_files(cwd: String, iid: i64) -> Result<Vec<String>, St
 ///   POST /projects/:fullpath/merge_requests/:iid/discussions
 ///   Body: { body, position: { base_sha, start_sha, head_sha, position_type,
 ///            new_path, new_line, old_path, old_line } }
-#[tauri::command]
-pub(crate) async fn gl_mr_create_discussion(
+fn gl_mr_create_discussion_inner(
     cwd: String,
     iid: i64,
     body: String,
@@ -1221,10 +1575,9 @@ pub(crate) async fn gl_mr_create_discussion(
         }
     }
 
-    let output = hidden_cmd("glab")
-        .args(&args)
-        .current_dir(&cwd)
-        .output()
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
         .map_err(|e| format!("glab api create discussion: {}", e))?;
 
     if !output.status.success() {
@@ -1236,6 +1589,25 @@ pub(crate) async fn gl_mr_create_discussion(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).map_err(|e| format!("Parse discussion: {}", e))
+}
+
+#[tauri::command]
+pub(crate) async fn gl_mr_create_discussion(
+    cwd: String,
+    iid: i64,
+    body: String,
+    base_sha: String,
+    start_sha: String,
+    head_sha: String,
+    old_line: Option<i64>,
+    new_line: Option<i64>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        gl_mr_create_discussion_inner(cwd, iid, body, base_sha, start_sha, head_sha, old_line, new_line, path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─── Award emoji (reactions) ─────────────────────────────────────────────────
@@ -1278,7 +1650,8 @@ fn glab_api(cwd: &str, method: &str, endpoint: &str, fields: &[(&str, &str)]) ->
     for (k, v) in fields {
         cmd.args(["-f", &format!("{}={}", k, v)]);
     }
-    let output = cmd.current_dir(cwd).output().map_err(|e| format!("glab api: {}", e))?;
+    cmd.current_dir(cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api: {}", e))?;
     if !output.status.success() {
         return Err(format!("glab api {} {}: {}", method, endpoint, String::from_utf8_lossy(&output.stderr)));
     }
@@ -1372,5 +1745,267 @@ mod gl_list_issues_tests {
         assert_eq!(i.labels, vec!["bug".to_string(), "p1".to_string()]);
         assert_eq!(i.milestone, "M1");
         assert_eq!(i.url, "https://gitlab.com/o/r/-/issues/12");
+    }
+}
+
+/// Issue #138 — `glab mr list` has no generic `--state <value>` flag like
+/// `gh`; it takes one boolean flag per state. Regression coverage for
+/// `gl_state_flag`, consumed by both `gl_list_mrs` and `gl_mr_count`'s
+/// `hidden_cmd("glab").args([...])` argument construction.
+#[cfg(test)]
+mod gl_state_flag_tests {
+    use super::gl_state_flag;
+
+    #[test]
+    fn maps_closed_to_the_closed_flag() {
+        assert_eq!(gl_state_flag("closed"), "--closed");
+    }
+
+    #[test]
+    fn maps_merged_to_the_merged_flag() {
+        assert_eq!(gl_state_flag("merged"), "--merged");
+    }
+
+    #[test]
+    fn maps_all_to_the_all_flag() {
+        assert_eq!(gl_state_flag("all"), "--all");
+    }
+
+    #[test]
+    fn maps_opened_and_any_other_value_to_the_opened_flag() {
+        assert_eq!(gl_state_flag("opened"), "--opened");
+        assert_eq!(gl_state_flag("open"), "--opened");
+        assert_eq!(gl_state_flag(""), "--opened");
+    }
+}
+
+/// Issue #161 — `merge_status` is deprecated since GitLab 15.6 and commonly
+/// sits at "unchecked"/"checking" until something triggers a recompute, so
+/// the old `can_be_merged` else `CONFLICTING` mapping treated every
+/// not-yet-computed MR as a false-positive conflict. Regression coverage for
+/// `gl_mergeable_state`, consumed by `gl_mr_to_detail`.
+#[cfg(test)]
+mod gl_mergeable_state_tests {
+    use super::gl_mergeable_state;
+    use serde_json::json;
+
+    #[test]
+    fn detailed_mergeable_maps_to_mergeable() {
+        let mr = json!({"detailed_merge_status": "mergeable", "merge_status": "can_be_merged"});
+        assert_eq!(gl_mergeable_state(&mr), "MERGEABLE");
+    }
+
+    #[test]
+    fn detailed_conflict_maps_to_conflicting() {
+        let mr = json!({"detailed_merge_status": "conflict", "merge_status": "cannot_be_merged"});
+        assert_eq!(gl_mergeable_state(&mr), "CONFLICTING");
+    }
+
+    #[test]
+    fn detailed_ci_still_running_is_unknown_not_conflicting() {
+        let mr = json!({"detailed_merge_status": "ci_still_running", "merge_status": "unchecked"});
+        assert_eq!(gl_mergeable_state(&mr), "UNKNOWN");
+    }
+
+    #[test]
+    fn detailed_unchecked_is_unknown() {
+        let mr = json!({"detailed_merge_status": "unchecked"});
+        assert_eq!(gl_mergeable_state(&mr), "UNKNOWN");
+    }
+
+    #[test]
+    fn falls_back_to_legacy_merge_status_when_detailed_is_absent() {
+        assert_eq!(gl_mergeable_state(&json!({"merge_status": "can_be_merged"})), "MERGEABLE");
+        assert_eq!(gl_mergeable_state(&json!({"merge_status": "cannot_be_merged"})), "CONFLICTING");
+        assert_eq!(gl_mergeable_state(&json!({"merge_status": "cannot_be_merged_recheck"})), "CONFLICTING");
+        assert_eq!(gl_mergeable_state(&json!({"merge_status": "unchecked"})), "UNKNOWN");
+    }
+
+    #[test]
+    fn neither_field_present_is_unknown() {
+        assert_eq!(gl_mergeable_state(&json!({})), "UNKNOWN");
+    }
+}
+
+/// Issue #161 — GitLab's MR resource has no `diff_stats` field (that was a
+/// GitHub-shaped assumption; GitLab's REST API never returns per-line
+/// addition/deletion counts on the MR itself), so `gl_mr_to_detail` reading
+/// `mr.diff_stats` always fell through to `(0, 0)`. Regression coverage for
+/// `gl_diff_stats_from_files`, which sums real `+`/`-` line counts out of
+/// the diffs endpoint's per-file unified-diff text instead.
+#[cfg(test)]
+mod gl_diff_stats_from_files_tests {
+    use super::gl_diff_stats_from_files;
+    use serde_json::json;
+
+    #[test]
+    fn sums_additions_and_deletions_across_files() {
+        let files = vec![
+            json!({"new_path": "a.rs", "diff": "@@ -1,2 +1,3 @@\n-old\n+new1\n+new2\n context\n"}),
+            json!({"new_path": "b.rs", "diff": "@@ -1,1 +1,1 @@\n-gone\n+kept\n"}),
+        ];
+        assert_eq!(gl_diff_stats_from_files(&files), (3, 2));
+    }
+
+    #[test]
+    fn ignores_the_file_header_lines_not_just_hunk_lines() {
+        // `---`/`+++` file headers must not be miscounted as a deletion/addition.
+        let files = vec![json!({
+            "new_path": "a.rs",
+            "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+        })];
+        assert_eq!(gl_diff_stats_from_files(&files), (1, 1));
+    }
+
+    #[test]
+    fn empty_file_list_is_zero_zero() {
+        assert_eq!(gl_diff_stats_from_files(&[]), (0, 0));
+    }
+
+    #[test]
+    fn a_file_with_no_diff_field_contributes_nothing() {
+        let files = vec![json!({"new_path": "binary.png"})];
+        assert_eq!(gl_diff_stats_from_files(&files), (0, 0));
+    }
+}
+
+/// Issue #161 — `gl_list_mrs_inner`'s naive offset+limit pagination requests
+/// a growing `--per-page` value (`limit + offset`) on every page, but never
+/// clamped it to GitLab's 100-per-page ceiling the way `gl_list_issues_inner`
+/// already does. The background prefetch that drains the rest of the open-MR
+/// list right after the first page paints (`prefetchOpenPrs`, `BG_PAGE =
+/// 100` in `usePrPanel.ts`) requests its very first batch at `offset: 10,
+/// limit: 100` — `--per-page 110` — which GitLab's API rejects outright. The
+/// failure is silently swallowed by `loadMorePrs`'s catch block, which sets
+/// `hasMore` to `false`, permanently hiding the *visible* scroll-to-load-more
+/// sentinel too even though the user never asked for the background batch
+/// that actually failed. Regression coverage for `gl_mr_list_per_page`.
+#[cfg(test)]
+mod gl_mr_list_per_page_tests {
+    use super::gl_mr_list_per_page;
+
+    #[test]
+    fn stays_under_the_cap_for_small_pages() {
+        assert_eq!(gl_mr_list_per_page(Some(10), Some(0)), 10);
+        assert_eq!(gl_mr_list_per_page(Some(10), Some(10)), 20);
+    }
+
+    #[test]
+    fn clamps_to_100_instead_of_erroring_on_the_background_prefetch_batch() {
+        // usePrPanel.ts's prefetchOpenPrs: limit=100 (BG_PAGE), offset=10
+        // after the first visible page — would ask for --per-page 110.
+        assert_eq!(gl_mr_list_per_page(Some(100), Some(10)), 100);
+    }
+
+    #[test]
+    fn clamps_even_when_both_limit_and_offset_are_already_over_100() {
+        assert_eq!(gl_mr_list_per_page(Some(100), Some(200)), 100);
+    }
+
+    #[test]
+    fn defaults_and_floors_match_the_pre_existing_behavior() {
+        assert_eq!(gl_mr_list_per_page(None, None), 10);
+        assert_eq!(gl_mr_list_per_page(Some(0), Some(-5)), 1);
+    }
+}
+
+/// Issue #161 — comments were listed via the flat `/notes` endpoint, which
+/// has no concept of a resolved discussion thread at all: a resolved and a
+/// live comment were indistinguishable to the frontend. Regression coverage
+/// for `gl_flatten_discussions`, which switches to the `/discussions`
+/// endpoint and flattens it back to the same flat-array shape `/notes` used
+/// to return, while preserving each note's `resolvable`/`resolved` fields.
+#[cfg(test)]
+mod gl_flatten_discussions_tests {
+    use super::gl_flatten_discussions;
+    use serde_json::json;
+
+    #[test]
+    fn flattens_notes_out_of_every_discussion_preserving_resolved_state() {
+        let discussions = vec![
+            json!({
+                "id": "d1", "individual_note": false,
+                "notes": [
+                    {"id": 1, "body": "first", "resolvable": true, "resolved": true},
+                    {"id": 2, "body": "reply", "resolvable": true, "resolved": true},
+                ]
+            }),
+            json!({
+                "id": "d2", "individual_note": true,
+                "notes": [{"id": 3, "body": "standalone", "resolvable": false}]
+            }),
+        ];
+        let flat = gl_flatten_discussions(&discussions);
+        assert_eq!(flat.len(), 3);
+        assert_eq!(flat[0]["id"], 1);
+        assert_eq!(flat[0]["resolved"], true);
+        assert_eq!(flat[2]["id"], 3);
+        assert_eq!(flat[2]["resolvable"], false);
+    }
+
+    #[test]
+    fn a_discussion_with_no_notes_array_contributes_nothing() {
+        let discussions = vec![json!({"id": "d1", "individual_note": true})];
+        assert_eq!(gl_flatten_discussions(&discussions).len(), 0);
+    }
+
+    #[test]
+    fn empty_discussion_list_is_empty() {
+        assert_eq!(gl_flatten_discussions(&[]).len(), 0);
+    }
+}
+
+/// Issue #161 — the dock/badge MR count used to fetch up to 100 MRs and
+/// count the array, silently capping any repo with more open MRs than that
+/// at exactly 100. Regression coverage for `gl_parse_x_total`, which reads
+/// the real total off the REST list endpoint's `X-Total` header instead.
+#[cfg(test)]
+mod gl_parse_x_total_tests {
+    use super::gl_parse_x_total;
+
+    #[test]
+    fn finds_x_total_after_a_status_line_with_no_colon() {
+        let output = "HTTP/2 200 \r\nContent-Type: application/json\r\nX-Total: 125\r\nX-Per-Page: 1\r\n\r\n[{}]";
+        assert_eq!(gl_parse_x_total(output), Some(125));
+    }
+
+    #[test]
+    fn header_name_match_is_case_insensitive() {
+        let output = "HTTP/2 200\nx-total: 7\n\n[]";
+        assert_eq!(gl_parse_x_total(output), Some(7));
+    }
+
+    #[test]
+    fn returns_none_when_the_header_is_absent() {
+        let output = "HTTP/2 200\nContent-Type: application/json\n\n[{}]";
+        assert_eq!(gl_parse_x_total(output), None);
+    }
+
+    #[test]
+    fn does_not_scan_into_the_body_past_the_blank_line() {
+        // A body containing a line that happens to look like "X-Total: 9"
+        // must not be matched once the header block has ended.
+        let output = "HTTP/2 200\n\n{\"note\": \"X-Total: 9\"}";
+        assert_eq!(gl_parse_x_total(output), None);
+    }
+
+    #[test]
+    fn returns_none_on_empty_output() {
+        assert_eq!(gl_parse_x_total(""), None);
+    }
+}
+
+/// Issue #161 — `glab mr diff`'s default (non-`--raw`) output isn't the
+/// git-compatible unified-diff format (`diff --git a/... b/...` headers) the
+/// frontend's `indexDiffFiles`/`parseFileDiff` parsers require; without
+/// `--raw` they silently see zero files and the UI renders "no diff
+/// available" no matter what the MR actually contains.
+#[cfg(test)]
+mod gl_mr_diff_args_tests {
+    use super::gl_mr_diff_args;
+
+    #[test]
+    fn includes_the_raw_flag() {
+        assert_eq!(gl_mr_diff_args(42), vec!["mr", "diff", "42", "--raw"]);
     }
 }

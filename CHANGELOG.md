@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.5] - 2026-08-18
+
+### Fixed
+
+- **Nine GitLab MR overview bugs, all from one repeated root cause** (#161) — several GitLab response handlers (`glListMrs`, `glMrPipelines`, `glCreateMr`, `glReviewerCandidates`) returned the raw Tauri payload untouched instead of mapping it to the camelCase shape the UI expects, the way `glGetMr` and every GitHub equivalent already did. That silently dropped `createdAt`/`updatedAt` (rendering "NaNj" instead of an age), the CI tab's pipeline link, and reviewer avatars. Fixed alongside it, each independently root-caused:
+  - `merge_status` is deprecated since GitLab 15.6 and commonly sits at `unchecked` until something triggers a recheck; the old mapping treated every not-yet-computed MR as a real conflict. Now prefers `detailed_merge_status` and only flags an actual `conflict`.
+  - `glab mr diff` needs `--raw` or its output isn't the git-compatible unified diff format the frontend parser expects, so the diff view always read as empty ("no diff available").
+  - The dock's MR count capped at 100 by fetching one page and counting it. Now reads the real total off the REST list endpoint's `X-Total` header.
+  - `gl_list_mrs_inner` requested a growing `--per-page` (limit + offset) on every page without clamping it to GitLab's 100-per-page ceiling. The automatic background prefetch that drains the rest of the open-MR list right after the first page paints requested `--per-page 110` on its very first batch, which GitLab rejects outright — silently disabling the *visible* "load more" scroll trigger as a side effect, so a repo with more than 10 open MRs looked permanently stuck at 10.
+  - GitLab's MR resource has no `diff_stats` field (a GitHub-shaped assumption that never matched a real GitLab payload), so additions/deletions always read `+0 -0` on the detail view. Now computed from the diffs endpoint's per-file unified-diff text (left as a known gap on the list view, where doing this per MR risked reintroducing the #149 slowness).
+  - Three duplicated `timeAgo` implementations (later found: a fourth, in the comment timeline) hardcoded a French-only "j" unit regardless of locale and rendered "NaNj" on any unparseable date instead of degrading gracefully. Consolidated into one `formatRelativeAge()` using the already-translated `date.*` i18n keys.
+- **Resolved GitLab comment threads showed no "Resolved" indicator** — comments were listed via GitLab's flat `/notes` endpoint, which has no concept of a resolved discussion thread at all. Switched to the Discussions API (flattened back to the same shape) so each note's resolved state is available, and added a small "Resolved" badge to the comment timeline (#161).
+
+## [3.6.4] - 2026-08-17
+
+### Fixed
+
+- **GitLab MR list can still time out when `glab` is authenticated via `--use-keyring`** — the v3.6.2 fix (#149) made a hang surface as a clean 20s timeout instead of freezing the app, but on keyring auth the underlying `glab` subprocess itself was still slow: retrieving the PAT from the macOS keychain hangs when `glab` is spawned from a signed Tauri app, the same per-binary ACL mismatch already fixed for `gh`. `shell_env.rs` now also preloads a `GITLAB_TOKEN` from a login shell at startup (parsed from `glab auth status --show-token`) so `glab` subprocesses bypass the keychain lookup entirely, mirroring the existing `GH_TOKEN` preload (#149).
+- **Dock PR badge briefly queries GitHub on a non-GitHub repo's first open** — opening a repo whose remote had never been resolved yet in this session (no cached remote, e.g. right after install, or a repo opened for the first time) fired the dock badge's `getPRCount` refresh immediately, before the async remote lookup completed. `forge` falls back to the GitHub provider by default while the remote is unresolved, so a GitLab (or other non-GitHub) repo would briefly hit a doomed `gh`-backed call and could surface a spurious error, before quietly correcting itself once the remote resolved. `refreshDockPrCount` now waits for the remote lookup on that cold path, same as the PR panel's own `init()`/`ensurePrsLoaded()` already did (#149).
+
+## [3.6.3] - 2026-08-13
+
+### Fixed
+
+- Linux: added a further startup fallback, `GDK_BACKEND=x11` (never overriding a value already set in the environment), for systems where `Could not create default EGL display: EGL_BAD_PARAMETER` still occurs after the v3.6.2 fallbacks. Confirmed via a report with `ldd` output that this is a genuine native-Wayland EGL negotiation failure on the host system, not an AppImage-bundled-library mismatch. Forcing GTK onto XWayland sidesteps that negotiation, at the cost of native Wayland's fractional scaling and lower input latency (#135).
+- **Amend and Split commit are reachable again from the commit graph.** Both actions shipped in April with a full backend/dialog implementation, but the v2.15.0 "Git Tree" rewrite replaced the old flat commit-log view with the graph view and never carried the corresponding context-menu items over, leaving the two actions fully wired end to end with no button left to trigger them. Restored "Amend commit..." and "Split commit..." to the graph's right-click menu (#156).
+
+## [3.6.2] - 2026-08-11
+
+### Added
+
+- **Auto-stash on pull (#150)** — pulling with uncommitted changes no longer dead-ends on `cannot pull with rebase: You have unstaged changes`. A new Settings → Git → "Pull with uncommitted changes" option (Ask — default · Auto stash & restore · Refuse) parks the working tree via `git pull --autostash` and lets git restore it, including across a conflicted rebase/merge (`rebase --continue`, `merge --continue`, and both `--abort` paths). When re-applying the parked changes conflicts, GitWand now says so explicitly instead of reporting a successful sync over a conflicted tree.
+
+### Fixed
+
+- **GitLab MR list no longer times out / freezes the app** — every `glab`-backed command ran its blocking subprocess directly on the async runtime, parking a worker thread for the call's duration; the frontend's 30s IPC timeout only gave up on the JS promise, leaving the `glab` process running and the worker parked on every retry. All `gl_*` commands now offload to `spawn_blocking`, and the `glab` subprocess itself carries a 20s timeout that kills and reaps the child instead of orphaning it, so the app stays responsive and a hang now surfaces as a clear "took too long to respond" message instead of a silent freeze (#149).
+- **Stash Manager: dates are no longer "Invalid Date"** — the backend asked git for its lenient date format (`%ai`, e.g. `2026-08-11 09:16:44 +0200`), which the macOS/Linux webview refuses to parse, so every stash rendered "Invalid Date". Stash dates now use git's strict ISO 8601 output (`%aI`), the Node dev-server route was aligned onto the same placeholder (it was using the committer timestamp), the parity suite now compares the field instead of blanking it, and the UI falls back to the raw string rather than "Invalid Date" if a date is ever unparseable. The same lenient format in the Tags panel (which rendered "NaN years ago") was fixed alongside it (#151).
+- Linux: broadened the startup render fallback with `LIBGL_ALWAYS_SOFTWARE=1` (never overriding a value already set in the environment) alongside the existing `WEBKIT_DISABLE_COMPOSITING_MODE`/`WEBKIT_DISABLE_DMABUF_RENDERER`. The two WebKitGTK vars only steer compositing; they don't affect EGL *display acquisition*, which is where `Could not create default EGL display: EGL_BAD_PARAMETER` originates on some native-Wayland/Gnome setups (#135).
+- Telemetry no longer panics on exit (`there is no reactor running, must be called from the context of a Tokio 1.x runtime`). The vendored `tauri-plugin-aptabase` fork still flushed its queue through `futures::executor::block_on`, which provides no Tokio reactor, so quitting within 60s of launch — before the background flush had drained the queued `launch` event — panicked on any platform. This was the second half of the crash reported on Linux, where EGL failures make the app exit almost immediately (#135).
+
+## [3.6.1] - 2026-08-10
+
+### Fixed
+
+- **Settings → Git → Default Branch is now actually used** — repos whose mainline is neither `main` nor `master` (nor tracked as `origin/main`/`origin/master`) no longer hit a recurring `git branch failed: fatal: failed to find 'main'` notification. The configured default branch is now threaded through to `git_branches`, `git_branch_merged`, and `git_branch_top_authors` and tried before the existing fallback chain; if nothing resolves, the current branch is used instead of a hardcoded `"main"` literal (#136).
+- Commit Tree: checking out or deleting a local branch with a `/` in its name (e.g. `test/some_experiment`) no longer truncates it to the text after the first slash once you've switched away from it — the ref-classification logic no longer assumes any slash-containing decoration is a remote branch (#137).
+- **GitLab PR overview** — the PR panel no longer shows the GitHub-specific "GitHub CLI not installed" message for GitLab repos; the CLI-missing error and its install hint are now forge-specific (GitHub/`gh` vs GitLab/`glab`). Also fixed `glab mr list` failing with "Unknown flag: --state" — GitLab's CLI uses per-state boolean flags (`--opened`/`--closed`/`--merged`/`--all`), not `gh`'s generic `--state <value>` (#138).
+- **Rebase auto-resolve UX** — "Auto-resolve" on a paused rebase conflict now correctly re-polls the rebase banner state (the Continue button and conflict hint were staying stuck even though the conflict had actually been resolved and staged); the per-hunk AI-resolve button now uses the app-wide animated `AiSparkle` icon instead of a barely-visible opacity pulse, for both clearer feedback and visual consistency with the rest of the app; and the per-hunk AI explanation prompt now repeats its language directive at the end of the prompt as a best-effort mitigation for occasional wrong-language responses from some providers (#133).
+- Linux: force WebKitGTK software-rendering fallback (`WEBKIT_DISABLE_COMPOSITING_MODE`, `WEBKIT_DISABLE_DMABUF_RENDERER`) before the webview is created, so the app degrades gracefully instead of aborting on systems without a working EGL/GPU context (`Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...`) (#135, #139).
+- Settings → Git → Committer Identities now update immediately after adding, editing, or deleting an identity, instead of requiring the settings popover to be closed and reopened (#140).
+
 ## [3.6.0] - 2026-07-20
 
 ### Added
@@ -1243,7 +1294,12 @@ Design-system foundations — the app header and every overlay now ride on a sha
 - CI pipeline via GitHub Actions (Node 18, 20, 22)
 - 28 tests covering all patterns + real-world scenarios (package.json, Laravel routes, Vue SFC, CSS, .env files)
 
-[Unreleased]: https://github.com/devlint/GitWand/compare/v3.5.0...HEAD
+[Unreleased]: https://github.com/devlint/GitWand/compare/v3.6.5...HEAD
+[3.6.5]: https://github.com/devlint/GitWand/compare/v3.6.4...v3.6.5
+[3.6.4]: https://github.com/devlint/GitWand/compare/v3.6.3...v3.6.4
+[3.6.3]: https://github.com/devlint/GitWand/compare/v3.6.2...v3.6.3
+[3.6.2]: https://github.com/devlint/GitWand/compare/v3.6.1...v3.6.2
+[3.6.1]: https://github.com/devlint/GitWand/compare/v3.6.0...v3.6.1
 [3.6.0]: https://github.com/devlint/GitWand/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/devlint/GitWand/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/devlint/GitWand/compare/v3.3.0...v3.4.0

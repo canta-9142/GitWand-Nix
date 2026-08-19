@@ -5,6 +5,58 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.6.5 — August 2026
+
+A single detailed community report on GitLab merge request support turned into nine fixes, all traced back to a couple of root causes once we started pulling on the thread.
+
+The biggest one: several of GitLab's response handlers were passing the API's raw field names straight through instead of translating them into what the interface expects, the way every other integration already does. That one gap alone was responsible for merge request ages showing as "NaNj" instead of an actual date, the CI tab's pipeline link going missing, and reviewer avatars not loading. Also fixed alongside it: a merge-conflict warning that showed up on almost every merge request regardless of whether it actually had one (GitLab's own status field sits in a "not checked yet" state far more often than not), a diff view that always claimed there was nothing to show, a dock badge that quietly capped out at 100 merge requests, and a "load more" button that stopped working the moment a repo had more than ten open merge requests, caused by an invisible background refresh failing in a way that disabled it as a side effect. Line-count stats (+12 -3, and so on) now show up correctly too, computed from the actual diff since GitLab doesn't report them the way GitHub does.
+
+Resolved comment threads also get a small "Resolved" badge now, GitLab's own concept of a settled discussion that GitWand had no way to represent before.
+
+## v3.6.4 — August 2026
+
+Two more fixes closing out the GitLab timeout saga from the last couple of releases, both traced back to community reports that kept pointing at the same issue from different angles.
+
+The v3.6.2 fix turned a silent freeze into a clean 20-second timeout, but on macOS, one specific `glab` auth setup — logging in with `--use-keyring` — was still genuinely slow underneath: retrieving the token from the system keychain hangs when `glab` is spawned from a signed app instead of a terminal, the exact same per-app permission mismatch already fixed for GitHub's CLI a few releases back. GitWand now preloads that token the same way it already does for `gh`, so a `glab` subprocess never has to touch the keychain at all.
+
+Separately, and more commonly, opening a repo GitWand had never seen before could very briefly ask GitHub about it instead of GitLab, and show a confusing sign-in error before quietly fixing itself a moment later. The dock's PR-count badge was checking in before GitWand had finished figuring out which forge a fresh repo actually used, defaulting to GitHub in the meantime. It now waits for that answer first, same as the rest of the PR panel already did.
+
+## v3.6.3 — August 2026
+
+Two follow-ups from the previous release, both closing loops that community reports opened.
+
+On Linux, the software-rendering fallback shipped in v3.6.2 didn't cover every case: some Wayland desktop setups still hit the same startup crash, because the failure was happening one step earlier than that fallback could reach, at EGL's own platform negotiation rather than compositing. A report with detailed diagnostic output pinned down exactly where, and confirmed it wasn't a packaging problem, just a genuine native-Wayland limitation. GitWand now also forces GTK onto XWayland on Linux, sidestepping that negotiation entirely.
+
+Amending the last commit, and splitting a commit into smaller ones, quietly stopped being reachable a few releases back when the Git Tree replaced the old flat commit log. Both actions kept working under the hood the whole time. They just lost their menu entries in the move. Right-click a commit in the Git Tree again, and Amend and Split are back where Revert used to end the list.
+
+## v3.6.2 — August 2026
+
+Four issues fixed and one long-requested workflow improvement, shipped together.
+
+Pulling with local uncommitted changes used to either work by luck or dead-end with a raw `cannot pull with rebase: you have unstaged changes` error. There's now a real answer: a new Settings → Git → "Pull with uncommitted changes" option lets GitWand park your changes for the duration of the pull and restore them automatically afterward — asking first by default, or auto-stashing silently if you'd rather it just handled it. If restoring them ever runs into a conflict, GitWand says so plainly instead of reporting a successful sync over a tree full of conflict markers.
+
+GitLab's merge request list — and the sidebar badge count — could hang the whole PR panel indefinitely: every `glab`-backed command was running its network call directly on the app's async runtime instead of a background thread, so a slow or stuck `glab` process parked a worker and blocked everything behind it. Every GitLab command now runs off the main runtime with its own timeout, so a hang now shows up as a clear "took too long to respond" message instead of freezing the app.
+
+The Stash Manager showed "Invalid Date" for every single stash — the date format GitWand asked git for is one the shipped macOS/Linux app's webview refuses to parse (it happened to work fine in a browser, which is presumably how this slipped through). Stash — and tag — dates now use a format every engine agrees on.
+
+And on Linux, a rendering failure could still abort the app on startup even after last release's software-rendering fallback, on setups where the failure originates earlier, at EGL display creation rather than compositing. A broader fallback now covers that path too. A second, unrelated bug hiding behind the same crash report — a telemetry panic that could in principle hit any platform on a very fast app exit — is fixed alongside it.
+
+## v3.6.1 — August 2026
+
+A bugfix-only release — six issues reported by the community, fixed and shipped together.
+
+Settings → Git → Default Branch now actually does something: repos whose mainline isn't `main` or `master` used to trip a recurring "failed to find 'main'" error every time GitWand needed a base for ahead/behind counts, merged-branch detection, or top-contributor stats. The configured branch is now tried first everywhere that matters, and if nothing resolves, GitWand falls back to your current branch instead of a hardcoded literal.
+
+Local branches with a slash in their name — `feature/onboarding`, `fix/123-thing` — could get checked out and created just fine, but switching away and back, or deleting them, would silently truncate the name to whatever came after the first `/`. The commit graph was guessing a ref's type from the presence of a slash alone; it no longer guesses.
+
+On GitLab repos, the PR overview panel was showing a GitHub-specific "install the GitHub CLI" error regardless of which forge you were actually using, and once `glab` was installed, listing merge requests failed outright on a flag `glab` doesn't support. Both are fixed — the error now names the right CLI, and merge request state filtering uses `glab`'s actual flags.
+
+Auto-resolving a conflict during a paused rebase looked like it did nothing — the conflict was genuinely resolved and staged, but the banner's Continue button and conflict hint didn't know that yet. They're back in sync now. While in there, the AI-assisted resolve button gained the same animated icon used everywhere else in the app instead of a barely-visible fade, and its explanation text got a nudge to stay in your chosen language more reliably.
+
+Settings → Git → Committer Identities used to require closing and reopening the panel before an add, edit, or delete actually showed up in the list. It now updates immediately.
+
+And on Linux, a WebKitGTK rendering failure on systems without a working hardware EGL context — VMs, older Mesa, missing GPU passthrough — could abort the app before a window ever appeared. GitWand now forces software rendering as a fallback on Linux, so it degrades gracefully instead of refusing to launch.
+
 ## v3.6.0 — July 2026
 
 ### Rebase conflicts no longer trap you behind a modal

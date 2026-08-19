@@ -497,7 +497,7 @@ pub(crate) async fn git_merge_continue(cwd: String) -> Result<GitPushPullResult,
 }
 
 #[tauri::command]
-pub(crate) async fn git_pull(cwd: String, strategy: String) -> Result<GitPushPullResult, String> {
+pub(crate) async fn git_pull(cwd: String, strategy: String, autostash: Option<bool>) -> Result<GitPushPullResult, String> {
     let _t0 = Instant::now();
     // Pass the strategy flag EXPLICITLY so the user's pull-mode choice is
     // authoritative. A bare `git pull` defers to the ambient `pull.rebase`
@@ -511,13 +511,17 @@ pub(crate) async fn git_pull(cwd: String, strategy: String) -> Result<GitPushPul
         "ff-only" => "--ff-only",
         _ => "--no-rebase",
     };
+    let mut args: Vec<&str> = vec!["pull", strategy];
+    if autostash.unwrap_or(false) {
+        args.push("--autostash");
+    }
     let _repo = repo_lock::write(&cwd);
     let output = git_cmd()
-        .args(["pull", strategy])
+        .args(&args)
         .current_dir(&cwd)
         .output()
         .map_err(|e| format!("Failed to run git pull: {}", e))?;
-    record_cmd(&format!("git pull {}", strategy), &cwd, _t0.elapsed().as_millis() as u64, output.status.code().unwrap_or(-1));
+    record_cmd(&format!("git {}", args.join(" ")), &cwd, _t0.elapsed().as_millis() as u64, output.status.code().unwrap_or(-1));
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -728,9 +732,9 @@ fn declared_submodule_paths(cwd: &str) -> std::collections::HashSet<String> {
 // ─── Git branches ──────────────────────────────────────────────
 
 #[tauri::command]
-pub(crate) async fn git_branches(cwd: String) -> Result<Vec<GitBranch>, String> {
+pub(crate) async fn git_branches(cwd: String, default_branch: Option<String>) -> Result<Vec<GitBranch>, String> {
     let _repo = repo_lock::read(&cwd);
-    let main_name = get_main_branch_name(&cwd);
+    let main_name = resolve_default_branch(&cwd, default_branch.as_deref());
     let output = git_cmd()
         .args([
             "branch", "-a",
@@ -827,21 +831,6 @@ pub(crate) async fn git_branches(cwd: String) -> Result<Vec<GitBranch>, String> 
     }
 
     Ok(branches)
-}
-
-fn get_main_branch_name(cwd: &str) -> String {
-    for name in ["main", "master", "origin/main", "origin/master"] {
-        if let Ok(output) = git_cmd()
-            .args(["rev-parse", "--verify", name])
-            .current_dir(cwd)
-            .output()
-        {
-            if output.status.success() {
-                return name.to_string();
-            }
-        }
-    }
-    "main".to_string()
 }
 
 #[tauri::command]
@@ -990,7 +979,7 @@ pub(crate) async fn git_stash_pop(cwd: String) -> Result<(), String> {
 pub(crate) async fn git_stash_list(cwd: String) -> Result<Vec<StashEntry>, String> {
     let _repo = repo_lock::read(&cwd);
     let output = git_cmd()
-        .args(["stash", "list", "--format=%H%x00%gd%x00%gs%x00%ai"])
+        .args(["stash", "list", "--format=%H%x00%gd%x00%gs%x00%aI"])
         .current_dir(&cwd)
         .output()
         .map_err(|e| format!("Failed to list stashes: {}", e))?;
@@ -1307,7 +1296,7 @@ pub(crate) async fn git_create_tag(cwd: String, name: String, sha: String, messa
 pub(crate) async fn git_list_tags(cwd: String) -> Result<Vec<TagEntry>, String> {
     let sep = "\x1f";
     let fmt = format!(
-        "%(refname:short){s}%(objecttype){s}%(objectname:short){s}%(*objectname:short){s}%(taggerdate:iso){s}%(creatordate:iso){s}%(contents:subject)",
+        "%(refname:short){s}%(objecttype){s}%(objectname:short){s}%(*objectname:short){s}%(taggerdate:iso-strict){s}%(creatordate:iso-strict){s}%(contents:subject)",
         s = sep
     );
     let output = git_cmd()
@@ -2798,9 +2787,10 @@ pub(crate) async fn git_author_line_stats(cwd: String) -> Result<Vec<AuthorLineS
 pub(crate) async fn git_branch_top_authors(
     cwd: String,
     branches: Vec<String>,
+    default_branch: Option<String>,
 ) -> Result<Vec<BranchTopAuthor>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base = get_main_branch_name(&cwd);
+        let base = resolve_default_branch(&cwd, default_branch.as_deref());
         let results: Vec<BranchTopAuthor> = branches
             .into_par_iter()
             .filter_map(|branch| {
@@ -4107,5 +4097,320 @@ mod interactive_rebase_tests {
         assert!(res.conflict, "a clashing reorder must report a conflict");
         // The repo is left mid-rebase; TempRepo's Drop cleans it up.
         let _ = repo.git(&["rebase", "--abort"]);
+    }
+}
+
+/// Regression coverage for #136: repos whose mainline is neither `main` nor
+/// `master` used to make `git_branches`/`git_branch_top_authors` fail with
+/// `fatal: failed to find 'main'`. These exercise the full Tauri commands
+/// end-to-end (not just the `resolve_default_branch` helper) against a
+/// "trunk"-only repo.
+#[cfg(test)]
+mod default_branch_setting_tests {
+    use super::*;
+    use crate::git::cmd::git_binary;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    impl TempRepo {
+        /// A repo whose only branch is `trunk` — no `main`/`master`, no remote.
+        fn new_trunk() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("gitwand-default-branch-test-{}-{}-{}", pid, n, nanos));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = TempRepo { path: dir };
+            repo.git_ok(&["init", "-q", "-b", "trunk"]);
+            repo.git_ok(&["config", "user.name", "Test"]);
+            repo.git_ok(&["config", "user.email", "test@example.com"]);
+            repo.git_ok(&["config", "commit.gpgsign", "false"]);
+            repo.write("a.txt", "1\n");
+            repo.commit_all("base");
+            repo
+        }
+        fn cwd(&self) -> String {
+            self.path.to_str().unwrap().to_string()
+        }
+        fn write(&self, rel: &str, content: &str) {
+            std::fs::write(self.path.join(rel), content).unwrap();
+        }
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            Command::new(git_binary())
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} spawn: {}", args, e))
+        }
+        fn git_ok(&self, args: &[&str]) {
+            let out = self.git(args);
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fn commit_all(&self, msg: &str) {
+            self.git_ok(&["add", "-A"]);
+            self.git_ok(&["commit", "-q", "-m", msg]);
+        }
+    }
+
+    #[test]
+    fn git_branches_no_longer_fails_when_mainline_is_not_main_or_master() {
+        let repo = TempRepo::new_trunk();
+        // Previously: hardcoded "main" fallback -> `%(ahead-behind:main)` ->
+        // `fatal: failed to find 'main'` -> Err(...) surfaced to the UI as a
+        // notification (#136). Must now succeed.
+        let branches = tauri::async_runtime::block_on(git_branches(repo.cwd(), None))
+            .expect("git_branches must not fail when the mainline isn't main/master");
+        assert!(branches.iter().any(|b| b.name == "trunk"));
+    }
+
+    fn make_bare_remote(dir_name_prefix: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{}-{}-{}-{}", dir_name_prefix, pid, n, nanos));
+        let out = Command::new(git_binary())
+            .args(["init", "--bare", "-q", "-b", "trunk"])
+            .arg(&dir)
+            .output()
+            .expect("git init --bare spawn");
+        assert!(
+            out.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    #[test]
+    fn git_branches_uses_the_configured_default_branch() {
+        let repo = TempRepo::new_trunk();
+        let bare = make_bare_remote("gitwand-default-branch-bare");
+        repo.git_ok(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        repo.git_ok(&["push", "-q", "-u", "origin", "trunk"]);
+        repo.git_ok(&["checkout", "-q", "-b", "feature"]);
+        repo.write("a.txt", "2\n");
+        repo.commit_all("feature work");
+        repo.git_ok(&["push", "-q", "-u", "origin", "feature"]);
+
+        // With "trunk" configured explicitly (Settings > Git > Default Branch),
+        // feature's ahead-count relative to trunk must be 1.
+        let branches = tauri::async_runtime::block_on(git_branches(
+            repo.cwd(),
+            Some("trunk".to_string()),
+        ))
+        .expect("git_branches with a configured default branch must succeed");
+        let feature = branches
+            .iter()
+            .find(|b| b.name == "feature")
+            .expect("feature branch present");
+        assert_eq!(feature.main_commit_count, 1);
+
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn git_branch_top_authors_no_longer_fails_when_mainline_is_not_main_or_master() {
+        let repo = TempRepo::new_trunk();
+        repo.git_ok(&["checkout", "-q", "-b", "feature"]);
+        repo.write("a.txt", "2\n");
+        repo.commit_all("feature work");
+
+        let authors = tauri::async_runtime::block_on(git_branch_top_authors(
+            repo.cwd(),
+            vec!["feature".to_string()],
+            None,
+        ))
+        .expect("git_branch_top_authors must not fail when the mainline isn't main/master");
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].branch, "feature");
+        assert_eq!(authors[0].name, "Test");
+    }
+}
+
+/// Regression coverage for #151: `git_stash_list` used git's lenient `%ai`
+/// ("2026-08-11 09:16:44 +0200"), which JavaScriptCore — the webview on the
+/// macOS/Linux builds — refuses to parse, so the Stash Manager rendered
+/// "Invalid Date" for every entry. The date must be strict ISO 8601 (`%aI`).
+#[cfg(test)]
+mod stash_and_tag_date_tests {
+    use super::*;
+    use crate::git::cmd::git_binary;
+    use regex::Regex;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// `%aI` / `:iso-strict` emit a bare `Z` for UTC commits and `±HH:MM`
+    /// otherwise — both are accepted by `new Date()` in every JS engine.
+    const STRICT_ISO: &str = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$";
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    impl TempRepo {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir =
+                std::env::temp_dir().join(format!("gitwand-date-test-{}-{}-{}", pid, n, nanos));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = TempRepo { path: dir };
+            repo.git_ok(&["init", "-q", "-b", "main"]);
+            repo.git_ok(&["config", "user.name", "Test"]);
+            repo.git_ok(&["config", "user.email", "test@example.com"]);
+            repo.git_ok(&["config", "commit.gpgsign", "false"]);
+            repo.git_ok(&["config", "tag.gpgsign", "false"]);
+            repo
+        }
+        fn cwd(&self) -> String {
+            self.path.to_str().unwrap().to_string()
+        }
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            Command::new(git_binary())
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} spawn: {}", args, e))
+        }
+        fn git_ok(&self, args: &[&str]) {
+            let out = self.git(args);
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fn write(&self, rel: &str, content: &str) {
+            std::fs::write(self.path.join(rel), content).unwrap();
+        }
+        fn commit_all(&self, msg: &str) {
+            self.git_ok(&["add", "-A"]);
+            self.git_ok(&["commit", "-q", "-m", msg]);
+        }
+    }
+
+    #[test]
+    fn stash_list_dates_are_strict_iso_8601() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("base");
+
+        repo.write("a.txt", "v2\n");
+        repo.git_ok(&["stash", "push", "-q", "-m", "first stash"]);
+        repo.write("a.txt", "v3\n");
+        repo.git_ok(&["stash", "push", "-q", "-m", "second stash"]);
+
+        let entries = tauri::async_runtime::block_on(git_stash_list(repo.cwd()))
+            .expect("git_stash_list must succeed on a repo with stashes");
+
+        assert_eq!(entries.len(), 2, "both stashes must be listed");
+        let re = Regex::new(STRICT_ISO).unwrap();
+        for e in &entries {
+            assert!(
+                re.is_match(&e.date),
+                "stash date {:?} is not strict ISO 8601 — the webview will render \
+                 \"Invalid Date\" (#151)",
+                e.date
+            );
+            // A space separator or a colon-less offset is exactly the %ai shape
+            // this test exists to keep out.
+            assert!(!e.date.contains(' '), "date must not contain a space: {:?}", e.date);
+        }
+        // Sanity: the rest of the entry is still parsed correctly.
+        assert_eq!(entries[0].message, "second stash");
+        assert_eq!(entries[0].branch, "main");
+        assert_eq!(entries[1].message, "first stash");
+    }
+
+    #[test]
+    fn stash_list_date_round_trips_to_the_commit_timestamp() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("base");
+        repo.write("a.txt", "v2\n");
+        repo.git_ok(&["stash", "push", "-q", "-m", "anchored"]);
+
+        let entries = tauri::async_runtime::block_on(git_stash_list(repo.cwd())).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // The reported date must equal git's own iso-strict rendering of the
+        // stash commit — guards against a future "reformat it ourselves" change
+        // silently shifting the timezone.
+        let iso_strict_from_git = String::from_utf8_lossy(
+            &repo
+                .git(&["log", "-1", "--date=iso-strict", "--format=%ad", &entries[0].hash])
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            entries[0].date, iso_strict_from_git,
+            "date must equal git's own iso-strict rendering of the stash commit"
+        );
+    }
+
+    #[test]
+    fn tag_list_dates_are_strict_iso_8601() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("base");
+        // Annotated tag → taggerdate; lightweight tag → creatordate. git_list_tags
+        // picks one or the other (ops.rs), so both paths need coverage.
+        repo.git_ok(&["tag", "-a", "v1.0.0", "-m", "release 1.0.0"]);
+        repo.git_ok(&["tag", "lightweight"]);
+
+        let tags = tauri::async_runtime::block_on(git_list_tags(repo.cwd()))
+            .expect("git_list_tags must succeed");
+        assert_eq!(tags.len(), 2, "both tags must be listed");
+
+        let re = Regex::new(STRICT_ISO).unwrap();
+        for t in &tags {
+            assert!(
+                re.is_match(&t.date),
+                "tag {:?} date {:?} is not strict ISO 8601 — TagsPanel.relativeDate \
+                 renders \"NaN years ago\" (#151, sibling of the stash bug)",
+                t.name,
+                t.date
+            );
+        }
+        assert!(
+            tags.iter().any(|t| t.name == "v1.0.0" && t.is_annotated),
+            "the annotated tag must be flagged is_annotated"
+        );
     }
 }
