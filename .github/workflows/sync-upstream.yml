@@ -43,9 +43,33 @@ jobs:
 
           git switch -C "$SYNC_BRANCH" origin/main
           if ! git merge --no-edit upstream/main; then
-            git merge --abort
-            echo "::error::upstream/main conflicts with this fork and must be merged manually."
-            exit 1
+            mapfile -t conflicted_paths < <(
+              git diff --name-only --diff-filter=U
+            )
+            unexpected_conflict=false
+
+            for path in "${conflicted_paths[@]}"; do
+              case "$path" in
+                .github/workflows/ci.yml|.github/workflows/perf.yml|.github/workflows/release.yml)
+                  # These upstream workflows are intentionally absent from the
+                  # Nix fork. Keep the deletion when upstream modifies them.
+                  git rm -- "$path"
+                  ;;
+                *)
+                  echo "::error file=$path::Unexpected conflict while merging upstream/main."
+                  unexpected_conflict=true
+                  ;;
+              esac
+            done
+
+            if [[ "$unexpected_conflict" == true ]] || \
+              git diff --name-only --diff-filter=U | grep -q .; then
+              git merge --abort
+              echo "::error::upstream/main conflicts with this fork and must be merged manually."
+              exit 1
+            fi
+
+            git commit --no-edit
           fi
 
           git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
