@@ -159,8 +159,24 @@ export function matchGlob(pattern: string, filePath: string): boolean {
   return globRegex(normalizedPattern).test(normalizedPath);
 }
 
-/** Convertit un pattern glob en RegExp. */
+/**
+ * Cache module-level pattern glob → `RegExp` compilée. `matchGlob` est appelé une fois par
+ * valeur candidate dans le scanner de secrets (une fois par match de pattern, une fois par
+ * token d'entropie) et une fois par override lookup dans `effectivePolicyForFile` — sans ce
+ * cache, `globRegex` recompilait le même petit ensemble de patterns (12+ globs par défaut du
+ * scanner de secrets, overrides `.gitwandrc`) à chaque appel. Miroir du cache `CompiledIgnore`
+ * côté Rust (`apps/desktop/src-tauri/src/commands/secrets.rs`). `Map` pur JS — zéro dépendance
+ * Node.js, compatible browser (AGENTS.md « packages/core = zéro Node.js »). Borné par le nombre
+ * de patterns distincts réellement rencontrés (built-ins + config utilisateur) : pas de fuite
+ * mémoire dans l'usage actuel.
+ */
+const GLOB_REGEX_CACHE = new Map<string, RegExp>();
+
+/** Convertit un pattern glob en RegExp (mémoïsé — voir `GLOB_REGEX_CACHE`). */
 function globRegex(pattern: string): RegExp {
+  const cached = GLOB_REGEX_CACHE.get(pattern);
+  if (cached) return cached;
+
   // Échapper les caractères spéciaux regex, puis replacer les globs
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&") // échapper les caractères regex
@@ -169,7 +185,9 @@ function globRegex(pattern: string): RegExp {
     .replace(/\?/g, "[^/]")                // ? → un char sauf /
     .replace(/§DSTAR§/g, ".*");            // ** → tout (y compris /)
 
-  return new RegExp(`^${escaped}$`);
+  const re = new RegExp(`^${escaped}$`);
+  GLOB_REGEX_CACHE.set(pattern, re);
+  return re;
 }
 
 // ─── Effective policy ─────────────────────────────────────
@@ -320,6 +338,30 @@ export interface GitWandrcConfig {
     ignore?: string[];
     /** Seuil d'entropie Shannon (bits/char) pour la détection de secrets à haute entropie, [0, 8]. 0 désactive. */
     entropyThreshold?: number;
+  };
+  /**
+   * v3.7.0 — Opt-in per-repo AI review of the staged diff ("Commit Review").
+   *
+   * ```jsonc
+   * {
+   *   "commitReview": {
+   *     "enabled": true,
+   *     "minConfidence": 70,
+   *     "maxFindings": 15,
+   *     "maxFiles": 30
+   *   }
+   * }
+   * ```
+   */
+  commitReview?: {
+    /** Master switch, combined with the app setting `commitReviewEnabled`. Overrides it either way. */
+    enabled?: boolean;
+    /** Minimum confidence (0-100) a finding must reach to be shown. */
+    minConfidence?: number;
+    /** Cap on the number of findings shown (1-200). */
+    maxFindings?: number;
+    /** Cap on the number of staged files sent through the review pass (1-500). */
+    maxFiles?: number;
   };
 }
 
@@ -477,6 +519,30 @@ export function parseGitwandrc(json: string): GitWandrcConfig | null {
 
       if (Object.keys(secrets).length > 0) {
         result.secrets = secrets;
+      }
+    }
+
+    // v3.7.0 — Commit Review opt-in config.
+    if (parsed.commitReview && typeof parsed.commitReview === "object") {
+      const cr = parsed.commitReview;
+      const commitReview: NonNullable<GitWandrcConfig["commitReview"]> = {};
+
+      if (typeof cr.enabled === "boolean") commitReview.enabled = cr.enabled;
+
+      if (typeof cr.minConfidence === "number" && cr.minConfidence >= 0 && cr.minConfidence <= 100) {
+        commitReview.minConfidence = cr.minConfidence;
+      }
+
+      if (typeof cr.maxFindings === "number" && cr.maxFindings >= 1 && cr.maxFindings <= 200) {
+        commitReview.maxFindings = cr.maxFindings;
+      }
+
+      if (typeof cr.maxFiles === "number" && cr.maxFiles >= 1 && cr.maxFiles <= 500) {
+        commitReview.maxFiles = cr.maxFiles;
+      }
+
+      if (Object.keys(commitReview).length > 0) {
+        result.commitReview = commitReview;
       }
     }
 
