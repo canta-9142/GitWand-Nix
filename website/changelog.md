@@ -5,6 +5,56 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.8.0 — August 2026
+
+Undo, for the parts of git that never had one.
+
+GitWand has had an undo stack since v1.2, but it was built on `git reflog`, and the reflog only knows about things that move a ref. Commit, merge, rebase, pull: recoverable. Everything else, which is most of what actually loses work, was not. Discard a file and it was gone. Reset with uncommitted changes and they were gone. Let the engine auto-apply resolutions across seven files and there was no way back to the conflict markers you started from.
+
+Time Machine closes that gap. Before every destructive operation, GitWand now captures a snapshot of the working tree, the index, and the conflict state, and hands you a way back.
+
+The capture is real git, not a copy of your folder somewhere. It writes the same kind of object graph `git stash create` does, anchored under a ref namespace of its own, which means it costs nothing beyond the objects themselves, it never touches your stash list, and git's own garbage collection reclaims it once the retention window closes. Two things it does that stash cannot: it captures untracked files, and it survives a conflicted index. Both matter, because discarding untracked work and rewinding a half-applied merge resolution are exactly the cases this exists for.
+
+Restoring goes back through plumbing rather than `checkout`, deliberately. A checkout refuses to run on a dirty working tree, which is precisely the state you are in when you need an undo.
+
+The part that took the longest to get right was not the mechanism but where to put it. GitWand already had a rewind popover, so adding a second Time Machine surface beside it would have split one mental action across two places. The popover keeps its trigger and its position; only its contents changed, from git's reflog alone to that reflog merged with the new snapshots, with the operations that produce both collapsed into one row. A link at the bottom opens the full history when you want it.
+
+More importantly, a safety net nobody knows about is not a safety net. Discarding a file gave no feedback whatsoever before this release. Now it says so, with an Undo button and a `⌘Z` hint sitting right where the action happened. `⌘Z` and `⇧⌘Z` work at the repo level too, and they answer back through the same toast, so the shortcut tells you what it did rather than appearing to do nothing.
+
+Restoring is itself undoable. A snapshot of the current state is taken before every restore, and the confirmation dialog says as much, which is the difference between this and `git reset --hard`.
+
+Snapshots are pruned on an age and a count cap, checked when you open a repo rather than on a timer. Everything is optional: turn snapshots off and the timeline falls back to exactly the reflog view of previous versions. There is also an opt-in AI labelling pass if you want one-line summaries in the timeline instead of the mechanical ones.
+
+None of this leaks into your history. GitWand excludes its own snapshot refs from every history traversal it runs, so the Git Tree, commit counts and contributor stats are untouched, and nothing is pushed.
+
+## v3.7.3 — August 2026
+
+A community report from someone running a self-hosted GitLab instance: GitWand's PR panel kept showing GitHub, even though their `glab` CLI was correctly logged in and everything else about their setup was fine.
+
+The forge detection GitWand uses to decide which provider to talk to worked by scanning the remote URL's text for a recognizable name — `github.com`, `gitlab.com`, or just the word "gitlab" anywhere in the URL for a self-hosted instance. That covers the common case (`git.company.com/gitlab/...`), but breaks the moment a self-hosted instance sits on a hostname that doesn't happen to contain that word, an internal alias like `forge`, for instance. With nothing left to match, detection gave up and the interface quietly fell back to GitHub instead of admitting it didn't know.
+
+The fix asks the CLI itself instead of trying to guess from the hostname. When the URL doesn't give away the forge, GitWand now checks whether `glab` or `gh` is authenticated for that exact host, the same information those tools already track internally. Whichever one says yes wins, so a self-hosted GitLab instance is now recognized correctly regardless of what its hostname happens to look like, as long as it's a host you've already logged into via CLI.
+
+## v3.7.2 — August 2026
+
+One fix, and an embarrassing one: the conflict predictor was wrong every single time, always in the same direction.
+
+`gitwand preview --onto=main` exists to answer one question before you start a rebase or a merge: how much of this can GitWand handle on its own? It was answering "none of it". Every file came back as 0 auto-resolvable and every operation came back rated HIGH risk, regardless of what the engine would happily resolve a second later if you ran `gitwand resolve` on the very same conflicts.
+
+The cause was one option passed at the wrong layer. The predictor asked the engine to classify the conflicts without applying anything, which is the right instinct, since a prediction has no business touching your files. But that mode returns early, before the format-aware resolvers and the confidence gate ever run, so the number of resolvable conflicts it reported was structurally zero rather than measured. Prediction and resolution were reading the same engine and disagreeing completely.
+
+On the four-file PHP rebase used to verify the fix, the predictor now reports 6 of 7 conflicts auto-resolvable, with the one file that genuinely needs a human sitting at 0 of 1. The same repo reported 0 of 7 before.
+
+Two MCP tools had the same flaw, `gitwand_status` and `gitwand_preview_merge`, so a coding agent asking GitWand what it could resolve was told "nothing" and presumably went off to do the work itself. The desktop merge preview takes a different path and was never affected.
+
+## v3.7.1 — August 2026
+
+[Cursor Origin](https://cursor.com/docs/origin) is Cursor's git forge, still in early beta, and GitWand had never heard of it: a repo with an `origin.cursor.com` remote showed up as an unrecognized forge, and opening the PR panel fired off GitHub CLI calls that failed with a baffling GitHub auth error, on a repo that has nothing to do with GitHub. GitWand now recognizes Origin remotes for what they are. This is deliberately detection only, not a full integration: Origin's API currently only documents an app-auth model built for server-to-server access rather than a desktop client, and it's still moving underneath its beta tag, so a real `OriginProvider` is on hold until that settles. In the meantime, the PR panel is honest about it instead of pretending: it offers to open the repo on the web, hides both "New PR" buttons instead of leaving them to fail, and Today no longer suggests connecting an account type that doesn't exist for this forge. Everything else, clone, push, pull, merges, and the whole conflict-resolution engine, already worked fine on an Origin repo and needed no changes; none of it goes through a forge integration in the first place.
+
+A pre-existing bug got fixed along the way: "View on forge" for a commit on an Azure DevOps repo was building a `github.com` link instead of an Azure one, because the shared URL parser assumed every remote had the same shape GitHub's does. Azure's shapes are different enough (five different ones, depending on how you're connected) that a proper parser was worth writing rather than special-casing around the edges.
+
+And `dompurify`, the library behind every bit of user-generated HTML GitWand sanitizes before showing it to you, moved up two patch versions upstream to close a few narrow XSS-adjacent edge cases in how hooks interact with in-place sanitization.
+
 ## v3.7.0 — August 2026
 
 Commit Review — the biggest addition to the Changes panel since it shipped. A button now sits right in the commit area: click it, and GitWand runs the same AI review pipeline that already checks your pull requests against whatever's staged, right there, before you commit. Findings show up inline in the diff with severity badges, and you cycle through them with `n` and `p`, dismissing what doesn't matter with `x` — no separate view, no context switch.

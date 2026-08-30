@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Merge Room on `/agent`.** The page is now a shared workspace rather than a tool listing. Tool handlers no longer just return text to the agent: they file a case into live page state that the person sitting there watches fill up. The engine settles every hunk that carries no decision; every hunk where the two branches genuinely disagree queues for a human, who picks a side and gets the assembled file back, ready to paste. No tool on the page can make that call, which is the boundary the whole thing is built around. A live journal records who did what, agent and human alike.
+- **`list_cases`**, a third WebMCP tool, lets an agent read the room back: what is filed, what the engine settled, what is still waiting on a person, what they have already decided. It is what turns a stateless calculator into a workspace an agent can pick back up.
+
+### Fixed
+
+- **`parse_git_error` did not recognise a rebase that stopped on a conflict.** The catalogue only knew the phrases git prints when you try to *start* a rebase while one is already unfinished (`rebase-merge directory`), not the ones it prints when a rebase *halts*, which is the far more common paste. Reported by an agent audit of the live page. It now keys on the rebase-specific commands, and a halted cherry-pick gets its own entry rather than being mislabelled a rebase: both print `could not apply`, so matching on that phrase would have handed out `git rebase --continue` to someone mid-cherry-pick.
+
+### Added
+
+- **`/agent`, a WebMCP page.** gitwand.app/agent exposes two read-only git tools to any agent browsing it, over the W3C WebMCP standard: `parse_git_error` explains a failing git command and gives the commands that fix it, `resolve_conflict` runs the deterministic engine over a conflicted file and reports per hunk what was resolved and what still needs a human. Both execute in the visitor's tab, so nothing is uploaded and there is no backend. `@gitwand/core` is imported on demand rather than at module scope, which keeps it out of the shared theme chunk every page downloads.
+- The page states its own registration status live, including when the browser has no WebMCP at all, and writes both tool contracts out in HTML and JSON-LD for the majority of visitors and crawlers that will never run the script.
+- **A try-it panel on `/agent`.** Both tools can be run by hand from the page, against editable sample inputs, so the majority of visitors whose browser has no WebMCP can still see what an agent gets back. It calls the same `execute` an agent calls rather than a mock, and deliberately does not feed the agent call counter.
+
+### Changed
+
+- **The engine speaks English.** Every explanation, resolution reason, decision-trace step, confidence booster and penalty `@gitwand/core` produces was written in French. None of the consumers translate them, so the desktop merge editor, the CLI summary and the `@gitwand/mcp` `explanation` / `resolutionReason` fields have been handing French text to every user and every agent, whatever their locale. 194 strings translated across 38 files. Comments and test names stay French: this is only about what leaves the engine.
+- A regression guard (`__tests__/english-output.test.ts`) runs the engine over the whole corpus and asserts that no string it hands back is French, checking real output rather than scanning source so it cannot be fooled by how a string is assembled. It caught four strings a source scan had missed, including one with no accented characters in it.
+
+### Fixed
+
+- **`pnpm test` was non-deterministic (#172).** Suites that use real git repositories are subprocess-bound, not CPU-bound, and were timing out under the load of the whole monorepo testing at once. Every git-backed suite now shares a 60s timeout, chosen to catch a hang rather than to enforce a performance budget. Running workspaces one at a time turned out to be **faster** as well as deterministic (49s against 119s), because five packages each fanning out to one worker per core oversubscribes the machine several times over, so `pnpm test` now passes `--workspace-concurrency=1`. Eleven consecutive full runs green, against roughly one failure in three before.
+
+- **Site-wide WebMCP tools went dark on browsers without `navigator.modelContext`.** The registration script bailed out entirely unless the deprecated `navigator` location existed, so the three documentation tools would disappear the day Chrome removes the alias it deprecated in 150. It now prefers `document.modelContext`, where the spec has put the entry point since 27 May 2026, and falls back to `navigator` only when that is all the browser offers. It registers once either way: on the versions exposing both names they alias the same object, so registering on both would have duplicated every tool.
+- **WebMCP tools could never be unregistered.** `signal` was passed as a property of the tool dictionary, which declares no such member, so it was silently dropped. It now goes in the options argument where `ModelContextRegisterToolOptions` expects it.
+
+## [3.8.0] - 2026-08-24
+
+### Added
+
+- **Time Machine — repo snapshots & global undo.** Every destructive operation (discard, reset, checkout, branch switch, bulk resolution apply) now captures a restorable snapshot first: the working tree including untracked files, the index, and conflict stages 1/2/3. Snapshots are written with git plumbing under `refs/gitwand/snapshots/`, so they cost nothing until git's own `gc` reclaims them and they are never pushed by the default refspec. Restoring uses `read-tree` rather than `checkout`, so it cannot refuse on a dirty tree, which is the state an undo has to recover from.
+- **Undo where the action happened.** A discard used to give no feedback at all. It now surfaces a single-slot toast with an "Undo" button and a `⌘Z` hint, which is what makes the safety net discoverable rather than a panel you have to remember exists.
+- **Global `⌘Z` / `⇧⌘Z`.** Outside the merge editor these rewind and replay repo operations. The keyboard path reports through the same toast the buttons use, so it says either "Restored" or "Nothing to undo" instead of failing silently.
+- **One timeline over two sources.** The existing rewind popover (`⌘⇧U`, and Actions > Rewind) now lists GitWand snapshots merged with git's reflog rather than the reflog alone, deduplicating the operations that produce both. A footer link opens a full-history modal with source filters. Restoring is itself undoable, since a `pre-restore` snapshot is taken first, and the confirmation says so.
+- **Retention settings** — enable/disable snapshots, an age cap (default 14 days) and a count cap (default 200), pruned on repo open rather than on a timer. Plus opt-in one-line AI snapshot labels, following the Quick Stash label pattern.
+- `snapshot_create` / `snapshot_list` / `snapshot_restore` / `snapshot_prune` Tauri commands, each with a real `dev-server.mjs` route and parity coverage.
+
+### Fixed
+
+- Snapshot refs are excluded from every `--all` history traversal GitWand runs, so the Git Tree, the hidden-commit count, the contributor shortlog and per-author line churn are unaffected. (A `git log --all` typed at the terminal still shows them, exactly as it shows `refs/stash`.)
+- Ref moves made by a restore carry an explicit reflog message. Without one git writes an empty reflog entry, which showed as a blank row in the timeline and as an unexplained line in the user's own `git reflog`.
+- Restoring a snapshot taken *before* a merge started now clears `MERGE_HEAD` and `MERGE_MSG` as well. Previously the merge state survived the rewind, so `git status` reported "you are still merging" over a tree that no longer contained the merge, and the next commit became a merge commit that silently re-merged the branch the user had just undone.
+- A failed index restore no longer leaves the index wiped. The restored index is now built in a scratch `GIT_INDEX_FILE` and moved into place only once `update-index` has succeeded; previously the live index was emptied first, so any failure in the second step left every tracked file reading as deleted-from-index with no rollback.
+- `⌘Z` and `⇧⌘Z` report a failed restore instead of doing nothing. The keyboard path opens neither the popover nor the modal, which are the only places the error was rendered, so a failure was silent and surfaced only as an unhandled rejection.
+- The undo toast rewinds the snapshot its own operation created, rather than whatever point happens to be newest when the button is clicked, and steps aside once the repo has moved on. An offer reading "1 file discarded" could previously undo a commit made inside its 8-second window; restoring blind would equally have dragged that commit along, since a snapshot restore rewinds HEAD too.
+- `prune_snapshots_inner` refuses a 0-day or 0-count retention outright, in both the Rust engine and the dev-server port. The frontend already clamped at the input and guarded again before the call; this is the last layer before the refs go, and it also covers a hand-edited settings file.
+- Opt-in AI snapshot labels now persist in a linked worktree. They were written to a sidecar under `.git/`, which is a file rather than a directory in any linked worktree, so every read and write failed with `ENOTDIR` and was silently swallowed; they live in `localStorage` keyed by repo path now, like the other ancillary per-repo state.
+- The snapshot retention fields refuse a value that would delete every snapshot. Clearing the input yields `Number("") === 0`, which was persisted verbatim and made the next prune wipe the whole undo history; the value is now clamped at the input and the destructive case is rejected again before the backend is called.
+
+## [3.7.3] - 2026-08-25
+
+### Fixed
+
+- **Self-hosted GitLab remotes fell through to the GitHub provider in the PR panel** (#168). `detect_provider()` only recognized a GitLab remote by matching the literal substring `"gitlab"` in the URL, so a self-hosted instance on a hostname that doesn't contain it (e.g. an internal alias like `forge`) was classified `"unknown"`, and the frontend's `githubProvider` fallback kicked in — even though `glab` was correctly authenticated for that host. `git_remote_info` now falls back to probing `glab auth status --hostname <host>` (then `gh auth status --hostname <host>`) from the repo directory whenever the URL-based detection is inconclusive, so any self-hosted forge the user has already authenticated via CLI is recognized regardless of hostname. `dev-server.mjs` (the `pnpm dev:web` mock backend) intentionally does not mirror this CLI probe, matching its existing "no glab in dev:web" mock-only design; an unrecognized host there still resolves to `"unknown"`.
+
+## [3.7.2] - 2026-08-24
+
+### Fixed
+
+- **The conflict predictor reported 0% auto-resolvable on every conflict.** `gitwand preview --onto=<ref>` (and the MCP `gitwand_status` / `gitwand_preview_merge` tools) called `resolve()` with `{ explainOnly: true }` and then read `stats.autoResolved`. That flag short-circuits `resolveHunk()` before the format-aware dispatch and the confidence gate, returning `lines: null` for every hunk, so `autoResolved` was structurally always `0`. Every file showed `0/N auto-resolvable` and every operation came back `Risk: HIGH`, whatever the engine could actually do. On a real 4-file rebase the predictor now reports `6/7` where it previously reported `0/7`. These three call sites predict over in-memory content and never write, so `explainOnly` bought nothing. The desktop merge preview goes through `useMergePreview` and was never affected.
+
+## [3.7.1] - 2026-08-21
+
+### Added
+
+- **Cursor Origin remote detection** (#165) — [Cursor Origin](https://cursor.com/docs/origin) remotes (`origin.cursor.com`) are now recognized instead of falling through to `unknown`, which previously routed PR-panel calls at the GitHub provider and surfaced a confusing GitHub-auth error on a repo that has nothing to do with GitHub. This is detection only (Phase 1, a real `OriginProvider`, is deferred until Origin's app-auth model and API stabilize out of beta): the PR panel now shows an honest "Open on the web" state, both "New PR" buttons are hidden via a provider-driven `forgeSupportsPRs()` check instead of only after a failed call, and Today no longer offers to "connect" an account type that can't exist for this forge. `detect_provider()` was extracted out of `git_remote_info` into `git/parse.rs` (unit-testable, mirrored in `dev-server.mjs`), with new parity coverage for `git-remote-info`, which previously had none despite the detection chain being duplicated verbatim between the Rust backend and the Node dev-server.
+
+### Fixed
+
+- **Azure DevOps "View on forge" commit URLs pointed at GitHub** (#165) — `forgeCommitUrl()` built a `github.com` URL for Azure DevOps repos because the generic owner/repo parser split `https://dev.azure.com/myorg/myproj/_git/myrepo` incorrectly and hit the GitHub fallback. It now resolves org/project through the same `parseAzureRemote()` logic already used server-side (`parse_azure_remote()` in `commands/azure.rs`), covering all five documented remote shapes (`dev.azure.com`, `user@` userinfo, legacy `visualstudio.com`, the `DefaultCollection` segment, and SSH `v3/`); an unparseable Azure remote now returns `null` instead of silently producing a broken GitHub-shaped link.
+
+### Security
+
+- Bumped `dompurify` (used by `useSafeHtml.ts` to sanitize user-generated HTML) from 3.4.11 to 3.4.13 — fixes for a hook-removal issue during `IN_PLACE` sanitization, a clone-guard bypass via hooks, and DOM clobbering via `ownerDocument` during `IN_PLACE`.
+
 ## [3.7.0] - 2026-08-19
 
 ### Added
@@ -24,6 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dev-server.mjs`'s `/api/read-gitwandrc` route now sends CORS headers on its success paths, fixing `.gitwandrc` testability via `pnpm dev:web`.
 - The Hooks panel now visibly distinguishes a foreign/hand-written pre-commit hook from "nothing installed" instead of showing the same state for both.
 - The folder picker's "Select this folder" button now uses the currently typed path instead of silently ignoring it unless Enter was pressed first.
+- **`gh_list_prs` 30s timeout reappeared** (#161 follow-up) — the per-PR `+`/`-` stats enrichment added after v2.8.5 ran a `git fetch origin` and one sequential `git diff --numstat` per PR with no timeout on any of it, unlike `glab`'s commands (`GLAB_TIMEOUT`, #149). A slow remote or a large PR list could blow past the frontend's 30s IPC timeout with nothing server-side to bound or kill the subprocesses. The `gh pr list` call is now bounded by the same 20s `output_with_timeout` pattern as GitLab's commands, the `git fetch origin` is throttled to once per 30s per repo (mirroring `azure.rs`'s existing fetch throttle) and itself bounded to 5s, and the per-PR numstat diffs now run in parallel (`rayon`) instead of in series.
+- **GitLab MR list still showed `+0 -0`** — the v3.6.5 fix computed real additions/deletions from the diffs endpoint but only wired it into the single-MR detail view (`gl_get_mr`), leaving the list view's per-row fetch out on purpose to avoid reintroducing the #149 timeout risk. `gl_list_mrs_inner` now fetches diff stats per MR under the same shared wall-clock budget (`ROLLUP_BUDGET`) already used for the pipeline-rollup fan-out, so the list gets real stats without doubling the worst-case latency.
+- **Diff-view "add a comment" tooltip was hardcoded in French** regardless of app locale — `PrInlineDiff.vue`'s line-number hover title used the literal string `'Ajouter un commentaire'` instead of going through i18n. Added `pr.inline.commentTooltip` to all 5 locale files and switched the 4 call sites to `t(...)`.
 
 ## [3.6.6] - 2026-08-19
 
@@ -1324,7 +1403,11 @@ Design-system foundations — the app header and every overlay now ride on a sha
 - CI pipeline via GitHub Actions (Node 18, 20, 22)
 - 28 tests covering all patterns + real-world scenarios (package.json, Laravel routes, Vue SFC, CSS, .env files)
 
-[Unreleased]: https://github.com/devlint/GitWand/compare/v3.7.0...HEAD
+[Unreleased]: https://github.com/devlint/GitWand/compare/v3.8.0...HEAD
+[3.8.0]: https://github.com/devlint/GitWand/compare/v3.7.3...v3.8.0
+[3.7.3]: https://github.com/devlint/GitWand/compare/v3.7.2...v3.7.3
+[3.7.2]: https://github.com/devlint/GitWand/compare/v3.7.1...v3.7.2
+[3.7.1]: https://github.com/devlint/GitWand/compare/v3.7.0...v3.7.1
 [3.7.0]: https://github.com/devlint/GitWand/compare/v3.6.6...v3.7.0
 [3.6.6]: https://github.com/devlint/GitWand/compare/v3.6.5...v3.6.6
 [3.6.5]: https://github.com/devlint/GitWand/compare/v3.6.4...v3.6.5

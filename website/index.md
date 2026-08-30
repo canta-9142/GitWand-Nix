@@ -1,7 +1,7 @@
 ---
 layout: page
 title: GitWand — the Git client that actually resolves conflicts
-description: GitWand is a free, open-source, native Git client that auto-resolves 95% of trivial merge conflicts with 8 deterministic patterns — no guessing, no hallucinations. Built with Tauri and Rust, with an MCP server for AI agents. macOS, Linux, Windows.
+description: GitWand is a free, open-source, native Git client that auto-resolves the merge conflicts that were never decisions, using 8 deterministic patterns — no guessing, no hallucinations. Built with Tauri and Rust, with an MCP server for AI agents. macOS, Linux, Windows.
 head:
   - - meta
     - property: og:title
@@ -18,11 +18,11 @@ head:
         "name": "GitWand",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "macOS, Linux, Windows",
-        "description": "A free, open-source, native Git client that auto-resolves 95% of trivial merge conflicts deterministically, with a per-hunk confidence score and full decision trace. Includes a CLI, a VS Code extension and an MCP server for AI agents.",
+        "description": "A free, open-source, native Git client that auto-resolves deterministically the merge conflicts that carry no decision, with a per-hunk confidence score and full decision trace. Includes a CLI, a VS Code extension and an MCP server for AI agents.",
         "url": "https://gitwand.app",
         "downloadUrl": "https://github.com/devlint/GitWand/releases",
         "license": "https://opensource.org/licenses/MIT",
-        "softwareVersion": "3.7.0",
+        "softwareVersion": "3.8.0",
         "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
         "author": { "@type": "Organization", "name": "Devlint", "url": "https://github.com/devlint" }
       }

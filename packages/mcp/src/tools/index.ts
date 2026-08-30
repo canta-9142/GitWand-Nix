@@ -468,7 +468,11 @@ async function toolStatus(cwd: string) {
     const filePath = resolvePath(cwd, file);
     try {
       const content = readFileSync(filePath, "utf-8");
-      const result = resolve(content, file, { explainOnly: true });
+      // NOT `explainOnly`: that flag short-circuits `resolveHunk` before the
+      // format-aware dispatch and the confidence gate, so every hunk comes back
+      // unresolved and `stats.autoResolved` is always 0. This is a prediction on
+      // in-memory content, nothing is written, so run the real resolution.
+      const result = resolve(content, file);
       addByType(aggregateByType, result.stats.byType);
       return {
         path: file,
@@ -489,7 +493,7 @@ async function toolStatus(cwd: string) {
 
   const totalConflicts = conflicts.reduce((s: number, c: Record<string, unknown>) => s + ((c.totalConflicts as number) ?? 0), 0);
   const totalResolvable = conflicts.reduce((s: number, c: Record<string, unknown>) => s + ((c.autoResolvable as number) ?? 0), 0);
-  // v2.7 — "recoverable-before-model" : of the residual past the trivial passes,
+  // v3.4 — "recoverable-before-model" : of the residual past the trivial passes,
   // how much is still recoverable deterministically before the model is invoked.
   const tierSummary = summarizeTiers(aggregateByType as Record<ConflictType, number>);
 
@@ -547,7 +551,7 @@ async function toolResolve(cwd: string, args: Record<string, unknown>) {
 
   const totalConflicts = results.reduce((s: number, r: Record<string, unknown>) => s + ((r.totalConflicts as number) ?? 0), 0);
   const totalResolved = results.reduce((s: number, r: Record<string, unknown>) => s + ((r.autoResolved as number) ?? 0), 0);
-  // v2.7 — "recoverable-before-model" tier summary, see summarizeTiers() in @gitwand/core.
+  // v3.4 — "recoverable-before-model" tier summary, see summarizeTiers() in @gitwand/core.
   const tierSummary = summarizeTiers(aggregateByType as Record<ConflictType, number>);
 
   return {
@@ -592,7 +596,11 @@ async function toolPreview(cwd: string, args: Record<string, unknown>) {
     const filePath = resolvePath(cwd, file);
     try {
       const content = readFileSync(filePath, "utf-8");
-      const result = resolve(content, file, { explainOnly: true });
+      // NOT `explainOnly`: that flag short-circuits `resolveHunk` before the
+      // format-aware dispatch and the confidence gate, so every hunk comes back
+      // unresolved and `stats.autoResolved` is always 0. This is a prediction on
+      // in-memory content, nothing is written, so run the real resolution.
+      const result = resolve(content, file);
       return serializeResult(file, result);
     } catch (err: any) {
       return { path: file, error: err.message };

@@ -6,6 +6,24 @@ description: Technical articles on Git workflows, AI-powered conflict resolution
 # Blog
 
 <div class="blog-list">
+  <a href="/blog/best-git-gui-clients-2026" class="blog-card">
+    <div class="blog-meta">August 26, 2026 · 9 min read</div>
+    <h2 class="blog-title">The best Git GUI clients in 2026: an honest field guide</h2>
+    <p class="blog-excerpt">Nine clients — GitHub Desktop, Fork, Sublime Merge, Tower, GitKraken, GitButler, Lazygit, Sourcetree and GitWand — organised by what each one is genuinely best at rather than by score, with prices and licences checked in August 2026 and the two figures we couldn't verify flagged as unverified. Written by the maker of one of them, disclosed in the first line, with a plain statement under every tool of what it does better than ours. Ends on the failure mode almost none of them address: <strong>the conflicted hunk that was never a decision</strong>.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/from-four-tools-to-one" class="blog-card">
+    <div class="blog-meta">August 24, 2026 · 12 min read</div>
+    <h2 class="blog-title">From four tools to one: rebuilding the Git workflow you already have</h2>
+    <p class="blog-excerpt">Most people run Git across four applications: a desktop cockpit, a terminal, an IDE merge editor, and a browser tab. A tool-by-tool map of what each one buys you and where that same job lives in GitWand, with one PHP rebase played twice: the four-tool way, then end to end in GitWand (predictor first, <strong>Auto-resolve</strong> through the loop, merge editor for the one conflict that was ever real). Plus the receipts behind "deterministic", measured by replaying <strong>2,000 real merges</strong> (a residual of 104 hunks, and the two patterns that measurement talked us out of building), and the one job that should stay in your IDE.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/why-gitwand-is-rust-not-electron" class="blog-card">
+    <div class="blog-meta">August 21, 2026 · 10 min read</div>
+    <h2 class="blog-title">Why GitWand is Rust, not Electron: what native performance actually buys a Git client</h2>
+    <p class="blog-excerpt">A tour of what's shipped since v3.5 (Commit Review, dev-loop and CI performance work, small UX fixes) through the architectural bet that makes them possible: Tauri 2 + Rust for everything that touches the OS, a deliberately portable TypeScript core for the deterministic conflict engine, and what that split is worth against Electron incumbents and paid cloud AI, real numbers included (a <strong>750ms to 30ms</strong> multi-repo status fetch via <code>rayon</code>).</p>
+    <span class="blog-read">Read article →</span>
+  </a>
   <a href="/blog/v3-5-pr-review-2-secrets-scanner" class="blog-card">
     <div class="blog-meta">July 10, 2026 · 9 min read</div>
     <h2 class="blog-title">PR Review 2.0, a local secrets scanner, and smarter PR badges: GitWand v3.5</h2>
