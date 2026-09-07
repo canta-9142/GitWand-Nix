@@ -1,0 +1,72 @@
+{
+  "version": 2,
+  "pinnedAt": "2026-08-26",
+  "note": "Every repository is pinned to a commit SHA rather than a branch, so a run today and a run in two years scan the same merges. Re-pinning is a deliberate act: bump `pinnedAt`, update the SHAs, and keep the old results file — a corpus that silently drifts cannot be used to compare two versions of an engine.",
+  "selection": "v2 — selected on MEASURED merge history, not language coverage: candidates were probed with `git rev-list --merges` plus a merge-tree conflict-rate sample (60 recent merges). Dropped: rust-lang/cargo (zero conflicted merges — merge queue), django/django (10), vuejs/core (35, squash-merge; it was also the 92-95% showcase, which is exactly why keeping it would have been flattering rather than informative). Probed and rejected: kubernetes, rails, godot (0/60 conflicted — merge queues). Every repository is pinned to a commit SHA; re-pinning is a deliberate act recorded in this field.",
+  "repos": [
+    {
+      "name": "prettier/prettier",
+      "url": "https://github.com/prettier/prettier.git",
+      "sha": "0bc958e734b00907e2bae2bae45c664ad8a1a2f7",
+      "language": "JavaScript",
+      "maxMerges": 300,
+      "why": "A formatter's own repo: an adversarial case for whitespace_only, since the code is already normalised."
+    },
+    {
+      "name": "gohugoio/hugo",
+      "url": "https://github.com/gohugoio/hugo.git",
+      "sha": "a25af7facfc9de3f17bcd82a9268ded595f0adb4",
+      "language": "Go",
+      "maxMerges": 300,
+      "why": "Go, with go.mod/go.sum churn — a lockfile format the engine does NOT special-case, kept in deliberately."
+    },
+    {
+      "name": "tauri-apps/tauri",
+      "url": "https://github.com/tauri-apps/tauri.git",
+      "sha": "5e2856e3209d4ab16d21a1f828ff94b46a35a0b6",
+      "language": "Rust + TypeScript",
+      "maxMerges": 300,
+      "why": "Mixed-language monorepo with changesets — the shape GitWand's own users most often have."
+    },
+    {
+      "name": "laravel/framework",
+      "url": "https://github.com/laravel/framework.git",
+      "sha": "bdc52237f0b7999916e5f09dd179e3f415762dd0",
+      "language": "PHP",
+      "maxMerges": 300,
+      "why": "PHP, very high contributor turnover, many small overlapping edits."
+    },
+    {
+      "name": "expressjs/express",
+      "url": "https://github.com/expressjs/express.git",
+      "sha": "023767fe9872e029271df1418f73401bff20ff40",
+      "language": "JavaScript",
+      "maxMerges": 200,
+      "why": "Small and old. Included as a control: a repo where the engine should have little to do."
+    },
+    {
+      "name": "symfony/symfony",
+      "url": "https://github.com/symfony/symfony.git",
+      "sha": "f1072d8902e3d397ab5f9190877fb947d259b0c3",
+      "language": "PHP",
+      "maxMerges": 300,
+      "why": "Back-merge culture (5.4 → 6.4 → 7.x) with composer.json conflicts in half the conflicted merges — the divergent-conventions candidate the lot-F gate needs."
+    },
+    {
+      "name": "git/git",
+      "url": "https://github.com/git/git.git",
+      "sha": "f78ce2f7b6df702f93d40b85d6bda92a3f65da79",
+      "language": "C",
+      "maxMerges": 300,
+      "why": "Integration-branch workflow, conflicts hand-resolved by the maintainers — the highest-quality human-merge ground truth available."
+    },
+    {
+      "name": "twbs/bootstrap",
+      "url": "https://github.com/twbs/bootstrap.git",
+      "sha": "ae7d4c5313121f9da1f63974c7bbc373665a979b",
+      "language": "SCSS/JS",
+      "maxMerges": 300,
+      "why": "Design-system repo: _variables.scss conflicts — a file family none of the format resolvers special-case, kept in as an adversarial case."
+    }
+  ]
+}

@@ -526,6 +526,54 @@ pub(crate) fn gh_pr_raw_to_pr(r: GhPrRaw) -> PullRequest {
     }
 }
 
+/// Maps a git remote URL onto a forge identifier.
+///
+/// Extracted from `git_remote_info` so it is unit-testable and so the
+/// duplicated chain in `dev-server.mjs` has a single canonical shape to
+/// mirror. Returns `"unknown"` when no forge matches — callers treat that as
+/// "no forge integration", never as a silent GitHub fallback.
+///
+/// Cursor Origin (v3.8) is matched on its dedicated git host
+/// `origin.cursor.com`, NOT on a bare `cursor.com`: the latter is the web UI
+/// and would misfire on any URL merely containing it.
+pub(crate) fn detect_provider(url: &str) -> &'static str {
+    if url.contains("github.com") {
+        "github"
+    } else if url.contains("origin.cursor.com") {
+        "cursor"
+    } else if url.contains("gitlab.com") || url.contains("gitlab") {
+        "gitlab"
+    } else if url.contains("bitbucket.org") || url.contains("bitbucket") {
+        "bitbucket"
+    } else if url.contains("dev.azure.com") || url.contains("visualstudio.com") {
+        "azure"
+    } else {
+        "unknown"
+    }
+}
+
+/// Extracts the hostname from a git remote URL (`git@host:owner/repo.git` or
+/// `scheme://[user@]host[:port]/owner/repo.git`). Returns `None` for a URL
+/// shaped like neither form.
+///
+/// Used as the input to the CLI-auth fallback in `git_remote_info`
+/// (`commands/ops.rs`) when `detect_provider` can't identify the forge from
+/// the URL text alone — e.g. a self-hosted GitLab instance on a hostname that
+/// doesn't contain "gitlab" (GitHub issue #168).
+pub(crate) fn extract_remote_host(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("git@") {
+        let host = rest.split(':').next()?;
+        return (!host.is_empty()).then(|| host.to_string());
+    }
+    let host_start = url.find("://")? + 3;
+    let rest = &url[host_start..];
+    let rest = rest
+        .rsplit_once('@')
+        .map_or(rest, |(_, host_part)| host_part);
+    let host = rest.split(['/', ':']).next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 pub(crate) fn parse_remote_owner_repo(url: &str) -> (String, String) {
     if let Some(colon_pos) = url.find(':') {
         if url.starts_with("git@") {
@@ -1654,5 +1702,113 @@ mod repo_tree_tests {
         assert_eq!(src.children[0].name, "lib.rs");
         assert_eq!(src.children[0].path, "src/lib.rs");
         assert_eq!(src.children[1].name, "main.rs");
+    }
+}
+
+#[cfg(test)]
+mod remote_provider_tests {
+    use super::{detect_provider, extract_remote_host, parse_remote_owner_repo};
+
+    #[test]
+    fn detects_cursor_origin_https_remote() {
+        assert_eq!(
+            detect_provider("https://origin.cursor.com/acme/checkout.git"),
+            "cursor"
+        );
+    }
+
+    #[test]
+    fn detects_cursor_origin_ssh_remote() {
+        assert_eq!(
+            detect_provider("git@origin.cursor.com:acme/checkout.git"),
+            "cursor"
+        );
+    }
+
+    #[test]
+    fn does_not_claim_unrelated_cursor_hosts() {
+        // Only the Origin git host counts. A bare cursor.com URL (the web UI,
+        // docs, or a repo merely *named* cursor.com) must not be misread as a
+        // forge remote.
+        assert_eq!(detect_provider("https://cursor.com/docs/origin"), "unknown");
+    }
+
+    #[test]
+    fn detects_the_four_preexisting_forges() {
+        assert_eq!(
+            detect_provider("https://github.com/acme/checkout.git"),
+            "github"
+        );
+        assert_eq!(
+            detect_provider("git@gitlab.com:acme/checkout.git"),
+            "gitlab"
+        );
+        assert_eq!(
+            detect_provider("https://git.acme.io/gitlab/acme/checkout.git"),
+            "gitlab"
+        );
+        assert_eq!(
+            detect_provider("https://bitbucket.org/acme/checkout.git"),
+            "bitbucket"
+        );
+        assert_eq!(
+            detect_provider("https://dev.azure.com/acme/proj/_git/checkout"),
+            "azure"
+        );
+        assert_eq!(
+            detect_provider("https://acme.visualstudio.com/proj/_git/checkout"),
+            "azure"
+        );
+        assert_eq!(
+            detect_provider("https://git.sr.ht/~acme/checkout"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn extracts_host_from_ssh_and_https_remotes() {
+        assert_eq!(
+            extract_remote_host("git@github.com:acme/checkout.git"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            extract_remote_host("https://github.com/acme/checkout.git"),
+            Some("github.com".to_string())
+        );
+        // Self-hosted GitLab on a hostname that doesn't contain "gitlab" —
+        // this is the case `detect_provider` can't classify (issue #168).
+        assert_eq!(
+            extract_remote_host("git@forge:acme/checkout.git"),
+            Some("forge".to_string())
+        );
+        assert_eq!(
+            extract_remote_host("https://forge/acme/checkout.git"),
+            Some("forge".to_string())
+        );
+        // ssh:// form with an embedded user and port.
+        assert_eq!(
+            extract_remote_host("ssh://git@forge.internal:2222/acme/checkout.git"),
+            Some("forge.internal".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_remote_host_returns_none_for_malformed_urls() {
+        assert_eq!(extract_remote_host("not-a-remote-url"), None);
+        assert_eq!(extract_remote_host(""), None);
+    }
+
+    #[test]
+    fn parses_owner_and_repo_from_a_cursor_origin_remote() {
+        // Origin uses a GitHub-shaped path, so the generic parser already
+        // handles it — locked in here because the detection above depends on it.
+        assert_eq!(
+            parse_remote_owner_repo("https://origin.cursor.com/acme/checkout.git"),
+            ("acme".to_string(), "checkout".to_string())
+        );
+        assert_eq!(
+            parse_remote_owner_repo("git@origin.cursor.com:acme/checkout.git"),
+            ("acme".to_string(), "checkout".to_string())
+        );
     }
 }

@@ -5,6 +5,96 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.9.1 — September 2026
+
+A community request, filed as a one-line issue: "the branch merge UI doesn't include the ability to merge with no fast forward option. This is the base working process in our company." Some teams want every merge to leave a visible seam, a real merge commit, even for a branch that could otherwise fast-forward silently into the trunk. GitWand's merge popover had no way to ask for that. It does now: an "Always create a merge commit" checkbox sits next to the branch picker, off by default, and checking it before merging runs `git merge --no-ff` instead of letting a fast-forward slide through unannounced. Leave it unchecked and nothing changes.
+
+A CLI installed the traditional way, `npm install -g @gitwand/cli`, never told you a newer version existed, unlike `npx @gitwand/cli`, which always resolves latest, or the desktop app, which updates itself. Only global installs had this blind spot, so `gitwand` now checks npm at most once a day and prints a one-line notice when it's behind, quietly, and only in a real terminal.
+
+## v3.9.0 — August 2026
+
+### The engine finally measures itself
+
+Every accuracy claim GitWand has ever made about its conflict engine was, until now, an assertion. This release replaces that with a number. `benchmark/` pins eight public repositories to exact commits, replays roughly 1,700 real historical merges through the engine, and compares the result byte-for-byte with what the team actually committed. Two numbers come out the other end: coverage, how much of a repo's conflicts the engine even attempts, and agreement, how often what it produces matches the human. Coverage is a property of the codebase. Agreement is a property of the engine, and it is the one this release was built to move.
+
+The first fix the benchmark found was structural: a hunk the engine calls "too complex to touch" could still, quietly, be resolved by a format-aware resolver underneath it, reported as unresolved while being applied anyway. That is now impossible. A format resolver's output gets its own classification, its own confidence score, and its own trace entry, so nothing ships without an honest label. A related fix catches resolutions that look fine hunk by hunk but break the file as a whole, two "Unreleased" headings in a changelog, or a duplicate key in a JSON object, and retracts them rather than writing something no parser would accept.
+
+The biggest single change was admitting the engine was wrong about generated files. Lockfiles, minified bundles, anything a build tool produces: GitWand used to auto-merge them, on the theory that the alternative side wins or a semantic merge would be close enough. Measured against 1,662 real merges, that guess diverged from what teams actually shipped almost every time. Generated files now decline by default, with an explanation of what to regenerate and how, and the accept-and-hope behavior is one `.gitwandrc` key away for anyone who still wants it.
+
+### Teaching the engine what merge it's in
+
+A surprising number of wrong resolutions turned out to share one root cause: the engine had no idea whether it was in a merge, a rebase, or a cherry-pick, or which side was which. A version string set differently on both sides of a back-merge, `'13.x-dev'` against `'12.54.1'`, has an obvious right answer to a human: keep the target branch's value. Without context, the engine was guessing, and measured wrong about three times out of four. `MergeContext` now flows in from the CLI, the MCP server, and the desktop's own knowledge of what operation is running, and that one case alone took laravel/framework's agreement from 36.6% to 81.9%.
+
+The correction is as much the story as the fix. An early version of the rule sent every version-like scalar to the target branch, including ordinary dependency bumps that should keep "newest wins." Agreement dropped on three other repositories the moment that shipped in the benchmark, not in production, which is the entire reason the benchmark exists. The rule now only touches version pairs that can't be ordered, and orderable ones still go with the newer.
+
+A smaller but equally overdue fix: `package.json` and `composer.json` conflicts are almost always a handful of `"key": value` lines, and merging them line by line was exactly the wrong granularity. They now merge by key, three-way, with one narrow arbitration: two version ranges on the same operator resolve to the newer. Anything that looks like a real decision, a changed operator, a `workspace:*` migration, still comes back to a human. It's the first change in this release that raised both coverage and agreement at once, on every repository measured.
+
+### A repo's own habits, and an honest no
+
+Every rule above was calibrated on the benchmark's eight public repositories, but no two teams merge the same way. `gitwand conventions` now replays a repository's own merge history and measures its actual habits, whether it regenerates lockfiles or merges them, whether a changelog gets hand-merged or rebuilt by tooling, entirely locally and only above real evidence floors. It always loses to an explicit `.gitwandrc`, and every resolution it influences says so in its reason. Checked against the benchmark corpus itself, the result came back flat: the derived rules just confirmed the defaults, because the defaults were calibrated on the same repos. That's not a wasted feature, it's circularity being reported honestly instead of dressed up, and the payoff shows up on the repositories that actually diverge from the defaults.
+
+The same honesty applies to the feature this release did not fully ship. For a declined lockfile, GitWand can now run the ecosystem's own installer, `npm install --package-lock-only` and friends, inside a disposable, sandboxed worktree, with an explicit allowlist that keeps secrets out of the spawned process. Measured against real historical merges rather than assumed correct, it matched the human outcome 5 times out of 13 on `prettier/prettier`, well short of the 80% bar this release set for shipping a feature to the desktop UI. So it stays exactly what the numbers support: a CLI opt-in (`--regenerate`), not a button. And because every future PR to the engine now runs through the same benchmark, a new `benchmark-gate.yml` CI check fails the build if agreement on the pinned corpus drops without the PR explaining why.
+
+### The Merge Room, a shared workspace for agents
+
+`gitwand.app/agent` used to expose two read-only tools over the WebMCP standard: explain a git error, resolve a conflicted file. Both ran entirely in the visitor's browser tab, no upload, no backend. This release turns that page into a shared workspace instead. Every tool call now files a case into live page state, so the person sitting at the page watches it fill up in real time: hunks the engine can settle get settled, hunks where the two branches genuinely disagree queue up for a human to pick a side, and the assembled result comes back ready to paste. No tool on the page can make that call itself, which is the whole point of the boundary. A third tool, `list_cases`, lets an agent read the room back: what's filed, what's settled, what's still waiting. It's what turns a stateless calculator into something an agent can leave and come back to.
+
+### Smaller fixes
+
+Signed commits could fail from the desktop app with a cryptic gpg-agent or ssh-agent socket error, while the identical `git commit` worked fine from a terminal. The cause was environmental: GitWand backfills the minimal environment a Finder-launched app gets from macOS by reading a login shell's variables at startup, but a login shell alone doesn't source `~/.zshrc`, and that's exactly where GPG and SSH agent setup conventionally lives. The startup probe now asks for an interactive shell too, so those variables come through like any other.
+
+`pnpm test` had been non-deterministic for a while, roughly one failure in three, because git-backed test suites are bound by subprocess spawning rather than CPU and were timing out under full monorepo load. Every such suite now shares a consistent timeout, and running workspaces one at a time turned out to be faster overall as well as reliable. Eleven consecutive clean runs later, the flake is gone. `parse_git_error` also picked up recognition for a rebase that stopped on a conflict, a phrase distinct enough from a cherry-pick's that the two no longer got confused, and the site's WebMCP registration now prefers the current `document.modelContext` entry point over the deprecated `navigator` alias, with a fix for a tool's stop signal that was silently being dropped.
+
+## v3.8.0 — August 2026
+
+Undo, for the parts of git that never had one.
+
+GitWand has had an undo stack since v1.2, but it was built on `git reflog`, and the reflog only knows about things that move a ref. Commit, merge, rebase, pull: recoverable. Everything else, which is most of what actually loses work, was not. Discard a file and it was gone. Reset with uncommitted changes and they were gone. Let the engine auto-apply resolutions across seven files and there was no way back to the conflict markers you started from.
+
+Time Machine closes that gap. Before every destructive operation, GitWand now captures a snapshot of the working tree, the index, and the conflict state, and hands you a way back.
+
+The capture is real git, not a copy of your folder somewhere. It writes the same kind of object graph `git stash create` does, anchored under a ref namespace of its own, which means it costs nothing beyond the objects themselves, it never touches your stash list, and git's own garbage collection reclaims it once the retention window closes. Two things it does that stash cannot: it captures untracked files, and it survives a conflicted index. Both matter, because discarding untracked work and rewinding a half-applied merge resolution are exactly the cases this exists for.
+
+Restoring goes back through plumbing rather than `checkout`, deliberately. A checkout refuses to run on a dirty working tree, which is precisely the state you are in when you need an undo.
+
+The part that took the longest to get right was not the mechanism but where to put it. GitWand already had a rewind popover, so adding a second Time Machine surface beside it would have split one mental action across two places. The popover keeps its trigger and its position; only its contents changed, from git's reflog alone to that reflog merged with the new snapshots, with the operations that produce both collapsed into one row. A link at the bottom opens the full history when you want it.
+
+More importantly, a safety net nobody knows about is not a safety net. Discarding a file gave no feedback whatsoever before this release. Now it says so, with an Undo button and a `⌘Z` hint sitting right where the action happened. `⌘Z` and `⇧⌘Z` work at the repo level too, and they answer back through the same toast, so the shortcut tells you what it did rather than appearing to do nothing.
+
+Restoring is itself undoable. A snapshot of the current state is taken before every restore, and the confirmation dialog says as much, which is the difference between this and `git reset --hard`.
+
+Snapshots are pruned on an age and a count cap, checked when you open a repo rather than on a timer. Everything is optional: turn snapshots off and the timeline falls back to exactly the reflog view of previous versions. There is also an opt-in AI labelling pass if you want one-line summaries in the timeline instead of the mechanical ones.
+
+None of this leaks into your history. GitWand excludes its own snapshot refs from every history traversal it runs, so the Git Tree, commit counts and contributor stats are untouched, and nothing is pushed.
+
+## v3.7.3 — August 2026
+
+A community report from someone running a self-hosted GitLab instance: GitWand's PR panel kept showing GitHub, even though their `glab` CLI was correctly logged in and everything else about their setup was fine.
+
+The forge detection GitWand uses to decide which provider to talk to worked by scanning the remote URL's text for a recognizable name — `github.com`, `gitlab.com`, or just the word "gitlab" anywhere in the URL for a self-hosted instance. That covers the common case (`git.company.com/gitlab/...`), but breaks the moment a self-hosted instance sits on a hostname that doesn't happen to contain that word, an internal alias like `forge`, for instance. With nothing left to match, detection gave up and the interface quietly fell back to GitHub instead of admitting it didn't know.
+
+The fix asks the CLI itself instead of trying to guess from the hostname. When the URL doesn't give away the forge, GitWand now checks whether `glab` or `gh` is authenticated for that exact host, the same information those tools already track internally. Whichever one says yes wins, so a self-hosted GitLab instance is now recognized correctly regardless of what its hostname happens to look like, as long as it's a host you've already logged into via CLI.
+
+## v3.7.2 — August 2026
+
+One fix, and an embarrassing one: the conflict predictor was wrong every single time, always in the same direction.
+
+`gitwand preview --onto=main` exists to answer one question before you start a rebase or a merge: how much of this can GitWand handle on its own? It was answering "none of it". Every file came back as 0 auto-resolvable and every operation came back rated HIGH risk, regardless of what the engine would happily resolve a second later if you ran `gitwand resolve` on the very same conflicts.
+
+The cause was one option passed at the wrong layer. The predictor asked the engine to classify the conflicts without applying anything, which is the right instinct, since a prediction has no business touching your files. But that mode returns early, before the format-aware resolvers and the confidence gate ever run, so the number of resolvable conflicts it reported was structurally zero rather than measured. Prediction and resolution were reading the same engine and disagreeing completely.
+
+On the four-file PHP rebase used to verify the fix, the predictor now reports 6 of 7 conflicts auto-resolvable, with the one file that genuinely needs a human sitting at 0 of 1. The same repo reported 0 of 7 before.
+
+Two MCP tools had the same flaw, `gitwand_status` and `gitwand_preview_merge`, so a coding agent asking GitWand what it could resolve was told "nothing" and presumably went off to do the work itself. The desktop merge preview takes a different path and was never affected.
+
+## v3.7.1 — August 2026
+
+[Cursor Origin](https://cursor.com/docs/origin) is Cursor's git forge, still in early beta, and GitWand had never heard of it: a repo with an `origin.cursor.com` remote showed up as an unrecognized forge, and opening the PR panel fired off GitHub CLI calls that failed with a baffling GitHub auth error, on a repo that has nothing to do with GitHub. GitWand now recognizes Origin remotes for what they are. This is deliberately detection only, not a full integration: Origin's API currently only documents an app-auth model built for server-to-server access rather than a desktop client, and it's still moving underneath its beta tag, so a real `OriginProvider` is on hold until that settles. In the meantime, the PR panel is honest about it instead of pretending: it offers to open the repo on the web, hides both "New PR" buttons instead of leaving them to fail, and Today no longer suggests connecting an account type that doesn't exist for this forge. Everything else, clone, push, pull, merges, and the whole conflict-resolution engine, already worked fine on an Origin repo and needed no changes; none of it goes through a forge integration in the first place.
+
+A pre-existing bug got fixed along the way: "View on forge" for a commit on an Azure DevOps repo was building a `github.com` link instead of an Azure one, because the shared URL parser assumed every remote had the same shape GitHub's does. Azure's shapes are different enough (five different ones, depending on how you're connected) that a proper parser was worth writing rather than special-casing around the edges.
+
+And `dompurify`, the library behind every bit of user-generated HTML GitWand sanitizes before showing it to you, moved up two patch versions upstream to close a few narrow XSS-adjacent edge cases in how hooks interact with in-place sanitization.
+
 ## v3.7.0 — August 2026
 
 Commit Review — the biggest addition to the Changes panel since it shipped. A button now sits right in the commit area: click it, and GitWand runs the same AI review pipeline that already checks your pull requests against whatever's staged, right there, before you commit. Findings show up inline in the diff with severity badges, and you cycle through them with `n` and `p`, dismissing what doesn't matter with `x` — no separate view, no context switch.

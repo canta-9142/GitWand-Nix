@@ -33,6 +33,14 @@ export const DEFAULT_OPTIONS: Required<GitWandOptions> = {
   policy: DEFAULT_POLICY,
   patternOverrides: {},
   generatedFiles: [],
+  // accuracy lot 1 — les fichiers générés déclinent par défaut (voir GitWandOptions)
+  resolveGeneratedFiles: false,
+  // accuracy lot C — contexte de merge inconnu par défaut ; fourni par les appelants
+  mergeContext: null,
+  // accuracy lot D — pas de contexte de régénération par défaut ; fourni par les appelants
+  regenerationContext: null,
+  // accuracy lot F — pas de conventions dérivées par défaut
+  conventions: null,
   // v2.2 — profils de format actifs par défaut
   disableFormatProfiles: false,
   // v2.4 — validation post-merge
@@ -130,7 +138,7 @@ export function applyFileFrequencyPenalty(
       dimensions: { ...d, fileFrequency: ff },
       penalties: [
         ...hunk.confidence.penalties,
-        `Zone chaude — ${priorComplexHunks} hunk${priorComplexHunks > 1 ? "s" : ""} complexe${priorComplexHunks > 1 ? "s" : ""} déjà vus dans ce fichier (−${(ff * 0.10).toFixed(1)} pts)`,
+        `Hot spot: ${priorComplexHunks} complex hunk${priorComplexHunks > 1 ? "s" : ""} already seen in this file (−${(ff * 0.10).toFixed(1)} pts)`,
       ],
     },
   };

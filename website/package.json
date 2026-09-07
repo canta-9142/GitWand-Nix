@@ -1,15 +1,20 @@
 {
   "name": "gitwand-website",
-  "version": "3.7.0",
+  "version": "3.9.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vitepress dev",
     "build": "vitepress build",
-    "preview": "vitepress preview"
+    "preview": "vitepress preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@gitwand/core": "workspace:*"
   },
   "devDependencies": {
     "vitepress": "2.0.0-alpha.17",
-    "vue": "^3.5.0"
+    "vitest": "^4.1.11",
+    "vue": "^3.5.42"
   }
 }

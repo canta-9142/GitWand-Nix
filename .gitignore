@@ -53,6 +53,9 @@ apps/desktop/public/grammars/
 
 # Superpowers
 .superpowers/
+
+# Impeccable (local tool-lease cache, no repo content)
+.impeccable/
 website/.vitepress/cache
 website/.vitepress/dist
 research/
@@ -68,3 +71,7 @@ visibility-pack/
 
 # Nix
 result/
+
+# Devpost hackathon submission helper (local plugin state, HyperFrames video project)
+.devpost-hackathon-state.json
+videos/

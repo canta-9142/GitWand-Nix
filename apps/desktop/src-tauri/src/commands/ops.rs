@@ -6,6 +6,36 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// Take a Time Machine snapshot before a destructive operation (v3.8).
+///
+/// Best-effort by design: a snapshot failure must never block the operation
+/// the user actually asked for, so errors are logged and swallowed. Called
+/// from inside commands that already hold the `repo_lock` write guard, which
+/// is why it uses the lock-free `*_inner` function rather than the
+/// `snapshot_create` command.
+///
+/// `enabled` carries the frontend's `snapshotsEnabled` setting. `None` means
+/// "no opinion" and snapshots; only an explicit `Some(false)` opts out. App
+/// settings live in exactly one place (the frontend), as everywhere else in
+/// this codebase, so Rust never reads them itself.
+fn snapshot_before(
+    cwd: &str,
+    enabled: Option<bool>,
+    kind: &str,
+    label: &str,
+) -> Option<crate::git::snapshot::SnapshotMeta> {
+    if enabled == Some(false) {
+        return None;
+    }
+    match crate::git::snapshot::create_snapshot_inner(cwd, kind, label) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("[snapshots] failed to snapshot before {}: {}", kind, e);
+            None
+        }
+    }
+}
+
 // ─── Git stage / unstage ─────────────────────────────────────
 
 #[tauri::command]
@@ -464,16 +494,27 @@ pub(crate) async fn git_fetch(cwd: String) -> Result<GitPushPullResult, String> 
 }
 
 #[tauri::command]
-pub(crate) async fn git_merge(cwd: String, branch: String) -> Result<GitPushPullResult, String> {
+pub(crate) async fn git_merge(
+    cwd: String,
+    branch: String,
+    no_ff: Option<bool>,
+) -> Result<GitPushPullResult, String> {
     let _repo = repo_lock::write(&cwd);
     let _t0 = Instant::now();
+    let mut args: Vec<&str> = vec!["merge", &branch];
+    if no_ff.unwrap_or(false) {
+        // --no-ff always creates a merge commit, which otherwise opens an
+        // editor for the commit message; --no-edit keeps it non-interactive.
+        args.push("--no-ff");
+        args.push("--no-edit");
+    }
     let output = git_cmd()
-        .args(["merge", &branch])
+        .args(&args)
         .current_dir(&cwd)
         .output()
         .map_err(|e| format!("Failed to run git merge: {}", e))?;
     record_cmd(
-        &format!("git merge {}", branch),
+        &format!("git {}", args.join(" ")),
         &cwd,
         _t0.elapsed().as_millis() as u64,
         output.status.code().unwrap_or(-1),
@@ -737,8 +778,15 @@ pub(crate) async fn git_discard(
     cwd: String,
     paths: Vec<String>,
     untracked: bool,
-) -> Result<(), String> {
+    snapshots_enabled: Option<bool>,
+) -> Result<Option<crate::git::snapshot::SnapshotMeta>, String> {
     let _repo = repo_lock::write(&cwd);
+    let snapshot = snapshot_before(
+        &cwd,
+        snapshots_enabled,
+        "discard",
+        &format!("Discard {} file(s)", paths.len()),
+    );
     if untracked {
         let mut cmd = git_cmd();
         cmd.arg("clean").arg("-f").arg("--").current_dir(&cwd);
@@ -789,7 +837,7 @@ pub(crate) async fn git_discard(
             }
         }
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 /// Paths of submodules declared in `.gitmodules`, relative to the repo root.
@@ -1013,8 +1061,18 @@ pub(crate) async fn git_create_branch(
 }
 
 #[tauri::command]
-pub(crate) async fn git_switch_branch(cwd: String, name: String) -> Result<(), String> {
+pub(crate) async fn git_switch_branch(
+    cwd: String,
+    name: String,
+    snapshots_enabled: Option<bool>,
+) -> Result<Option<crate::git::snapshot::SnapshotMeta>, String> {
     let _repo = repo_lock::write(&cwd);
+    let snapshot = snapshot_before(
+        &cwd,
+        snapshots_enabled,
+        "checkout",
+        &format!("Switch to {}", name),
+    );
     let _t0 = Instant::now();
     let output = git_cmd()
         .args(["checkout", &name])
@@ -1031,7 +1089,7 @@ pub(crate) async fn git_switch_branch(cwd: String, name: String) -> Result<(), S
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git checkout failed: {}", stderr));
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1393,8 +1451,18 @@ pub(crate) async fn git_cherry_pick_continue(cwd: String) -> Result<GitPushPullR
 // ─── Commit context menu operations ─────────────────────────
 
 #[tauri::command]
-pub(crate) async fn git_checkout_commit(cwd: String, sha: String) -> Result<(), String> {
+pub(crate) async fn git_checkout_commit(
+    cwd: String,
+    sha: String,
+    snapshots_enabled: Option<bool>,
+) -> Result<Option<crate::git::snapshot::SnapshotMeta>, String> {
     let _repo = repo_lock::write(&cwd);
+    let snapshot = snapshot_before(
+        &cwd,
+        snapshots_enabled,
+        "checkout",
+        &format!("Checkout {}", sha),
+    );
     let _t0 = Instant::now();
     let output = git_cmd()
         .args(["checkout", &sha])
@@ -1413,7 +1481,7 @@ pub(crate) async fn git_checkout_commit(cwd: String, sha: String) -> Result<(), 
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1421,8 +1489,15 @@ pub(crate) async fn git_reset_to_commit(
     cwd: String,
     sha: String,
     mode: String,
-) -> Result<(), String> {
+    snapshots_enabled: Option<bool>,
+) -> Result<Option<crate::git::snapshot::SnapshotMeta>, String> {
     let _repo = repo_lock::write(&cwd);
+    let snapshot = snapshot_before(
+        &cwd,
+        snapshots_enabled,
+        "reset",
+        &format!("Reset {} to {}", mode, sha),
+    );
     let flag = match mode.as_str() {
         "soft" => "--soft",
         "hard" => "--hard",
@@ -1447,7 +1522,7 @@ pub(crate) async fn git_reset_to_commit(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -3156,7 +3231,14 @@ pub(crate) async fn git_shortlog(cwd: String) -> Result<Vec<ShortlogEntry>, Stri
         // `--all` (not HEAD): count every author's commits across all branches,
         // independent of the checked-out branch — matches the dashboard's
         // all-branches contributor totals.
-        .args(["shortlog", "-sne", "--all"])
+        // `--exclude` before `--all`: Time Machine snapshot refs (v3.8) are
+        // authored by the app, not by a contributor.
+        .args([
+            "shortlog",
+            "-sne",
+            "--exclude=refs/gitwand/snapshots/*",
+            "--all",
+        ])
         .current_dir(&cwd)
         .output()
         .map_err(|e| format!("Failed to run git shortlog: {}", e))?;
@@ -3185,6 +3267,9 @@ pub(crate) async fn git_author_line_stats(cwd: String) -> Result<Vec<AuthorLineS
     let output = git_cmd()
         .args([
             "log",
+            // Same exclusion as the shortlog above: a snapshot commit's tree
+            // would otherwise register as churn against its author.
+            "--exclude=refs/gitwand/snapshots/*",
             "--all",
             "--no-merges",
             "--numstat",
@@ -3659,6 +3744,50 @@ pub(crate) async fn reconstruct_conflict(
 
 // ─── Git remote info ─────────────────────────────────────────
 
+/// Timeout for the `glab`/`gh` `auth status` probes below — best-effort,
+/// bounded so a missing or hanging CLI degrades to "unknown" instead of
+/// blocking remote-info resolution.
+const FORGE_AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Fallback provider detection for a remote host `detect_provider` couldn't
+/// classify from the URL text alone (e.g. a self-hosted GitLab instance whose
+/// hostname doesn't contain "gitlab" — GitHub issue #168).
+///
+/// Runs `<bin> auth status --hostname <host>` from `cwd` for each forge CLI in
+/// turn; whichever one reports that exact host as authenticated wins. Reusing
+/// `hidden_cmd` means this picks up the same `GH_TOKEN`/`GITLAB_TOKEN`
+/// ambient-env fallback the rest of the app already relies on (#149), so it
+/// works even when the CLI's own keychain lookup would hang.
+fn detect_provider_via_cli_auth(cwd: &str, host: &str) -> &'static str {
+    let authenticated_for_host = |bin: &str| -> bool {
+        let mut cmd = hidden_cmd(bin);
+        cmd.args(["auth", "status", "--hostname", host])
+            .current_dir(cwd);
+        let Ok(output) = output_with_timeout(cmd, FORGE_AUTH_PROBE_TIMEOUT) else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        // Guard against a CLI that ignores an unknown --hostname and silently
+        // reports its default host's status instead of erroring.
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        combined.contains(host)
+    };
+
+    if authenticated_for_host("glab") {
+        "gitlab"
+    } else if authenticated_for_host("gh") {
+        "github"
+    } else {
+        "unknown"
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn git_remote_info(cwd: String) -> Result<RemoteInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -3696,17 +3825,12 @@ pub(crate) async fn git_remote_info(cwd: String) -> Result<RemoteInfo, String> {
         }
 
         if let Some((name, url)) = origin.or(first) {
-            let provider = if url.contains("github.com") {
-                "github"
-            } else if url.contains("gitlab.com") || url.contains("gitlab") {
-                "gitlab"
-            } else if url.contains("bitbucket.org") || url.contains("bitbucket") {
-                "bitbucket"
-            } else if url.contains("dev.azure.com") || url.contains("visualstudio.com") {
-                "azure"
-            } else {
-                "unknown"
-            };
+            let mut provider = detect_provider(&url);
+            if provider == "unknown" {
+                if let Some(host) = extract_remote_host(&url) {
+                    provider = detect_provider_via_cli_auth(&cwd, &host);
+                }
+            }
 
             let (owner, repo) = parse_remote_owner_repo(&url);
 
@@ -4528,6 +4652,28 @@ mod tree_conflict_tests {
     }
 
     #[test]
+    fn git_remote_info_degrades_to_unknown_when_cli_auth_probe_finds_nothing() {
+        // Self-hosted GitLab issue #168: a remote host with no recognizable
+        // substring (unlike "gitlab.example.com") falls through
+        // `detect_provider` and hits the `glab`/`gh auth status --hostname`
+        // fallback. In this sandboxed test env neither CLI is authenticated
+        // for the made-up host below, so the fallback must degrade to
+        // "unknown" rather than erroring, hanging, or silently claiming a
+        // provider it never confirmed.
+        let repo = TempRepo::new();
+        repo.git_ok(&[
+            "remote",
+            "add",
+            "origin",
+            "git@definitely-not-a-real-forge-host.invalid:acme/checkout.git",
+        ]);
+
+        let info = tauri::async_runtime::block_on(git_remote_info(repo.cwd()))
+            .expect("git_remote_info failed");
+        assert_eq!(info.provider, "unknown");
+    }
+
+    #[test]
     fn git_unpushed_tags_reflects_what_the_remote_actually_has() {
         let repo = TempRepo::new();
         repo.write("a.txt", "1");
@@ -5024,6 +5170,321 @@ mod stash_and_tag_date_tests {
         assert!(
             tags.iter().any(|t| t.name == "v1.0.0" && t.is_annotated),
             "the annotated tag must be flagged is_annotated"
+        );
+    }
+}
+
+/// v3.8 Time Machine: every destructive command must leave a restorable
+/// snapshot behind, and a snapshot failure must never block the operation
+/// the user actually asked for.
+#[cfg(test)]
+mod snapshot_hook_tests {
+    use super::*;
+    use crate::git::cmd::git_binary;
+    use crate::git::snapshot::{list_snapshots_inner, restore_snapshot_inner};
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "gitwand-snapshot-hook-test-{}-{}-{}",
+                std::process::id(),
+                n,
+                nanos
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = TempRepo { path: dir };
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.git(&["config", "user.name", "Test"]);
+            repo.git(&["config", "user.email", "test@example.com"]);
+            repo.git(&["config", "commit.gpgsign", "false"]);
+            repo
+        }
+
+        fn cwd(&self) -> String {
+            self.path.to_str().unwrap().to_string()
+        }
+
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            let out = Command::new(git_binary())
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {}", args, e));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        }
+
+        fn write(&self, rel: &str, content: &str) {
+            let p = self.path.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.path.join(rel)).unwrap()
+        }
+
+        fn commit_all(&self, msg: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", msg]);
+        }
+    }
+
+    #[test]
+    fn discard_takes_a_snapshot_first() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("c1");
+        repo.write("a.txt", "unsaved work\n");
+
+        tauri::async_runtime::block_on(git_discard(
+            repo.cwd(),
+            vec!["a.txt".to_string()],
+            false,
+            None,
+        ))
+        .expect("discard failed");
+
+        // The discard happened…
+        assert_eq!(repo.read("a.txt"), "v1\n");
+
+        // …and it is undoable.
+        let snaps = list_snapshots_inner(&repo.cwd()).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].kind, "discard");
+
+        restore_snapshot_inner(&repo.cwd(), &snaps[0].id).unwrap();
+        assert_eq!(repo.read("a.txt"), "unsaved work\n");
+    }
+
+    #[test]
+    fn hard_reset_takes_a_snapshot_first() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("c1");
+        repo.write("a.txt", "v2\n");
+        repo.commit_all("c2");
+
+        tauri::async_runtime::block_on(git_reset_to_commit(
+            repo.cwd(),
+            "HEAD~1".to_string(),
+            "hard".to_string(),
+            None,
+        ))
+        .expect("reset failed");
+
+        let snaps = list_snapshots_inner(&repo.cwd()).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].kind, "reset");
+
+        restore_snapshot_inner(&repo.cwd(), &snaps[0].id).unwrap();
+        assert_eq!(repo.read("a.txt"), "v2\n");
+    }
+
+    #[test]
+    fn switch_branch_takes_a_snapshot_first() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("c1");
+        repo.git(&["branch", "other"]);
+
+        tauri::async_runtime::block_on(git_switch_branch(repo.cwd(), "other".to_string(), None))
+            .expect("switch failed");
+
+        let snaps = list_snapshots_inner(&repo.cwd()).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].kind, "checkout");
+        // The snapshot records where we came FROM, which is what makes it
+        // useful as an undo target.
+        assert_eq!(snaps[0].head_ref.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn snapshots_are_skipped_when_the_setting_is_off() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("c1");
+        repo.write("a.txt", "unsaved work\n");
+
+        tauri::async_runtime::block_on(git_discard(
+            repo.cwd(),
+            vec!["a.txt".to_string()],
+            false,
+            Some(false),
+        ))
+        .expect("discard failed");
+
+        // The discard still happened, it just left no safety net.
+        assert_eq!(repo.read("a.txt"), "v1\n");
+        assert!(list_snapshots_inner(&repo.cwd()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_failure_never_blocks_the_operation() {
+        // A repo with no HEAD cannot be snapshotted (`create_snapshot_inner`
+        // returns None), but the operation must still run.
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.git(&["add", "-A"]);
+
+        let res = tauri::async_runtime::block_on(git_reset_to_commit(
+            repo.cwd(),
+            "HEAD".to_string(),
+            "mixed".to_string(),
+            None,
+        ));
+
+        // `git reset` on a headless repo fails on its own terms, not because
+        // of snapshots — what matters is that we reached it at all.
+        assert!(list_snapshots_inner(&repo.cwd()).unwrap().is_empty());
+        let _ = res;
+    }
+}
+
+#[cfg(test)]
+mod merge_no_ff_tests {
+    use super::*;
+    use crate::git::cmd::git_binary;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    impl TempRepo {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir =
+                std::env::temp_dir().join(format!("gitwand-noff-test-{}-{}-{}", pid, n, nanos));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = TempRepo { path: dir };
+            repo.git_ok(&["init", "-q", "-b", "main"]);
+            repo.git_ok(&["config", "user.name", "Test"]);
+            repo.git_ok(&["config", "user.email", "test@example.com"]);
+            repo.git_ok(&["config", "commit.gpgsign", "false"]);
+            repo
+        }
+        fn cwd(&self) -> String {
+            self.path.to_str().unwrap().to_string()
+        }
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            Command::new(git_binary())
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} spawn: {}", args, e))
+        }
+        fn git_ok(&self, args: &[&str]) {
+            let out = self.git(args);
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fn write(&self, rel: &str, content: &str) {
+            std::fs::write(self.path.join(rel), content).unwrap();
+        }
+        fn commit_all(&self, msg: &str) {
+            self.git_ok(&["add", "-A"]);
+            self.git_ok(&["commit", "-q", "-m", msg]);
+        }
+        fn parent_count_of_head(&self) -> usize {
+            let out = self.git(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+            let line = String::from_utf8_lossy(&out.stdout);
+            line.split_whitespace().count().saturating_sub(1)
+        }
+    }
+
+    /// `feature` branches off `main` and gets one extra commit; `main` gets
+    /// none, so merging `feature` into `main` is fast-forwardable.
+    fn make_fast_forwardable(repo: &TempRepo) {
+        repo.write("a.txt", "base\n");
+        repo.commit_all("base");
+        repo.git_ok(&["checkout", "-q", "-b", "feature"]);
+        repo.write("a.txt", "feature change\n");
+        repo.commit_all("feature commit");
+        repo.git_ok(&["checkout", "-q", "main"]);
+    }
+
+    #[test]
+    fn no_ff_true_creates_merge_commit_even_when_fast_forward_possible() {
+        let repo = TempRepo::new();
+        make_fast_forwardable(&repo);
+
+        let result = tauri::async_runtime::block_on(git_merge(
+            repo.cwd(),
+            "feature".to_string(),
+            Some(true),
+        ))
+        .expect("merge must succeed");
+
+        assert!(result.success, "merge failed: {}", result.message);
+        assert_eq!(
+            repo.parent_count_of_head(),
+            2,
+            "--no-ff must produce a merge commit with 2 parents even on a fast-forwardable branch"
+        );
+    }
+
+    #[test]
+    fn no_ff_false_fast_forwards_when_possible() {
+        let repo = TempRepo::new();
+        make_fast_forwardable(&repo);
+
+        let result = tauri::async_runtime::block_on(git_merge(
+            repo.cwd(),
+            "feature".to_string(),
+            Some(false),
+        ))
+        .expect("merge must succeed");
+
+        assert!(result.success, "merge failed: {}", result.message);
+        assert_eq!(
+            repo.parent_count_of_head(),
+            1,
+            "default merge must fast-forward (1 parent) when possible"
         );
     }
 }

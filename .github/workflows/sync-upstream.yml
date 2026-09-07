@@ -50,7 +50,7 @@ jobs:
 
             for path in "${conflicted_paths[@]}"; do
               case "$path" in
-                .github/workflows/ci.yml|.github/workflows/perf.yml|.github/workflows/release.yml)
+                .github/workflows/benchmark-gate.yml|.github/workflows/ci.yml|.github/workflows/perf.yml|.github/workflows/release.yml)
                   # These upstream workflows are intentionally absent from the
                   # Nix fork. Keep the deletion when upstream modifies them.
                   git rm -- "$path"

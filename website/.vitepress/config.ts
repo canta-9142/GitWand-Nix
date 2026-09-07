@@ -1,9 +1,42 @@
 import { defineConfig } from 'vitepress'
+import { extractFaq } from './seo'
+import { fileURLToPath } from 'node:url'
+
 
 export default defineConfig({
   title: 'GitWand',
   description: "Git's magic wand — smart conflict resolution & native Git client",
   base: '/',
+
+  // The generated sitemap advertised /features.html while every canonical tag
+  // points at /features — two URL forms for one page, which is the mismatch the
+  // canonical block below exists to avoid. cleanUrls makes VitePress emit the
+  // extensionless form everywhere, sitemap included. GitHub Pages already serves
+  // /foo as /foo.html with a 200 and no redirect, which is what this requires.
+  cleanUrls: true,
+
+  vite: {
+    resolve: {
+      alias: {
+        // Point at the TypeScript source rather than packages/core/dist.
+        // deploy-website.yml runs `pnpm install` and builds the site directly,
+        // with no `pnpm --filter @gitwand/core build` step, so dist/ does not
+        // exist in CI. Same reasoning as apps/desktop/vite.config.ts.
+        '@gitwand/core': fileURLToPath(new URL('../../packages/core/src/index.ts', import.meta.url)),
+      },
+    },
+    build: {
+      rollupOptions: {
+        // Mark Node built-ins external so Rollup can parse packages/core's
+        // node adapter (structural/parsers/adapters/node.ts) without trying to
+        // resolve it. The adapter is behind a dynamic import reached only when
+        // env === "node", which never happens in a browser, so it is dead code
+        // here. Without this, the build fails on `createRequire` from
+        // node:module. Same fix as apps/desktop/vite.config.ts.
+        external: (id: string) => id.startsWith('node:'),
+      },
+    },
+  },
 
   sitemap: {
     hostname: 'https://gitwand.app',
@@ -28,14 +61,21 @@ export default defineConfig({
     ['link', { rel: 'api-catalog', href: '/.well-known/api-catalog', type: 'application/linkset+json' }],
     ['link', { rel: 'service-doc', href: '/guide/mcp', type: 'text/html', title: 'GitWand MCP Server Guide' }],
     ['link', { rel: 'service-doc', href: '/reference/core-api', type: 'text/html', title: 'GitWand Core API Reference' }],
-    // WebMCP — expose site tools to AI agents via the browser (navigator.modelContext)
+    // WebMCP — expose site tools to AI agents via the browser.
+    // The spec puts the entry point on document.modelContext; Chrome 150
+    // deprecated navigator.modelContext but kept it as an ALIAS to the same
+    // object, with removal announced. So: prefer document, fall back to
+    // navigator, and register ONCE. Registering on both would duplicate every
+    // tool on the versions that still expose both names.
     ['script', {}, `
 (function () {
-  if (typeof navigator === 'undefined' || !navigator.modelContext) return;
+  var mc = (typeof document !== 'undefined' && document.modelContext) ||
+           (typeof navigator !== 'undefined' && navigator.modelContext) || null;
+  if (!mc) return;
   var ac = new AbortController();
-  var signal = ac.signal;
+  var opts = { signal: ac.signal };
 
-  navigator.modelContext.registerTool({
+  mc.registerTool({
     name: 'search_gitwand_docs',
     description: 'Search the GitWand documentation for guides, API reference, CLI commands, and blog articles.',
     inputSchema: {
@@ -49,10 +89,9 @@ export default defineConfig({
       var url = 'https://gitwand.app/?q=' + encodeURIComponent(args.query);
       return Promise.resolve({ url: url, hint: 'Navigate to this URL to view search results.' });
     },
-    signal: signal
-  });
+  }, opts);
 
-  navigator.modelContext.registerTool({
+  mc.registerTool({
     name: 'get_gitwand_mcp_install',
     description: 'Get the installation instructions and configuration snippet for GitWand MCP server.',
     inputSchema: { type: 'object', properties: {} },
@@ -64,10 +103,9 @@ export default defineConfig({
         guide: 'https://gitwand.app/guide/mcp'
       });
     },
-    signal: signal
-  });
+  }, opts);
 
-  navigator.modelContext.registerTool({
+  mc.registerTool({
     name: 'navigate_to_gitwand_section',
     description: 'Get the URL for a GitWand documentation section.',
     inputSchema: {
@@ -99,11 +137,130 @@ export default defineConfig({
       var path = routes[args.section] || '/';
       return Promise.resolve({ url: 'https://gitwand.app' + path });
     },
-    signal: signal
-  });
+  }, opts);
 })();
 `],
   ],
+
+  // Every page gets a self-referencing canonical URL (and matching og:url), which is what
+  // Search Console's "Duplicate without user-selected canonical" flag is asking for — without
+  // it, Google has to guess between whatever URL variants (with/without trailing slash, with/
+  // without .html) happen to serve the same content. A page that already sets its own
+  // `rel: canonical` in frontmatter (e.g. a post cross-posted from elsewhere, pointing back at
+  // the original) is left alone instead of getting a conflicting second canonical tag.
+  transformPageData(pageData) {
+    const hasOwnCanonical = (pageData.frontmatter.head || []).some(
+      ([tag, attrs]: [string, Record<string, string>]) => tag === 'link' && attrs?.rel === 'canonical'
+    )
+
+    const canonicalUrl = `https://gitwand.app/${pageData.relativePath}`
+      .replace(/\/?index\.md$/, '/')
+      .replace(/\.md$/, '')
+
+    pageData.frontmatter.head ??= []
+    // A page that already declares its own canonical (a post cross-posted from
+    // elsewhere, pointing back at the original) keeps it — but it still gets the
+    // structured data below. An earlier version of this returned here, which
+    // silently left that one page with no JSON-LD at all.
+    if (!hasOwnCanonical) {
+      pageData.frontmatter.head.push(
+        ['link', { rel: 'canonical', href: canonicalUrl }],
+        ['meta', { property: 'og:url', content: canonicalUrl }],
+      )
+    }
+
+    // ── Structured data, generated rather than hand-maintained ────────────────
+    // Only the home page carried JSON-LD before this. Two schemas are worth
+    // emitting site-wide, and both are fully derivable from page data, so they
+    // belong here instead of in 30-odd frontmatter blocks that would drift.
+    const SECTIONS: Record<string, string> = {
+      guide: 'Guide',
+      reference: 'Reference',
+      compare: 'Compare',
+      blog: 'Blog',
+      fix: 'Fix a conflict',
+    }
+    const [segment] = pageData.relativePath.split('/')
+    const section = SECTIONS[segment]
+
+    // BreadcrumbList — tells Google the site's shape and earns the breadcrumb
+    // trail in the SERP instead of a bare URL. Emitted on every page below the
+    // root; the home page is the trail's own first item.
+    if (section) {
+      const isSectionIndex = /(^|\/)index\.md$/.test(pageData.relativePath)
+      const itemListElement: unknown[] = [
+        { '@type': 'ListItem', position: 1, name: 'GitWand', item: 'https://gitwand.app/' },
+        { '@type': 'ListItem', position: 2, name: section, item: `https://gitwand.app/${segment}/` },
+      ]
+      if (!isSectionIndex) {
+        itemListElement.push({
+          '@type': 'ListItem',
+          position: 3,
+          name: pageData.title || pageData.frontmatter.title,
+          item: canonicalUrl,
+        })
+      }
+      pageData.frontmatter.head.push([
+        'script',
+        { type: 'application/ld+json' },
+        JSON.stringify({ '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement }),
+      ])
+    }
+
+    // BlogPosting — every post already has a title, description and date in its
+    // frontmatter; without this markup Google has to infer authorship and
+    // publication date, and answer engines cite the post without attribution.
+    // Skipped when the page declares an external canonical: claiming a BlogPosting
+    // at this URL would contradict the canonical, which says the original lives
+    // somewhere else. The breadcrumb above is navigational and stays either way.
+    if (segment === 'blog' && !hasOwnCanonical && !/(^|\/)index\.md$/.test(pageData.relativePath)) {
+      const date = pageData.frontmatter.date
+      pageData.frontmatter.head.push([
+        'script',
+        { type: 'application/ld+json' },
+        JSON.stringify({
+          '@context': 'https://schema.org',
+          '@type': 'BlogPosting',
+          headline: pageData.frontmatter.title || pageData.title,
+          description: pageData.frontmatter.description || pageData.description,
+          url: canonicalUrl,
+          mainEntityOfPage: { '@type': 'WebPage', '@id': canonicalUrl },
+          ...(date ? { datePublished: new Date(date).toISOString().slice(0, 10) } : {}),
+          image: 'https://gitwand.app/og-image.png',
+          author: { '@type': 'Organization', name: 'Devlint', url: 'https://github.com/devlint' },
+          publisher: {
+            '@type': 'Organization',
+            name: 'GitWand',
+            url: 'https://gitwand.app/',
+            logo: { '@type': 'ImageObject', url: 'https://gitwand.app/logo.svg' },
+          },
+          isPartOf: { '@type': 'Blog', name: 'GitWand Blog', url: 'https://gitwand.app/blog/' },
+        }),
+      ])
+    }
+
+    // FAQPage — the /compare/* pages and /guide/llm-fallback each end in an
+    // "## FAQ" section of "### question" + answer. Those are exactly the blocks
+    // that win featured snippets on "gitwand vs X" / "is GitWand free" queries,
+    // and they were shipping as plain prose. Parsed from the source file so the
+    // markup can never drift from the visible copy.
+    const faq = extractFaq(pageData.filePath)
+    if (faq.length) {
+      pageData.frontmatter.head.push([
+        'script',
+        { type: 'application/ld+json' },
+        JSON.stringify({
+          '@context': 'https://schema.org',
+          '@type': 'FAQPage',
+          mainEntity: faq.map((qa) => ({
+            '@type': 'Question',
+            name: qa.q,
+            acceptedAnswer: { '@type': 'Answer', text: qa.a },
+          })),
+        }),
+      ])
+    }
+  },
 
   themeConfig: {
     logo: '/logo.svg',
@@ -115,10 +272,12 @@ export default defineConfig({
           { text: 'Features', link: '/features' },
           { text: 'Conflict engine', link: '/conflict-engine' },
           { text: 'AI & agents', link: '/ai-agents' },
+          { text: 'WebMCP', link: '/agent' },
           { text: 'Compare', link: '/compare/' },
         ],
       },
       { text: 'Guide', link: '/guide/getting-started' },
+      { text: 'Fix a conflict', link: '/fix/' },
       { text: 'Reference', link: '/reference/core-api' },
       { text: 'Blog', link: '/blog/' },
       { text: "What's new", link: '/changelog' },
@@ -151,6 +310,18 @@ export default defineConfig({
           ],
         },
       ],
+      '/fix/': [
+        {
+          text: 'Fix a Git conflict',
+          items: [
+            { text: 'All guides', link: '/fix/' },
+            { text: 'Merge conflict in a file', link: '/fix/merge-conflict-in-file' },
+            { text: 'Lockfile conflicts', link: '/fix/package-lock-json-merge-conflict' },
+            { text: 'Rebase repeats the same conflict', link: '/fix/rebase-same-conflict-every-commit' },
+            { text: 'git rerere explained', link: '/fix/git-rerere' },
+          ],
+        },
+      ],
       '/compare/': [
         {
           text: 'Compare',
@@ -169,6 +340,10 @@ export default defineConfig({
           text: 'Blog',
           items: [
             { text: 'All articles', link: '/blog/' },
+            { text: 'What WebMCP is, and the first Git tool on it', link: '/blog/webmcp-gitwand-merge-room' },
+            { text: 'Best Git GUI clients in 2026', link: '/blog/best-git-gui-clients-2026' },
+            { text: 'From four tools to one', link: '/blog/from-four-tools-to-one' },
+            { text: 'Why GitWand is Rust, not Electron', link: '/blog/why-gitwand-is-rust-not-electron' },
             { text: 'PR Review 2.0 + secrets scanner (v3.5)', link: '/blog/v3-5-pr-review-2-secrets-scanner' },
             { text: 'Integrated terminal + one-click AI tasks (v3.2)', link: '/blog/v3-2-integrated-terminal-ai-tasks' },
             { text: 'Changes tree view + interactive rebase fix (v2.23)', link: '/blog/v2-23-changes-tree-view' },

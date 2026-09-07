@@ -21,7 +21,7 @@ import { computeEffectivePolicy } from "./policy.js";
 
 export type FormatDispatchResult =
   /** Le résolveur format-aware a produit une résolution. */
-  | { status: "resolved"; lines: string[]; reason: string }
+  | { status: "resolved"; lines: string[]; reason: string; resolverUsed: string }
   /** Le résolveur a résolu mais la politique rejette le résultat (ex: imports/non_overlapping off). */
   | { status: "rejected-policy"; reason: string }
   /** Aucun résolveur format-aware n'a traité ce hunk — continuer vers le moteur textuel. */
@@ -54,17 +54,17 @@ export function dispatchFormatAware(
     if (!options.resolveNonOverlapping) {
       return {
         status: "rejected-policy",
-        reason: "Résolution d'imports (non-overlapping) désactivée par options (resolveNonOverlapping: false).",
+        reason: "Import resolution (non-overlapping) disabled by options (resolveNonOverlapping: false).",
       };
     }
     const { policy, cfg } = computeEffectivePolicy(filePath, options);
     if (!cfg.allowNonOverlapping) {
       return {
         status: "rejected-policy",
-        reason: `Résolution d'imports (non-overlapping) désactivée par la politique "${policy}".`,
+        reason: `Import resolution (non-overlapping) disabled by the "${policy}" policy.`,
       };
     }
   }
 
-  return { status: "resolved", lines: formatResult.lines, reason: formatResult.reason };
+  return { status: "resolved", lines: formatResult.lines, reason: formatResult.reason, resolverUsed: formatResult.resolverUsed };
 }

@@ -1,5 +1,5 @@
 import { ref, computed } from "vue";
-import { parseGitwandrc, type MergeResult, type ConflictHunk, type GitWandOptions, type MergePolicy, type LlmFallbackConfig } from "@gitwand/core";
+import { parseGitwandrc, type MergeResult, type ConflictHunk, type GitWandOptions, type MergePolicy, type LlmFallbackConfig, type MergeContext } from "@gitwand/core";
 // `resolve`, `resolveAsync` and `parseConflictMarkers` are loaded lazily via
 // `engine()` (see ../utils/coreEngine.ts) — they pull in the classifier +
 // full pattern registry (~243 KB raw / ~73 KB gzip) and must stay out of the
@@ -7,6 +7,7 @@ import { parseGitwandrc, type MergeResult, type ConflictHunk, type GitWandOption
 // `typeof parseConflictMarkers` for `RawConflictSegment` without a runtime import.
 import type { parseConflictMarkers } from "@gitwand/core";
 import { engine } from "../utils/coreEngine";
+import { useSnapshots } from "./useSnapshots";
 import {
   pickFolder,
   getConflictedFiles,
@@ -17,6 +18,7 @@ import {
   resolveTreeConflict,
   reconstructConflict,
   gitStage,
+  gitRepoState,
 } from "../utils/backend";
 import { useFolderHistory } from "./useFolderHistory";
 import { useAIProvider } from "./useAIProvider";
@@ -425,6 +427,9 @@ export function useGitWand() {
             policy: cfg.policy,
             patternOverrides: cfg.patterns,
             generatedFiles: cfg.generatedFiles,
+            // accuracy lot 1 — opt-in repo-level : ré-autorise l'auto-résolution des
+            // fichiers générés (le défaut du moteur est de décliner).
+            resolveGeneratedFiles: cfg.resolveGeneratedFiles,
           };
         }
         // v2.5 — `llmFallback` n'est pas géré par `parseGitwandrc` (qui
@@ -479,12 +484,42 @@ export function useGitWand() {
       // Non-fatal : visible dans le toast d'erreur, mais on continue.
       error.value = msg;
     }
+    // accuracy lot C — Contexte de merge : l'app sait quelle opération est en cours
+    // (git_repo_state lit .git directement). Convention des marqueurs git :
+    // « ours » est la branche cible pour merge, rebase ET cherry-pick — déclaré
+    // explicitement pour que le moteur n'ait jamais à re-dériver l'inversion
+    // ours/theirs du rebase. `null` hors opération : le moteur propose au lieu
+    // d'appliquer sur les décisions qui dépendent du contexte.
+    let mergeContext: MergeContext | null = null;
+    try {
+      const st = await gitRepoState(cwd);
+      const OP: Record<string, MergeContext["operation"]> = {
+        merge: "merge", rebase: "rebase", rebase_interactive: "rebase",
+        cherry_pick: "cherry-pick", revert: "revert",
+      };
+      const operation = OP[st.state];
+      if (operation) {
+        // `st.targetBranch` vient de rebase-merge/head-name : c'est la branche
+        // EN COURS DE REBASE (le travail de l'utilisateur) — donc « theirs »
+        // dans la convention des marqueurs, pas la branche onto. Pour merge /
+        // cherry-pick / revert, le backend ne renvoie pas de ref (null).
+        mergeContext = {
+          operation,
+          targetSide: "ours",
+          theirsRef: (operation === "rebase" ? st.targetBranch : null) ?? undefined,
+        };
+      }
+    } catch {
+      // état illisible → contexte inconnu, comportement conservateur du moteur
+    }
+
     const resolveOptionsWithLlm: GitWandOptions = (llmCfg?.enabled && aiEndpoint)
       ? {
           ...resolveOptions.value,
+          mergeContext,
           llmFallback: { ...llmCfg, endpoint: aiEndpoint },
         }
-      : resolveOptions.value;
+      : { ...resolveOptions.value, mergeContext };
 
     // Lazily load the engine once for this whole batch — memoized by
     // `engine()`, so the dynamic import only actually happens on the very
@@ -578,7 +613,7 @@ export function useGitWand() {
       selectedPath.value = loaded[0].path;
     }
 
-    // v2.7 — agrégat local de la métrique tier (dédupliqué par empreinte,
+    // v3.4 — agrégat local de la métrique tier (dédupliqué par empreinte,
     // les refreshs du même jeu de conflits ne recomptent pas).
     const { recordFile } = useTierStats();
     for (const f of loaded) {
@@ -1061,6 +1096,21 @@ export async function fetchUsers() {
    */
   async function saveAllFiles() {
     if (!folderPath.value) return;
+
+    // v3.8 Time Machine: writing every resolved file back is exactly the
+    // "more auto-apply" the snapshot safety net exists for, and unlike the
+    // destructive git commands this path is driven from the frontend, so it
+    // has to capture its own. `capture` never throws, so a snapshot failure
+    // cannot cost the user their save.
+    //
+    // The label is stored in the snapshot's commit message, so it stays in
+    // English like the Rust-side labels and like git's own reflog subjects.
+    // The UI localises the `kind`, not this string.
+    await useSnapshots().capture(
+      folderPath.value,
+      "resolution",
+      `Apply resolutions to ${files.value.length} file(s)`,
+    );
 
     const failures: Array<{ index: number; path: string; err: unknown }> = [];
     await Promise.all(
