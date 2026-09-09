@@ -5,6 +5,34 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.10.0 — September 2026
+
+### The repo stops being asked, and starts telling
+
+Until now GitWand kept a repository up to date the crude way: it asked, every two seconds, forever. Edit a file in your editor, run a command in another terminal, and the change surfaced whenever the next poll happened to land. That poll is gone as the primary mechanism. A filesystem watcher sits on `.git/` and the working tree, and changes appear as they happen, typically inside a second, whoever made them and wherever they came from.
+
+What the watcher emits is not a firehose of raw OS events. They are coalesced into a handful of meaningful kinds, status, index, refs, head, so the app can refresh precisely the thing that moved instead of redrawing everything on every keystroke in a saved file. A `git checkout` touching thousands of files cannot stall the stream: both how long events are batched and how many are batched at once are bounded. One watcher runs per repository no matter how many parts of the UI are listening, which matters because the next consumer is already designed for: the incremental code index behind the v4.0 work.
+
+The old two second poll survives as a fifteen second safety net, and drops back to its former self only when the watcher genuinely cannot run: a network mount, a platform failure, or the setting switched off. It lives in Settings under Git as "Live repo updates", on by default. Turn it off and you get the previous behaviour back immediately, exactly as it was.
+
+### Less waiting, in three other places
+
+Opening a diff no longer spawns a git subprocess. `git_diff` now goes through libgit2 directly, which matters because it sits on the busiest read path in the app. The command line remains the reference implementation and the fallback, and a parity test suite compares the two on every run so the fast path cannot quietly drift away from what git itself would say.
+
+Analysing a large conflicted file used to freeze the interface while it worked. That analysis now happens on a separate thread, so the window stays responsive no matter how big the file is. Nothing about the conflict engine itself changed, only where it runs.
+
+Clone and fetch progress used to be broadcast globally, with every listener hearing about every operation. Each now streams on its own private channel, and fetch gained a progress indicator it simply never had before.
+
+### Today can finally act
+
+The Today inbox listed work without being able to do any of it. Now it can. Merge really merges, and refuses honestly when a pull request is not actually mergeable rather than failing silently. Nudge posts a reminder you get to edit before it goes out, on GitHub for the moment. Resolve drops you directly into the conflict resolver instead of the pull request review page.
+
+One thing deliberately absent: queueing a merge to happen once checks pass. That needs a different call to every forge, and Bitbucket has no equivalent at all, so rather than ship a button labelled "Auto-merge" that could only ever say "waiting", the action performs an honest immediate merge and tells you when checks are still running.
+
+### Told plainly: what did not ship
+
+Blame was meant to move to libgit2 alongside diff. It did not. The accuracy test caught libgit2 and the command line attributing a moved block of code to different commits, and worse, the result depended on which version of git was installed: correct against 2.50.1, wrong against 2.55.0. Blame is something you read and trust, so it stays on the command line until that is resolved. The unused implementation and its failing scenario stay in the codebase as a guard against anyone switching it on without fixing the underlying disagreement first.
+
 ## v3.9.1 — September 2026
 
 A community request, filed as a one-line issue: "the branch merge UI doesn't include the ability to merge with no fast forward option. This is the base working process in our company." Some teams want every merge to leave a visible seam, a real merge commit, even for a branch that could otherwise fast-forward silently into the trunk. GitWand's merge popover had no way to ask for that. It does now: an "Always create a merge commit" checkbox sits next to the branch picker, off by default, and checking it before merging runs `git merge --no-ff` instead of letting a fast-forward slide through unannounced. Leave it unchecked and nothing changes.

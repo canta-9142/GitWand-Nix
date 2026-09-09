@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.0] - 2026-09-09
+
 ### Added
 
-- **Live Repo: the working tree refreshes itself** (v3.10.0). GitWand watched nothing and asked every 2 seconds instead; an edit made outside the app showed up whenever the next poll happened to land. A `notify`-based filesystem watcher now covers `.git/` and the working tree, coalescing raw OS events into typed `RepoChangeEvent`s (`status`, `index`, `refs`, `head`…) streamed over a scoped `tauri::ipc::Channel`, with an EventSource equivalent under `pnpm dev:web` so both backends behave the same. One OS watcher per repository is shared by however many subscribers ask for it, which is also the hook the v4.0 incremental indexer will use. Debounce latency and batch size are bounded so a `git checkout` touching thousands of files cannot stall the stream. Controlled by `Live repo updates` (Settings → Git), on by default; turning it off restores exact pre-v3.10 poll-only behaviour immediately.
+- **Live Repo: the working tree refreshes itself.** GitWand watched nothing and asked every 2 seconds instead; an edit made outside the app showed up whenever the next poll happened to land. A `notify`-based filesystem watcher now covers `.git/` and the working tree, coalescing raw OS events into typed `RepoChangeEvent`s (`status`, `index`, `refs`, `head`…) streamed over a scoped `tauri::ipc::Channel`, with an EventSource equivalent under `pnpm dev:web` so both backends behave the same. One OS watcher per repository is shared by however many subscribers ask for it, which is also the hook the v4.0 incremental indexer will use. Debounce latency and batch size are bounded so a `git checkout` touching thousands of files cannot stall the stream. Controlled by `Live repo updates` (Settings → Git), on by default; turning it off restores exact pre-v3.10 poll-only behaviour immediately.
 - **The Today inbox acts instead of just listing.** The remaining Phase 3 mutations from v3.0.0 landed: `merge` and the dependency-bump action really merge (gated by `mergeReadiness`, so a PR that is not actually mergeable is refused rather than silently failing), `nudge` posts a reminder comment you can edit before it goes out, and `resolve` jumps straight into the conflict resolver rather than dumping you on the PR review page. Nudge is GitHub-only for now. Forge-side auto-merge (`gh pr merge --auto` and its per-provider equivalents) is deliberately *not* here: the action performs an honest immediate merge instead of a button labelled "Auto-merge" that could only ever report "waiting: <check>".
 
 - **A panel for an untracked nested Git repository** (#183). A folder carrying its own `.git` is the one directory entry `git status` still reports as a single row, because git refuses to look inside it. Selecting it now explains why its contents are not tracked from here and offers the two things the app can act on: open it as its own repo tab, or add it to `.gitignore`. Its files are deliberately not listed, because `git ls-files --others` answers with the directory itself, so a file row would just reopen the same panel.
@@ -1452,7 +1454,8 @@ Design-system foundations — the app header and every overlay now ride on a sha
 - CI pipeline via GitHub Actions (Node 18, 20, 22)
 - 28 tests covering all patterns + real-world scenarios (package.json, Laravel routes, Vue SFC, CSS, .env files)
 
-[Unreleased]: https://github.com/devlint/GitWand/compare/v3.9.1...HEAD
+[Unreleased]: https://github.com/devlint/GitWand/compare/v3.10.0...HEAD
+[3.10.0]: https://github.com/devlint/GitWand/compare/v3.9.1...v3.10.0
 [3.9.1]: https://github.com/devlint/GitWand/compare/v3.9.0...v3.9.1
 [3.9.0]: https://github.com/devlint/GitWand/compare/v3.8.0...v3.9.0
 [3.8.0]: https://github.com/devlint/GitWand/compare/v3.7.3...v3.8.0
