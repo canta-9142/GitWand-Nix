@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.1] - 2026-09-09
+
 ### Fixed
 
 - **One unreadable file made every conflict in the repo unresolvable.** Selecting a conflicted file opened the read-only diff instead of the merge editor, with no way to reach resolution at all: the sidebar listed N conflicts and the banner asked the user to resolve them, while nothing could be opened. `loadRealFiles` read every unmerged path inside a single `Promise.all`, and `read_file` is `std::fs::read_to_string`, which rejects any file that is not valid UTF-8. A minified build artifact or a Latin-1 source therefore rejected the whole batch, `openPath` caught it and called `loadDemoData()`, and the merge editor ended up holding fabricated demo paths, so the lookup for the real file returned null and `App.vue` fell through to `DiffViewer`. Each file now loads in isolation, and a failure degrades only itself. The demo set is also no longer used as an error handler for a real repository: replacing a user's conflicts with invented files hid the failure instead of reporting it.
@@ -1459,7 +1461,8 @@ Design-system foundations — the app header and every overlay now ride on a sha
 - CI pipeline via GitHub Actions (Node 18, 20, 22)
 - 28 tests covering all patterns + real-world scenarios (package.json, Laravel routes, Vue SFC, CSS, .env files)
 
-[Unreleased]: https://github.com/devlint/GitWand/compare/v3.10.0...HEAD
+[Unreleased]: https://github.com/devlint/GitWand/compare/v3.10.1...HEAD
+[3.10.1]: https://github.com/devlint/GitWand/compare/v3.10.0...v3.10.1
 [3.10.0]: https://github.com/devlint/GitWand/compare/v3.9.1...v3.10.0
 [3.9.1]: https://github.com/devlint/GitWand/compare/v3.9.0...v3.9.1
 [3.9.0]: https://github.com/devlint/GitWand/compare/v3.8.0...v3.9.0

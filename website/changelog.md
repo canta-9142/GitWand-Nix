@@ -5,6 +5,18 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.10.1 — September 2026
+
+### One unreadable file no longer blocks every conflict
+
+A conflict that GitWand could not open, reported the day v3.10.0 shipped. The sidebar listed four conflicted files, the banner asked for them to be resolved, and selecting any of them showed a read-only diff with no way to reach the resolver at all.
+
+The cause was not the resolver. GitWand loads every conflicted file in one batch, and it reads them as text. A file that is not valid UTF-8, typically a minified bundle or some other build artifact, could not be read, and that single failure aborted the whole batch. What made it invisible rather than merely broken is what happened next: the app fell back to its built-in demonstration files, so the merge editor was left holding examples instead of the repository's real conflicts, quietly, with no error. Files that were perfectly readable, including one-line conflicts the engine settles on its own, became unreachable along with the file that actually failed.
+
+Each file is now loaded on its own, and a failure affects only that file. The demonstration set is no longer used when something goes wrong in a real repository: substituting invented files for someone's actual conflicts hid the problem instead of reporting it.
+
+A file GitWand genuinely cannot decode now gets a panel of its own rather than disappearing. It stays in the list, because git still counts it and a rebase will not continue until it is settled, and it offers the two choices that make sense without reading the contents: keep your side, keep theirs, or open it in your own editor. Both choices are carried out by git directly on the raw bytes, so they work on a file no text editor could show you.
+
 ## v3.10.0 — September 2026
 
 ### The repo stops being asked, and starts telling
