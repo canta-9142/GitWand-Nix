@@ -44,6 +44,16 @@ jobs:
       - name: Install Linux dependencies
         run: |
           set -euxo pipefail
+          # Drop third-party apt sources the runner image ships but this build
+          # never uses. On 2026-09-09 Google's Chrome repo served a Packages.gz
+          # whose hash did not match its own Release file, so `apt-get update`
+          # exited 100 and, under `set -e`, took down every Ubuntu job in the
+          # repo: CI, perf benches, and the v3.10.1 release, which shipped with
+          # no Linux artifacts. Tauri's prereqs all come from Ubuntu's own
+          # archives, so nothing here depends on Google's CDN staying healthy.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/google-chrome-*.list \
+                     /etc/apt/sources.list.d/*google*.sources
           sudo apt-get update
           # Full Tauri 2 prereqs (https://v2.tauri.app/start/prerequisites/#linux).
           # `libglib2.0-dev` + `libsoup-3.0-dev` are required by glib-sys /
