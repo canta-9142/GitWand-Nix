@@ -224,8 +224,37 @@ pub fn git_log_parity(
     ))
 }
 
+/// Parity entry point for `git_diff`. Exercises the shipped implementation,
+/// libgit2 fast path and directory branch included, both of which have drifted
+/// from the Node dev-server before: the directory branch (an untracked folder,
+/// or a nested repo) lived only in the dev-server for several releases with
+/// nothing comparing the two (issue #183), and the v3.10.0 libgit2 fast path
+/// has to stay indistinguishable from the CLI output that route produces.
+pub fn git_diff_parity(cwd: String, path: String, staged: bool) -> Result<types::GitDiff, String> {
+    tauri::async_runtime::block_on(commands::read::git_diff(cwd, path, staged))
+}
+
 pub fn git_branches_parity(cwd: String) -> Result<Vec<types::GitBranch>, String> {
     tauri::async_runtime::block_on(commands::ops::git_branches(cwd, None))
+}
+
+/// Parity entry point for `git_blame`. Same reasoning as `git_diff_parity`.
+pub fn git_blame_parity(
+    cwd: String,
+    path: String,
+    algorithm: Option<String>,
+) -> Result<Vec<types::BlameLine>, String> {
+    tauri::async_runtime::block_on(commands::read::git_blame(cwd, path, algorithm))
+}
+
+/// Parity entry point for `read_file`. Exposed for the *failure* case above
+/// all: `read_file` is `std::fs::read_to_string`, which rejects a file that is
+/// not valid UTF-8, while the dev-server used to substitute U+FFFD and return
+/// success. That divergence hid a bug where one such file made every conflict
+/// in a repository unresolvable in the packaged app, while `pnpm dev:web`
+/// loaded it fine, so QA could not reproduce it (issue #188).
+pub fn read_file_parity(cwd: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::block_on(commands::files::read_file(cwd, path))
 }
 
 pub fn git_remote_info_parity(cwd: String) -> Result<types::RemoteInfo, String> {
@@ -467,6 +496,7 @@ pub fn run() {
             commands::read::git_repo_state,
             commands::ops::git_rebase_action,
             commands::ops::git_interactive_rebase,
+            commands::ops::git_add_to_gitignore,
             commands::ops::git_discard,
             commands::read::git_show,
             commands::ops::git_branches,
@@ -694,10 +724,25 @@ pub fn run() {
             commands::terminal::terminal_write,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_close,
+            // ── v3.10.0 Live Repo FS watcher ──
+            commands::watcher::watch_repo_start,
+            commands::watcher::watch_repo_stop,
         ])
-        .on_window_event(|_window, event| {
+        // A reload (Vite full reload in dev, location.reload(), a restored
+        // crashed webview) leaves the previous document's watcher
+        // subscriptions behind: its `onUnmounted` never runs, so nothing calls
+        // `watch_repo_stop`, and the channel keeps "sending" into a document
+        // whose callback registry is gone. Reap them the moment the new page
+        // starts loading, before it re-subscribes.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                commands::watcher::stop_all_for_webview(webview.label());
+            }
+        })
+        .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 commands::terminal::terminal_close_all();
+                commands::watcher::stop_all_for_webview(window.label());
             }
         })
         .run(tauri::generate_context!())

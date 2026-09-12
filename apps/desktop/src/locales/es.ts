@@ -57,6 +57,7 @@ const es: Locale = {
     pull: "Pull",
     sync: "Sincronizar",
     syncTooltip: "Recuperar ramas remotas y hacer pull",
+    fetchProgress: "Obteniendo… {0} %",
     merge: "Merge",
     mergeTooltip: "Hacer merge de una rama en la rama actual",
     mergeNoFf: "Crear siempre un commit de fusión",
@@ -330,6 +331,13 @@ const es: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    newFolder: "Carpeta nueva",
+    newFolderCount: "{0} archivo(s)",
+    nestedRepo: "Repositorio Git anidado",
+    nestedRepoHint:
+      "Esta carpeta tiene su propio .git, por lo que Git no rastrea su contenido desde aqu\u00ed. A\u00f1\u00e1dela como subm\u00f3dulo, ign\u00f3rala, o elimina su .git para rastrear los archivos.",
+    nestedRepoOpen: "Abrir en una pesta\u00f1a nueva",
+    nestedRepoIgnore: "A\u00f1adir a .gitignore",
     noDiff: "No hay diff disponible para este archivo",
     noDiffHint: "Archivo nuevo o binario",
     selectFile: "Selecciona un archivo para ver el diff",
@@ -765,6 +773,12 @@ const es: Locale = {
     markerlessExplanation: "Git registra un conflicto para este archivo, pero la copia de trabajo no tiene marcadores y no coincide con ningún lado.",
     reconstructConflict: "Reconstruir conflicto",
     keepWorkingTree: "Mantener mi versión (preparar tal cual)",
+    unreadableTitle: "El archivo no se puede leer como texto",
+    unreadableExplanation: "Git informa de un conflicto en este archivo, pero su contenido no es texto UTF-8 válido, así que no hay bloques que mostrar. Suele ser un artefacto de compilación o un binario. Aun así puedes resolverlo tomando un lado completo, lo que opera sobre los bytes en bruto, o abrirlo en tu propio editor.",
+    unreadableKeepOurs: "Mantener nuestra versión",
+    unreadableKeepTheirs: "Mantener su versión",
+    unreadableOpenExternally: "Abrir en un editor externo",
+    unreadableReasonLabel: "Motivo informado",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -1261,6 +1275,8 @@ const es: Locale = {
     defaultBranch: "Rama por defecto",
     commitSignature: "Añadir «🪄 Commit vía GitWand» a la descripción",
     commitSignatureHint: "Una pequeña firma añadida automáticamente — se puede quitar en cualquier momento",
+    liveRepoWatcher: "Actualización en vivo del repositorio",
+    liveRepoWatcherHint: "Actualiza al instante a partir de eventos del sistema de archivos en lugar de sondear. Desactívalo si el repositorio está en una unidad de red.",
     blameAlgorithm: "Algoritmo de diff para blame",
     blameAlgorithmHint: "Controla cómo git blame detecta líneas movidas. histogram da los mejores resultados.",
     secretsScannerEnabled: "Escanear cambios en stage en busca de secretos",
@@ -1677,7 +1693,6 @@ const es: Locale = {
       resolve: "Resolver",
       follow: "Seguir",
       nudge: "Recordar",
-      autoMerge: "Auto-merge",
       view: "Ver",
     },
     case: {
@@ -1746,6 +1761,23 @@ const es: Locale = {
     reviewersShort: "Revisores",
     refreshAll: "Actualizar todo",
     refreshAllTooltip: "Actualizar las 4 pestañas en paralelo",
+    confirm: {
+      merge: {
+        title: "¿Fusionar esta pull request?",
+        body: "{0} se fusionará en {1}.",
+      },
+      nudge: {
+        title: "¿Enviar un recordatorio?",
+        body: "Se publicará un comentario en {0}.",
+      },
+    },
+    nudge: {
+      comment: "Recordatorio amistoso: esta pull request está lista para revisión.",
+    },
+    toast: {
+      merged: "Pull request fusionada.",
+      nudged: "Recordatorio publicado.",
+    },
     noWorkspace: {
       warning: "Crea un workspace primero para usar Today",
     },

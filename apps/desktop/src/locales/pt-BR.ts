@@ -58,6 +58,7 @@ const ptBR: Locale = {
     pull: "Pull",
     sync: "Sincronizar",
     syncTooltip: "Buscar branches remotos e fazer pull",
+    fetchProgress: "Buscando… {0}%",
     merge: "Merge",
     mergeTooltip: "Fazer merge de um branch no branch atual",
     mergeNoFf: "Sempre criar um commit de merge",
@@ -331,6 +332,13 @@ const ptBR: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    newFolder: "Nova pasta",
+    newFolderCount: "{0} arquivo(s)",
+    nestedRepo: "Reposit\u00f3rio Git aninhado",
+    nestedRepoHint:
+      "Esta pasta tem o pr\u00f3prio .git, ent\u00e3o o Git n\u00e3o rastreia o conte\u00fado dela a partir daqui. Adicione-a como subm\u00f3dulo, ignore-a, ou remova o .git dela para rastrear os arquivos.",
+    nestedRepoOpen: "Abrir em uma nova aba",
+    nestedRepoIgnore: "Adicionar ao .gitignore",
     noDiff: "Nenhum diff disponível para este arquivo",
     noDiffHint: "Arquivo novo ou binário",
     selectFile: "Selecione um arquivo para ver o diff",
@@ -766,6 +774,12 @@ const ptBR: Locale = {
     markerlessExplanation: "O Git registra um conflito para este arquivo, mas a cópia de trabalho não tem marcadores e não corresponde a nenhum dos lados.",
     reconstructConflict: "Reconstruir conflito",
     keepWorkingTree: "Manter minha versão (preparar como está)",
+    unreadableTitle: "O arquivo não pode ser lido como texto",
+    unreadableExplanation: "O Git relata este arquivo como em conflito, mas o conteúdo não é texto UTF-8 válido, portanto não há blocos para exibir. Costuma ser um artefato de build ou um binário. Você ainda pode resolvê-lo escolhendo um lado inteiro, o que opera sobre os bytes brutos, ou abri-lo no seu próprio editor.",
+    unreadableKeepOurs: "Manter nossa versão",
+    unreadableKeepTheirs: "Manter a versão deles",
+    unreadableOpenExternally: "Abrir no editor externo",
+    unreadableReasonLabel: "Motivo relatado",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -1262,6 +1276,8 @@ const ptBR: Locale = {
     defaultBranch: "Branch padrão",
     commitSignature: "Adicionar «🪄 Commit via GitWand» à descrição",
     commitSignatureHint: "Uma pequena assinatura adicionada automaticamente — removível a qualquer momento",
+    liveRepoWatcher: "Atualização ao vivo do repositório",
+    liveRepoWatcherHint: "Atualiza instantaneamente a partir de eventos do sistema de arquivos em vez de consultar periodicamente. Desative se o repositório estiver em uma unidade de rede.",
     blameAlgorithm: "Algoritmo de diff para blame",
     blameAlgorithmHint: "Controla como git blame detecta linhas movidas. histogram dá os melhores resultados.",
     secretsScannerEnabled: "Verificar alterações no stage em busca de segredos",
@@ -1677,7 +1693,6 @@ const ptBR: Locale = {
       resolve: "Resolver",
       follow: "Acompanhar",
       nudge: "Lembrar",
-      autoMerge: "Auto-merge",
       view: "Ver",
     },
     case: {
@@ -1746,6 +1761,23 @@ const ptBR: Locale = {
     reviewersShort: "Revisores",
     refreshAll: "Atualizar tudo",
     refreshAllTooltip: "Atualizar as 4 abas em paralelo",
+    confirm: {
+      merge: {
+        title: "Mesclar esta pull request?",
+        body: "{0} será mesclada em {1}.",
+      },
+      nudge: {
+        title: "Enviar um lembrete?",
+        body: "Um comentário será publicado em {0}.",
+      },
+    },
+    nudge: {
+      comment: "Lembrete amigável: esta pull request está pronta para revisão.",
+    },
+    toast: {
+      merged: "Pull request mesclada.",
+      nudged: "Lembrete enviado.",
+    },
     noWorkspace: {
       warning: "Crie um workspace primeiro para usar Today",
     },

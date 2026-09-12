@@ -64,6 +64,7 @@ const zhCN: Locale = {
     pull: "拉取",
     sync: "同步",
     syncTooltip: "获取远程分支并拉取",
+    fetchProgress: "正在获取… {0}%",
     merge: "合并",
     mergeTooltip: "将其他分支合并到当前分支",
     mergeNoFf: "始终创建合并提交",
@@ -331,6 +332,13 @@ const zhCN: Locale = {
   },
 
   diff: {
+    newFolder: "\u65b0\u6587\u4ef6\u5939",
+    newFolderCount: "{0} \u4e2a\u6587\u4ef6",
+    nestedRepo: "\u5d4c\u5957 Git \u4ed3\u5e93",
+    nestedRepoHint:
+      "\u8be5\u6587\u4ef6\u5939\u6709\u81ea\u5df1\u7684 .git\uff0c\u56e0\u6b64 Git \u4e0d\u4f1a\u4ece\u8fd9\u91cc\u8ddf\u8e2a\u5176\u5185\u5bb9\u3002\u53ef\u4ee5\u5c06\u5b83\u6dfb\u52a0\u4e3a\u5b50\u6a21\u5757\u3001\u5ffd\u7565\u5b83\uff0c\u6216\u5220\u9664\u5b83\u7684 .git \u4ee5\u8ddf\u8e2a\u8fd9\u4e9b\u6587\u4ef6\u3002",
+    nestedRepoOpen: "\u5728\u65b0\u6807\u7b7e\u9875\u4e2d\u6253\u5f00",
+    nestedRepoIgnore: "\u6dfb\u52a0\u5230 .gitignore",
     noDiff: "此文件没有可用的差异",
     noDiffHint: "新文件或二进制文件",
     selectFile: "选择文件以查看差异",
@@ -755,6 +763,12 @@ const zhCN: Locale = {
     markerlessExplanation: "Git 为此文件记录了冲突，但工作副本没有冲突标记，且与任何一方都不匹配。",
     reconstructConflict: "重建冲突",
     keepWorkingTree: "保留我的版本（直接暂存）",
+    unreadableTitle: "无法以文本方式读取该文件",
+    unreadableExplanation: "Git 报告此文件存在冲突，但其内容不是有效的 UTF-8 文本，因此没有可显示的区块。这通常是构建产物或二进制文件。你仍然可以整体保留其中一方来解决它（该操作直接作用于原始字节），或在你自己的编辑器中打开它。",
+    unreadableKeepOurs: "保留我方版本",
+    unreadableKeepTheirs: "保留对方版本",
+    unreadableOpenExternally: "在外部编辑器中打开",
+    unreadableReasonLabel: "报告的原因",
   },
 
   pr: {
@@ -1320,6 +1334,8 @@ const zhCN: Locale = {
     defaultBranch: "默认分支",
     commitSignature: "在描述中添加 \u201c🪄 Commit via GitWand\u201d",
     commitSignatureHint: "自动添加的小签名 — 可随时移除",
+    liveRepoWatcher: "仓库实时更新",
+    liveRepoWatcherHint: "通过文件系统事件即时刷新，而不是定时轮询。如果仓库位于网络驱动器上，请关闭此选项。",
     blameAlgorithm: "Blame 差异算法",
     blameAlgorithmHint: "控制 git blame 如何检测移动的行。histogram 在大多数仓库中效果最佳。",
     secretsScannerEnabled: "扫描暂存的更改中的密钥",
@@ -1664,7 +1680,6 @@ const zhCN: Locale = {
       resolve: "解决",
       follow: "跟进",
       nudge: "提醒",
-      autoMerge: "自动合并",
       view: "查看",
     },
     case: {
@@ -1733,6 +1748,23 @@ const zhCN: Locale = {
     reviewersShort: "审阅者",
     refreshAll: "全部刷新",
     refreshAllTooltip: "并行刷新所有 4 个标签页",
+    confirm: {
+      merge: {
+        title: "合并此拉取请求？",
+        body: "{0} 将被合并到 {1}。",
+      },
+      nudge: {
+        title: "发送提醒？",
+        body: "将在 {0} 上发布一条评论。",
+      },
+    },
+    nudge: {
+      comment: "友情提醒：此拉取请求已准备好接受审查。",
+    },
+    toast: {
+      merged: "拉取请求已合并。",
+      nudged: "提醒已发送。",
+    },
     noWorkspace: {
       warning: "请先创建工作区以使用 Today",
     },
