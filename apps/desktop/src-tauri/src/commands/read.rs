@@ -220,6 +220,14 @@ type FileStatusesResult =
 fn libgit2_file_statuses(repo: &git2::Repository) -> FileStatusesResult {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
+        // List every file inside a brand-new directory instead of the
+        // directory itself (issue #181). Without this, libgit2 reports
+        // `newfolder/` as a single entry, like git's default
+        // `--untracked-files=normal`, and the sidebar tree renders it as one
+        // opaque leaf row, so the folder's contents only became visible once
+        // staged. `git_status_cli` passes `--untracked-files=all` for the
+        // same reason.
+        .recurse_untracked_dirs(true)
         .include_ignored(false)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true)
@@ -357,10 +365,27 @@ fn compute_push_remote_via_cli(cwd: &str, upstream: Option<&str>) -> (Option<Str
 /// implementation `git_status_libgit2` instead, with this CLI version as a
 /// fallback on libgit2 errors.
 pub(crate) fn git_status_cli(cwd: String, pathspec: Option<String>) -> Result<GitStatus, String> {
+    // `--no-optional-locks`: a read-only status must never rewrite
+    // `.git/index`. Git refreshes the index's stat cache (and takes
+    // `index.lock` to write it back) whenever an entry's stat data is stale
+    // but its content is unchanged: a `touch`, a save-then-undo, a checkout,
+    // or just coarse mtime granularity on a network mount. The v3.10.0
+    // filesystem watcher classifies that write as an `index` change and
+    // refreshes the repo, which reads status again: GitWand feeding its own
+    // watcher. Must stay in sync with the dev-server's `/api/git-status`
+    // route, which the parity harness compares this against.
     let mut args: Vec<String> = vec![
+        "--no-optional-locks".to_string(),
         "status".to_string(),
         "--porcelain=v2".to_string(),
         "--branch".to_string(),
+        // Recurse into untracked directories (issue #181). git's default
+        // (`normal`) collapses a never-staged directory into a single
+        // `newfolder/` entry, which the sidebar tree cannot expand. Passing
+        // the flag explicitly also aligns this path with the libgit2 fast
+        // path, which reports untracked files regardless of a repo-local
+        // `status.showUntrackedFiles`.
+        "--untracked-files=all".to_string(),
     ];
     if let Some(ref p) = pathspec {
         let p = p.trim();
@@ -722,21 +747,40 @@ fn compute_main_commit_count(cwd: &str, branch: &str) -> i32 {
 #[tauri::command]
 pub(crate) async fn git_diff(cwd: String, path: String, staged: bool) -> Result<GitDiff, String> {
     let _repo = repo_lock::read(&cwd);
-    let mut cmd = git_cmd();
-    if staged {
-        cmd.arg("diff").arg("--cached");
-    } else {
-        cmd.arg("diff");
+    // A trailing slash means the sidebar handed us an untracked *directory*
+    // entry, which has no diff. List what is inside instead so the UI can
+    // render a folder panel. Mirrors `/api/git-diff` in dev-server.mjs, whose
+    // behavior the Rust side used to lack entirely (issue #183). It must stay
+    // ahead of the libgit2 fast path below: a directory is not a blob, so the
+    // fast path would error, fall back to the CLI and hand the UI an empty
+    // diff, which is exactly the bug #183 fixed.
+    if path.ends_with('/') {
+        return git_diff_directory(&cwd, path);
     }
-    cmd.arg("--").arg(&path).current_dir(&cwd);
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to run git diff: {}", e))?;
+    // libgit2 fast path (v3.10.0): avoids a git subprocess on the hottest read
+    // path in the app. Any error falls back to the CLI, which stays the
+    // reference implementation for the parity harness.
+    let raw: Vec<u8> = match libgit2_diff_patch(&cwd, &path, staged) {
+        Ok(patch) => patch.into_bytes(),
+        Err(e) => {
+            eprintln!("[git_diff] libgit2 fast path failed ({e}); falling back to CLI");
+            let mut cmd = git_cmd();
+            if staged {
+                cmd.arg("diff").arg("--cached");
+            } else {
+                cmd.arg("diff");
+            }
+            cmd.arg("--").arg(&path).current_dir(&cwd);
+            cmd.output()
+                .map_err(|e| format!("Failed to run git diff: {}", e))?
+                .stdout
+        }
+    };
 
     // Defensive truncation. We slice at the last newline within the cap so
     // we never split a hunk header mid-line.
-    let original_size = output.stdout.len();
+    let original_size = raw.len();
     let truncated_from_bytes: Option<u64> = if original_size > DIFF_TRUNCATE_BYTES {
         Some(original_size as u64)
     } else {
@@ -745,12 +789,12 @@ pub(crate) async fn git_diff(cwd: String, path: String, staged: bool) -> Result<
     let stdout_slice: &[u8] = if truncated_from_bytes.is_some() {
         let mut cut = DIFF_TRUNCATE_BYTES;
         // Walk back to the last \n so the parser sees complete lines.
-        while cut > 0 && output.stdout[cut - 1] != b'\n' {
+        while cut > 0 && raw[cut - 1] != b'\n' {
             cut -= 1;
         }
-        &output.stdout[..cut]
+        &raw[..cut]
     } else {
-        &output.stdout
+        &raw
     };
     let stdout = String::from_utf8_lossy(stdout_slice);
     let (mut hunks, mut status) = parse_diff_hunks(&stdout);
@@ -796,6 +840,53 @@ pub(crate) async fn git_diff(cwd: String, path: String, staged: bool) -> Result<
         status,
         old_path: None,
         truncated_from_bytes,
+        is_directory: None,
+        new_files: None,
+        nested_repo: None,
+    })
+}
+
+/// `git_diff` for a directory path: the untracked files inside it.
+///
+/// A directory carrying its own `.git` is reported as a nested repo with no
+/// file list. Git never looks inside one, so `ls-files --others` answers with
+/// the directory itself; listing that would hand the UI a row which reopens
+/// this very panel. Since `git status --untracked-files=all` (issue #181), a
+/// nested repo is in fact the only directory entry the sidebar can still
+/// produce.
+fn git_diff_directory(cwd: &str, path: String) -> Result<GitDiff, String> {
+    let dir = safe_repo_path(cwd, &path)?;
+
+    let raw: Vec<String> = git_cmd()
+        .args(["ls-files", "--others", "--exclude-standard", "--"])
+        .arg(&dir)
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Two independent signals, either is enough: an own `.git` (a directory
+    // for a plain clone, a file for a worktree or an absorbed submodule), or
+    // git answering with the directory instead of its contents.
+    let nested = dir.join(".git").exists() || raw == [path.clone()];
+
+    Ok(GitDiff {
+        path,
+        hunks: Vec::new(),
+        status: None,
+        old_path: None,
+        truncated_from_bytes: None,
+        is_directory: Some(true),
+        new_files: Some(if nested { Vec::new() } else { raw }),
+        nested_repo: if nested { Some(true) } else { None },
     })
 }
 
@@ -1141,6 +1232,10 @@ pub(crate) async fn git_show(cwd: String, hash: String) -> Result<Vec<GitDiff>, 
                     // Truncation is only meaningful for the per-file diff
                     // command. Set None unconditionally here.
                     truncated_from_bytes: None,
+                    // Directory entries only reach the single-file `git_diff`.
+                    is_directory: None,
+                    new_files: None,
+                    nested_repo: None,
                 });
             }
             current_status = None;
@@ -1251,6 +1346,9 @@ pub(crate) async fn git_show(cwd: String, hash: String) -> Result<Vec<GitDiff>, 
             status: current_status.take(),
             old_path: current_old_path.take(),
             truncated_from_bytes: None, // see P2.4 note above
+            is_directory: None,
+            new_files: None,
+            nested_repo: None,
         });
     }
 
@@ -1366,6 +1464,19 @@ pub(crate) async fn git_blame(
 ) -> Result<Vec<BlameLine>, String> {
     let _repo = repo_lock::read(&cwd);
     let algo = algorithm.as_deref().unwrap_or("histogram");
+    // Limit to 10 000 blame entries to cap memory & runtime on huge files.
+    const BLAME_MAX_ENTRIES: usize = 10_000;
+
+    // The libgit2 fast path (`libgit2_blame`, v3.10.0) is CLI-only for blame:
+    // `blame_attribution_matches_the_cli_on_a_moved_block` proved a real,
+    // git-version-dependent attribution divergence between libgit2's bundled
+    // xdiff (Myers) and the CLI's histogram blame on a moved block (it passed
+    // locally against git 2.50.1 but failed in CI against git 2.55.0 — see
+    // PR #178 CI run). Blame attribution is user-visible, so per the plan's
+    // documented fallback (git/libgit2.rs `libgit2_blame` doc comment) this
+    // stays CLI-only. `libgit2_blame` and its tests remain as a regression
+    // guard against re-enabling this without re-verifying the divergence.
+
     let diff_algo_flag = format!("--diff-algorithm={}", algo);
     let output = git_cmd()
         .args(["blame", "--porcelain", &diff_algo_flag, "--", &path])
@@ -1379,53 +1490,7 @@ pub(crate) async fn git_blame(
         ));
     }
     let raw = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = raw.lines().collect();
-    let mut blame_lines: Vec<BlameLine> = Vec::new();
-    // Limit to 10 000 blame entries to cap memory & runtime on huge files.
-    const BLAME_MAX_ENTRIES: usize = 10_000;
-    let mut i = 0;
-    while i < lines.len() && blame_lines.len() < BLAME_MAX_ENTRIES {
-        // Header: <40-char-sha> <orig-line> <final-line> [<num-lines-in-group>]
-        let parts: Vec<&str> = lines[i].split_whitespace().collect();
-        if parts.len() < 3 || parts[0].len() != 40 {
-            i += 1;
-            continue;
-        }
-        let hash_full = parts[0].to_string();
-        let hash = hash_full[..7].to_string();
-        let orig_line: u32 = parts[1].parse().unwrap_or(0);
-        let final_line: u32 = parts[2].parse().unwrap_or(0);
-        i += 1;
-        let mut author = String::new();
-        let mut author_date = String::new();
-        let mut summary = String::new();
-        let mut content = String::new();
-        while i < lines.len() && !lines[i].starts_with('\t') {
-            if lines[i].starts_with("author ") {
-                author = lines[i][7..].to_string();
-            } else if lines[i].starts_with("author-time ") {
-                author_date = lines[i][12..].to_string();
-            } else if lines[i].starts_with("summary ") {
-                summary = lines[i][8..].to_string();
-            }
-            i += 1;
-        }
-        if i < lines.len() && lines[i].starts_with('\t') {
-            content = lines[i][1..].to_string();
-            i += 1;
-        }
-        blame_lines.push(BlameLine {
-            hash,
-            hash_full,
-            final_line,
-            orig_line,
-            author,
-            author_date,
-            summary,
-            content,
-        });
-    }
-    Ok(blame_lines)
+    Ok(parse_blame_porcelain(&raw, BLAME_MAX_ENTRIES))
 }
 
 // ─── Merge Preview (Phase 8.1) ───────────────────────────
@@ -2673,6 +2738,154 @@ mod pathspec_tests {
         );
     }
 
+    // ── Untracked directories (issue #181) ────────────────────
+    //
+    // git's default `--untracked-files=normal` collapses a brand-new
+    // directory into a single `newfolder/` entry. The sidebar tree builder
+    // renders such a trailing-slash path as one opaque leaf row, so neither
+    // the folder nor the files inside it were visible until the user staged
+    // them. Both status implementations must therefore recurse into
+    // untracked directories.
+
+    #[test]
+    fn git_status_lists_files_inside_untracked_directory() {
+        let repo = TempRepo::new();
+        repo.write("root.txt", "root");
+        repo.commit_all("root");
+
+        // Brand-new, never-staged directory, with a nested subdirectory.
+        repo.write("newfolder/a.txt", "a");
+        repo.write("newfolder/sub/b.txt", "b");
+
+        let expected = vec![
+            "newfolder/a.txt".to_string(),
+            "newfolder/sub/b.txt".to_string(),
+        ];
+
+        let cli = git_status_cli(repo.cwd(), None).expect("git_status_cli failed");
+        let mut cli_untracked = cli.untracked.clone();
+        cli_untracked.sort();
+        assert_eq!(
+            cli_untracked, expected,
+            "CLI: untracked dir should be listed file-by-file, got {:?}",
+            cli.untracked
+        );
+
+        let lg2 = git_status_libgit2(&repo.cwd()).expect("git_status_libgit2 failed");
+        let mut lg2_untracked = lg2.untracked.clone();
+        lg2_untracked.sort();
+        assert_eq!(
+            lg2_untracked, expected,
+            "libgit2: untracked dir should be listed file-by-file, got {:?}",
+            lg2.untracked
+        );
+    }
+
+    // ── git_diff on a directory path (issue #183) ─────────────
+    //
+    // The sidebar can hand `git_diff` a path ending in "/" (an untracked
+    // directory entry from `git status`). Only the Node dev-server handled
+    // that: it listed the files inside and answered `isDirectory: true`, which
+    // `DiffViewer` renders as a "new folder" panel. Rust returned an ordinary
+    // empty diff, so the packaged app showed nothing where dev:web worked.
+
+    #[test]
+    fn git_diff_on_an_untracked_directory_lists_the_files_inside() {
+        let repo = TempRepo::new();
+        repo.write("root.txt", "root");
+        repo.commit_all("root");
+        repo.write("newfolder/a.txt", "a");
+        repo.write("newfolder/sub/b.txt", "b");
+
+        let diff =
+            tauri::async_runtime::block_on(git_diff(repo.cwd(), "newfolder/".to_string(), false))
+                .expect("git_diff on a directory failed");
+
+        assert_eq!(
+            diff.is_directory,
+            Some(true),
+            "should be flagged a directory"
+        );
+        assert_eq!(
+            diff.nested_repo, None,
+            "a plain folder is not a nested repo"
+        );
+        assert!(diff.hunks.is_empty(), "a directory has no hunks");
+        let mut files = diff.new_files.clone().unwrap_or_default();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                "newfolder/a.txt".to_string(),
+                "newfolder/sub/b.txt".to_string()
+            ],
+            "expected the files inside the directory, got {:?}",
+            diff.new_files
+        );
+    }
+
+    // A nested git repo is the one directory entry that survives
+    // `--untracked-files=all`: git refuses to look inside it. `git ls-files
+    // --others` then answers with the directory itself, so listing its
+    // "contents" would hand the UI a row that reopens the same panel. It is
+    // reported as a nested repo instead, with no file list.
+
+    #[test]
+    fn git_diff_on_an_untracked_nested_repo_reports_it_as_nested() {
+        let repo = TempRepo::new();
+        repo.write("root.txt", "root");
+        repo.commit_all("root");
+
+        // A second, independent repo living inside the working tree.
+        let inner = repo.path.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let out = Command::new(git_binary())
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&inner)
+            .output()
+            .expect("git init (inner) failed to spawn");
+        assert!(out.status.success(), "git init (inner) failed");
+        std::fs::write(inner.join("c.txt"), "c").unwrap();
+
+        let diff =
+            tauri::async_runtime::block_on(git_diff(repo.cwd(), "inner/".to_string(), false))
+                .expect("git_diff on a nested repo failed");
+
+        assert_eq!(
+            diff.is_directory,
+            Some(true),
+            "should be flagged a directory"
+        );
+        assert_eq!(
+            diff.nested_repo,
+            Some(true),
+            "should be flagged a nested repo"
+        );
+        assert!(
+            diff.new_files.clone().unwrap_or_default().is_empty(),
+            "a nested repo's files belong to the other repo, got {:?}",
+            diff.new_files
+        );
+    }
+
+    // Guard against the directory branch swallowing ordinary files: a real
+    // file must still produce hunks.
+
+    #[test]
+    fn git_diff_on_a_file_is_unaffected_by_the_directory_branch() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("a");
+        repo.write("a.txt", "two\n");
+
+        let diff = tauri::async_runtime::block_on(git_diff(repo.cwd(), "a.txt".to_string(), false))
+            .expect("git_diff on a file failed");
+
+        assert_eq!(diff.is_directory, None, "a file is not a directory");
+        assert_eq!(diff.nested_repo, None);
+        assert!(!diff.hunks.is_empty(), "expected hunks for a modified file");
+    }
+
     // ── Remote branch existence without configured upstream ───────
     //
     // Reproduces the "GitWand offers to publish an already-published branch"
@@ -2837,6 +3050,82 @@ mod pathspec_tests {
         // The snapshot commit and its meta commit must not be counted.
         assert_eq!(count, 1);
     }
+
+    // ── Phase D: git_diff libgit2 fast path ───────────────────
+
+    #[test]
+    fn git_diff_reports_an_unstaged_edit_via_the_fast_path() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "one\ntwo\nthree\n");
+        repo.commit_all("init");
+        repo.write("a.txt", "one\nTWO\nthree\n");
+
+        let d = tauri::async_runtime::block_on(git_diff(
+            repo.cwd().to_string(),
+            "a.txt".to_string(),
+            false,
+        ))
+        .expect("git_diff failed");
+        assert_eq!(d.path, "a.txt");
+        assert_eq!(d.hunks.len(), 1);
+        assert!(d.hunks[0]
+            .lines
+            .iter()
+            .any(|l| l.r#type == "delete" && l.content == "two"));
+        assert!(d.hunks[0]
+            .lines
+            .iter()
+            .any(|l| l.r#type == "add" && l.content == "TWO"));
+        assert!(d.truncated_from_bytes.is_none());
+    }
+
+    #[test]
+    fn git_diff_still_renders_an_untracked_file_as_all_additions() {
+        let repo = TempRepo::new();
+        repo.write("root.txt", "root");
+        repo.commit_all("init");
+        repo.write("new.txt", "hello\nworld\n");
+
+        let d = tauri::async_runtime::block_on(git_diff(
+            repo.cwd().to_string(),
+            "new.txt".to_string(),
+            false,
+        ))
+        .expect("git_diff failed");
+        assert_eq!(d.status.as_deref(), Some("added"));
+        assert!(d.hunks[0].lines.iter().all(|l| l.r#type == "add"));
+    }
+
+    /// Regression test: a TRACKED file whose only change is already staged
+    /// also yields an empty unstaged `git diff`. Without the `is_untracked`
+    /// guard, the `--no-index` fallback would misfire and render the whole
+    /// file as a fresh addition instead of showing no unstaged change (the
+    /// same bug independently found and fixed in dev-server.mjs's mirror
+    /// route during the v3.10.0 libgit2 migration).
+    #[test]
+    fn git_diff_unstaged_is_empty_for_a_tracked_file_with_only_a_staged_change() {
+        let repo = TempRepo::new();
+        repo.write("b.txt", "alpha\nbeta\n");
+        repo.commit_all("init b");
+        repo.write("b.txt", "alpha\nBETA\n");
+        Command::new(git_binary())
+            .args(["add", "--", "b.txt"])
+            .current_dir(repo.cwd())
+            .output()
+            .expect("git add failed");
+
+        let d = tauri::async_runtime::block_on(git_diff(
+            repo.cwd().to_string(),
+            "b.txt".to_string(),
+            false,
+        ))
+        .expect("git_diff failed");
+        assert!(
+            d.hunks.is_empty(),
+            "expected no unstaged hunks for a fully-staged tracked file, got {} hunk(s)",
+            d.hunks.len()
+        );
+    }
 }
 
 /// Regression coverage for #136: `git_branch_merged` used to hardcode a
@@ -2940,6 +3229,126 @@ mod branch_merged_tests {
         assert!(
             !merged.contains(&"unmerged-feature".to_string()),
             "a branch with unmerged commits must not be reported as merged"
+        );
+    }
+}
+
+/// `git status` must never rewrite `.git/index` (v3.10.0 Live Repo watcher).
+///
+/// Git refreshes the index's stat cache, taking `index.lock` and writing the
+/// index back, whenever an entry's recorded stat data no longer matches the
+/// file but its content does. The watcher classifies that write as an `index`
+/// change and refreshes the repo, which reads status again: a refresh loop
+/// with GitWand as the only writer. `--no-optional-locks` is what suppresses
+/// the write-back.
+#[cfg(test)]
+mod status_no_optional_locks_tests {
+    use super::*;
+    use crate::git::cmd::git_binary;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    impl TempRepo {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "gitwand-status-locks-test-{}-{}-{}",
+                std::process::id(),
+                n,
+                nanos
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = TempRepo { path: dir };
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.git(&["config", "user.name", "Test"]);
+            repo.git(&["config", "user.email", "test@example.com"]);
+            repo.git(&["config", "commit.gpgsign", "false"]);
+            std::fs::write(repo.path.join("a.txt"), "one\n").unwrap();
+            repo.git(&["add", "-A"]);
+            repo.git(&["commit", "-q", "-m", "base"]);
+            repo
+        }
+        fn cwd(&self) -> String {
+            self.path.to_str().unwrap().to_string()
+        }
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            let out = Command::new(git_binary())
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} spawn: {}", args, e));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        }
+        /// Make `a.txt`'s stat data stale while leaving its content identical:
+        /// exactly what a `touch`, a save-then-undo, a checkout or a coarse
+        /// mtime granularity produces, and the only case where git wants to
+        /// write the index back from a read-only status.
+        fn backdate_a_txt(&self) {
+            let out = Command::new("touch")
+                .args(["-t", "202001010000", "a.txt"])
+                .current_dir(&self.path)
+                .output()
+                .expect("touch spawn");
+            assert!(out.status.success(), "touch failed");
+        }
+        fn index_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.path.join(".git").join("index")).expect("read .git/index")
+        }
+    }
+
+    #[test]
+    fn git_status_cli_does_not_rewrite_the_index() {
+        let repo = TempRepo::new();
+        repo.backdate_a_txt();
+        let before = repo.index_bytes();
+
+        git_status_cli(repo.cwd(), None).expect("git status must succeed");
+
+        assert_eq!(
+            before,
+            repo.index_bytes(),
+            "git_status_cli rewrote .git/index; the watcher would classify that \
+             as an `index` change and refresh, which reads status again"
+        );
+    }
+
+    /// Guard on the premise: without `--no-optional-locks` the very same repo
+    /// state *does* get its index rewritten. If git ever stops doing this, the
+    /// test above would pass for the wrong reason.
+    #[test]
+    fn a_plain_status_does_rewrite_the_index() {
+        let repo = TempRepo::new();
+        repo.backdate_a_txt();
+        let before = repo.index_bytes();
+
+        repo.git(&["status", "--porcelain=v2", "--branch"]);
+
+        assert_ne!(
+            before,
+            repo.index_bytes(),
+            "premise broken: a plain `git status` no longer refreshes the index \
+             stat cache, so --no-optional-locks is no longer what prevents it"
         );
     }
 }
