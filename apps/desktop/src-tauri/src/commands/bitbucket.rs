@@ -336,6 +336,7 @@ fn bb_pr_to_pr(pr: &serde_json::Value) -> PullRequest {
         merge_state_status: String::new(),
         checks_rollup: String::new(),
         comment_count: ji(pr, "comment_count"),
+        auto_merge: Default::default(),
     }
 }
 
@@ -393,6 +394,7 @@ fn bb_pr_to_detail(pr: &serde_json::Value) -> PullRequestDetail {
         // unknown ⇒ UI gates on errors only.
         can_merge: None,
         head_sha: jdeep(pr, "source", "commit", "hash"),
+        auto_merge: Default::default(),
     }
 }
 

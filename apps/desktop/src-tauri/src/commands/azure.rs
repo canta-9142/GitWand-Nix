@@ -568,6 +568,7 @@ fn json_to_pr(r: &AzureRepo, pr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(pr, "mergeStatus").to_uppercase(),
         checks_rollup: String::new(),
         comment_count: 0,
+        auto_merge: Default::default(),
     }
 }
 
@@ -620,6 +621,7 @@ fn json_to_detail(r: &AzureRepo, pr: &serde_json::Value) -> PullRequestDetail {
         // cheaply available here. Unknown ⇒ UI gates on errors only.
         can_merge: None,
         head_sha: jnested(pr, "lastMergeSourceCommit", "commitId"),
+        auto_merge: Default::default(),
     }
 }
 

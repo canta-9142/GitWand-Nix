@@ -341,6 +341,37 @@ pub struct RemoteInfo {
     pub repo: String,
 }
 
+// ─── Forge-side auto-merge (v3.11.0) ───────────────────────────────
+//
+// Two scopes, deliberately separate. `supported` is an administrative
+// setting of the repository and does not vary per PR, so resolving it per
+// PR would ask N times for one answer. `armed` / `available` are per PR and
+// come from payloads each forge module already parses.
+
+/// `#[allow(dead_code)]`: not yet constructed by a caller outside its own
+/// unit tests, a later task in the forge-side auto-merge plan wires it in.
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoMergeSupport {
+    /// This forge, on this repository, can queue a merge at all.
+    pub supported: bool,
+    /// When it cannot, why, in the forge's own words. Not translated: this
+    /// is forge data, not GitWand copy.
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoMergeState {
+    /// An auto-merge is queued on this PR right now.
+    pub armed: bool,
+    /// This PR meets the forge's preconditions for queueing one.
+    pub available: bool,
+    /// When it does not, why. Forge text, untranslated.
+    pub reason: Option<String>,
+}
+
 // ─── PR types ──────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -363,6 +394,8 @@ pub struct PullRequest {
     pub review_decision: String,
     pub merge_state_status: String,
     pub checks_rollup: String,
+    #[serde(rename = "autoMerge", default)]
+    pub auto_merge: AutoMergeState,
     /// Number of issue-comments on the PR. Populated by the enriched
     /// workspace_prs_all path (v2.16) for the Launchpad notification diff;
     /// 0 on the light sidebar list path. `#[serde(default)]` so the
@@ -549,6 +582,8 @@ pub struct PullRequestDetail {
     /// cheaply provide one (callers must treat "" as "unknown", v3.6.0).
     #[serde(default)]
     pub head_sha: String,
+    #[serde(rename = "autoMerge", default)]
+    pub auto_merge: AutoMergeState,
 }
 
 // ─── Fork / PR target info ─────────────────────────────────────────

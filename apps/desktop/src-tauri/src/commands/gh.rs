@@ -503,6 +503,7 @@ fn gh_create_pr_inner(
         merge_state_status: String::new(),
         checks_rollup: String::new(),
         comment_count: 0,
+        auto_merge: Default::default(),
     })
 }
 
@@ -1889,5 +1890,114 @@ mod gh_should_fetch_origin_tests {
         let b = "/tmp/gitwand-test-gh-throttle-unique-ghi";
         assert!(gh_should_fetch_origin(a));
         assert!(gh_should_fetch_origin(b));
+    }
+}
+
+/// Per-PR auto-merge state from a `gh pr list` / `gh pr view` JSON object.
+///
+/// `autoMergeRequest` is a flat node: present and non-null when a merge is
+/// queued, explicitly `null` otherwise. GitHub has no per-PR precondition
+/// beyond the repository setting, so `available` is unconditionally true
+/// here; whether the repository allows it at all is `gh_auto_merge_support`.
+///
+/// `#[allow(dead_code)]`: not yet wired into a caller, a later task in the
+/// forge-side auto-merge plan populates `PullRequest::auto_merge`/
+/// `PullRequestDetail::auto_merge` with it.
+#[allow(dead_code)]
+pub(crate) fn gh_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeState {
+    crate::types::AutoMergeState {
+        armed: pr.get("autoMergeRequest").is_some_and(|v| !v.is_null()),
+        available: true,
+        reason: None,
+    }
+}
+
+/// Repository-level capability from `gh repo view --json autoMergeAllowed`.
+///
+/// Fails closed: a missing or non-boolean field reads as unsupported. An
+/// older `gh`, or a shape we did not anticipate, must hide the button rather
+/// than offer one that cannot work.
+///
+/// `#[allow(dead_code)]`: not yet wired into a caller, see `gh_auto_merge_state`.
+#[allow(dead_code)]
+pub(crate) fn gh_auto_merge_support(
+    repo_view: &serde_json::Value,
+) -> crate::types::AutoMergeSupport {
+    if repo_view
+        .get("autoMergeAllowed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        crate::types::AutoMergeSupport { supported: true, reason: None }
+    } else {
+        crate::types::AutoMergeSupport {
+            supported: false,
+            reason: Some(
+                "Auto-merge is disabled in this repository's settings.".to_string(),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod gh_auto_merge_tests {
+    use super::{gh_auto_merge_state, gh_auto_merge_support};
+
+    #[test]
+    fn a_pr_with_auto_merge_queued_is_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"number": 7, "autoMergeRequest": {"enabledAt": "2026-09-14T10:00:00Z"}}"#,
+        )
+        .unwrap();
+        let s = gh_auto_merge_state(&v);
+        assert!(s.armed);
+        assert!(s.available);
+        assert_eq!(s.reason, None);
+    }
+
+    #[test]
+    fn a_pr_without_auto_merge_is_not_armed_but_is_available() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"number": 7}"#).unwrap();
+        let s = gh_auto_merge_state(&v);
+        assert!(!s.armed);
+        assert!(s.available, "GitHub has no per-PR precondition beyond the repo setting");
+    }
+
+    #[test]
+    fn an_explicit_null_auto_merge_request_is_not_armed() {
+        // `gh pr list --json autoMergeRequest` emits an explicit null, not an
+        // absent key, which is a different JSON shape from the test above.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"number": 7, "autoMergeRequest": null}"#).unwrap();
+        assert!(!gh_auto_merge_state(&v).armed);
+    }
+
+    #[test]
+    fn a_repo_with_auto_merge_disabled_is_unsupported_with_a_reason() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"autoMergeAllowed": false}"#).unwrap();
+        let s = gh_auto_merge_support(&v);
+        assert!(!s.supported);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("Auto-merge is disabled in this repository's settings.")
+        );
+    }
+
+    #[test]
+    fn a_repo_with_auto_merge_allowed_is_supported() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"autoMergeAllowed": true}"#).unwrap();
+        let s = gh_auto_merge_support(&v);
+        assert!(s.supported);
+        assert_eq!(s.reason, None);
+    }
+
+    #[test]
+    fn a_missing_field_is_treated_as_unsupported_not_as_allowed() {
+        // An older `gh`, or a response shape we did not anticipate, must fail
+        // closed: offering a button that cannot work is worse than hiding one
+        // that could.
+        let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!gh_auto_merge_support(&v).supported);
     }
 }

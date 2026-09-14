@@ -375,6 +375,7 @@ fn json_to_pr(pr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(pr, "mergeable_state").to_uppercase(),
         checks_rollup: String::new(),
         comment_count: ji(pr, "comments"),
+        auto_merge: Default::default(),
     }
 }
 
@@ -423,6 +424,7 @@ fn json_to_detail(pr: &serde_json::Value) -> PullRequestDetail {
         // response does not embed `permissions` on the nested base repo.
         can_merge: None,
         head_sha: jnested(pr, "head", "sha"),
+        auto_merge: Default::default(),
     }
 }
 

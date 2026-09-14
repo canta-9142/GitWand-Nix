@@ -169,6 +169,7 @@ fn gl_mr_to_pr(mr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(mr, "merge_status"),
         checks_rollup: String::new(),
         comment_count: ji(mr, "user_notes_count"),
+        auto_merge: Default::default(),
     }
 }
 
@@ -262,6 +263,7 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
             .and_then(|s| s.as_str())
             .map(String::from)
             .unwrap_or_else(|| js(mr, "sha")),
+        auto_merge: Default::default(),
     }
 }
 
