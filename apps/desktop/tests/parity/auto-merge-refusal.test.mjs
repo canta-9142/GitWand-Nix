@@ -47,6 +47,23 @@ function normalizeForgeError(msg) {
   return lower.includes("remote") ? "no-remote" : "other";
 }
 
+/**
+ * Detect `runProbe`'s timeout shape (`probe.mjs`'s `spawnSync(..., { timeout:
+ * 10_000 })`) rather than let it masquerade as an ordinary class mismatch.
+ *
+ * The probe reads the macOS keychain through `settings_github_token()`, and
+ * it is an unsigned binary, so the FIRST keychain access after any rebuild
+ * (`cargo build --example parity-probe`) blocks on an OS authorization
+ * decision. That takes minutes; `runProbe` kills the child at 10s via Node's
+ * `spawnSync` timeout, which surfaces as `result.error.code === "ETIMEDOUT"`
+ * (message `"spawnSync <bin> ETIMEDOUT"`) and `exitCode: -1`. Left
+ * unrecognised, this looks exactly like `normalizeForgeError` classifying an
+ * ordinary mismatch as `"other"`: a phantom bug report, not a real one.
+ */
+function looksLikeProbeTimeout(result) {
+  return result.exitCode === -1 && /ETIMEDOUT/.test(String(result.error));
+}
+
 describe("parity: auto-merge refusal", () => {
   /** @type {Awaited<ReturnType<typeof startDevServer>>} */
   let dev;
@@ -63,6 +80,14 @@ describe("parity: auto-merge refusal", () => {
     const cwd = mkTempRepo("gw-auto-merge-refusal-");
     const rust = runProbe("gh-enable-auto-merge", { cwd, number: 1, method: "squash" });
     const node = await nodeEnableAutoMerge(dev, cwd, 1, "squash");
+
+    if (looksLikeProbeTimeout(rust)) {
+      throw new Error(
+        "parity-probe timed out. This is almost certainly the first keychain " +
+          "access by a freshly built probe binary, not a bug in the command. " +
+          "Re-run the suite once; the OS remembers the decision.",
+      );
+    }
 
     expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
     expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
@@ -84,6 +109,14 @@ describe("parity: auto-merge refusal", () => {
     });
     const nodeData = await res.json().catch(() => ({}));
     const node = res.ok ? { ok: true } : { ok: false, error: nodeData.error };
+
+    if (looksLikeProbeTimeout(rust)) {
+      throw new Error(
+        "parity-probe timed out. This is almost certainly the first keychain " +
+          "access by a freshly built probe binary, not a bug in the command. " +
+          "Re-run the suite once; the OS remembers the decision.",
+      );
+    }
 
     expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
     expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);

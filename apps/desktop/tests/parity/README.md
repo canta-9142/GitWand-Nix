@@ -126,6 +126,34 @@ Conséquence : les **hashes de commit sont reproductibles** d'une machine
 à l'autre. Si un test échoue parce qu'un hash diffère, c'est une vraie
 divergence Rust/Node, pas du bruit environnemental.
 
+## Le probe et le trousseau macOS (keychain)
+
+Les commandes de forge (`gh-enable-auto-merge`, `gh-disable-auto-merge`, et
+toute future commande passant par `github_api::settings_github_token()`) lisent
+le trousseau macOS pour savoir si un token GitHub est configuré. C'est un
+comportement correct et voulu : c'est ce qui permet à un utilisateur avec
+token de passer par le chemin GraphQL plutôt que par le CLI `gh`.
+
+Le binaire `parity-probe` n'est pas signé. Sur macOS, le **premier** accès au
+trousseau par un binaire fraîchement compilé (après tout `cargo build
+--example parity-probe`) bloque sur une décision d'autorisation OS, qui peut
+prendre plusieurs minutes avant que macOS ne réponde. `runProbe` (`probe.mjs`)
+tue le process au bout de 10 s, et le résultat (`exitCode: -1`,
+`error` contenant `"ETIMEDOUT"`) ressemble à s'y méprendre à un vrai échec de
+la commande testée.
+
+Ce blocage se résout de lui-même : macOS mémorise la décision d'autorisation,
+donc un second run juste après passe en quelques centaines de millisecondes.
+`tests/parity/auto-merge-refusal.test.mjs` détecte cette forme de timeout
+(`looksLikeProbeTimeout`) et lève une erreur explicite plutôt que de laisser
+le test échouer avec un message qui ressemble à une divergence Rust/Node
+ordinaire.
+
+CI n'est pas affecté : il n'y a ni trousseau ni token configuré sur les
+runners, donc `settings_github_token()` retourne toujours `None` et les deux
+commandes suivent systématiquement le chemin CLI `gh` (le premier `if let
+Some(tok) = ...` échoue silencieusement), sans jamais toucher au trousseau.
+
 ## Pourquoi pas juste `fetch` côté Rust aussi ?
 
 On pourrait lancer un second serveur HTTP en Rust et `fetch` des deux
