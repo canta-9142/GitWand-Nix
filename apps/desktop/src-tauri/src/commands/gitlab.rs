@@ -169,7 +169,7 @@ fn gl_mr_to_pr(mr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(mr, "merge_status"),
         checks_rollup: String::new(),
         comment_count: ji(mr, "user_notes_count"),
-        auto_merge: Default::default(),
+        auto_merge: gl_auto_merge_state(mr),
     }
 }
 
@@ -263,7 +263,12 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
             .and_then(|s| s.as_str())
             .map(String::from)
             .unwrap_or_else(|| js(mr, "sha")),
-        auto_merge: Default::default(),
+        auto_merge: gl_auto_merge_state(mr),
+        // GitLab has no repository-level auto-merge gate (unlike GitHub's
+        // "Allow auto-merge" repo setting) — any MR can request it, subject
+        // only to the per-MR pipeline precondition `gl_auto_merge_state`
+        // already checks.
+        auto_merge_support: crate::types::AutoMergeSupport { supported: true, reason: None },
     }
 }
 
@@ -2184,7 +2189,16 @@ mod gl_mr_diff_args_tests {
 ///
 /// The precondition is a pipeline: merge-when-pipeline-succeeds has nothing
 /// to wait for without one, and GitLab refuses the call.
-#[allow(dead_code)] // wired into gl_mr_to_pr/gl_mr_to_detail by Task 3
+///
+/// OPEN QUESTION (unverified, needs a live capture — see forge-side
+/// auto-merge design doc step 4): the GitLab merge-requests **list** endpoint
+/// (`gl_mr_to_pr`'s caller) may not embed `pipeline`/`head_pipeline` the way
+/// the single-MR **detail** endpoint does. If it doesn't, every MR in the
+/// list reads `available: false` here even when a pipeline is actually
+/// running, which would wrongly hide the Today auto-merge action from the
+/// list view. Confirm against a real `glab api
+/// "projects/:id/merge_requests?per_page=1"` response before relying on the
+/// list path's `available` value.
 fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
     let armed = mr
         .get("merge_when_pipeline_succeeds")

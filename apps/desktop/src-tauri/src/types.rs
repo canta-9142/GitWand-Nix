@@ -348,9 +348,6 @@ pub struct RemoteInfo {
 // PR would ask N times for one answer. `armed` / `available` are per PR and
 // come from payloads each forge module already parses.
 
-/// `#[allow(dead_code)]`: not yet constructed by a caller outside its own
-/// unit tests, a later task in the forge-side auto-merge plan wires it in.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoMergeSupport {
@@ -502,6 +499,13 @@ pub struct GhPrDetailRaw {
     pub mergeable: Option<String>,
     #[serde(rename = "statusCheckRollup", default)]
     pub status_check_rollup: Vec<GhPrStatusCheck>,
+    /// Present and non-null when a forge-side merge is queued on this PR.
+    /// `#[serde(default)]` reads as `Value::Null` (not armed) when the field
+    /// was never requested from `gh pr view --json`, so a caller that forgets
+    /// to add `autoMergeRequest` to its field list fails closed instead of
+    /// silently reporting "armed".
+    #[serde(rename = "autoMergeRequest", default)]
+    pub auto_merge_request: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -545,6 +549,9 @@ pub struct GhPrRaw {
     /// path (v2.16). Empty on the light sidebar list. We only need its length.
     #[serde(default)]
     pub comments: Vec<serde_json::Value>,
+    /// See `GhPrDetailRaw::auto_merge_request` — same fail-closed default.
+    #[serde(rename = "autoMergeRequest", default)]
+    pub auto_merge_request: serde_json::Value,
 }
 
 // ─── Pull Request Detail ───────────────────────────────────────────
@@ -584,6 +591,11 @@ pub struct PullRequestDetail {
     pub head_sha: String,
     #[serde(rename = "autoMerge", default)]
     pub auto_merge: AutoMergeState,
+    /// Repository-level auto-merge capability. Detail-only (not on
+    /// `PullRequest`): it's a per-repo administrative setting, not a per-PR
+    /// fact, so a list refresh has no reason to pay for it per row.
+    #[serde(rename = "autoMergeSupport", default)]
+    pub auto_merge_support: AutoMergeSupport,
 }
 
 // ─── Fork / PR target info ─────────────────────────────────────────

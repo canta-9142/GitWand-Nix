@@ -568,7 +568,7 @@ fn json_to_pr(r: &AzureRepo, pr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(pr, "mergeStatus").to_uppercase(),
         checks_rollup: String::new(),
         comment_count: 0,
-        auto_merge: Default::default(),
+        auto_merge: az_auto_merge_state(pr),
     }
 }
 
@@ -621,7 +621,12 @@ fn json_to_detail(r: &AzureRepo, pr: &serde_json::Value) -> PullRequestDetail {
         // cheaply available here. Unknown ⇒ UI gates on errors only.
         can_merge: None,
         head_sha: jnested(pr, "lastMergeSourceCommit", "commitId"),
-        auto_merge: Default::default(),
+        auto_merge: az_auto_merge_state(pr),
+        // Azure has no repository-level auto-complete gate (unlike GitHub's
+        // "Allow auto-merge" repo setting) — any non-draft PR can request it,
+        // subject only to the per-PR draft precondition `az_auto_merge_state`
+        // already checks.
+        auto_merge_support: crate::types::AutoMergeSupport { supported: true, reason: None },
     }
 }
 
@@ -2229,7 +2234,10 @@ mod tests {
 ///
 /// `autoCompleteSetBy` carries the identity that armed it, so its presence
 /// is the armed flag. Azure refuses auto-complete on a draft.
-#[allow(dead_code)] // wired into json_to_pr/json_to_detail by Task 3
+///
+/// `isDraft` is confirmed present on the **list** payload, not just detail:
+/// `json_to_pr`'s own `draft` field already reads `pr.get("isDraft")` off the
+/// exact same list-endpoint object this function receives.
 fn az_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeState {
     let is_draft = pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
     crate::types::AutoMergeState {

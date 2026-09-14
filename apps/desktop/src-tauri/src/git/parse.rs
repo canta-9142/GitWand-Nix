@@ -542,7 +542,12 @@ pub(crate) fn gh_pr_detail_raw_to_detail(r: GhPrDetailRaw) -> PullRequestDetail 
         // viewerPermission lookup — `gh pr view` doesn't carry it.
         can_merge: None,
         head_sha: r.head_ref_oid,
-        auto_merge: Default::default(),
+        auto_merge: crate::commands::gh::gh_auto_merge_state(&serde_json::json!({
+            "autoMergeRequest": r.auto_merge_request
+        })),
+        // Populated by the caller (gh_pr_detail_inner): needs a repo-level
+        // `autoMergeAllowed` lookup this per-PR JSON object doesn't carry.
+        auto_merge_support: Default::default(),
     }
 }
 
@@ -598,7 +603,9 @@ pub(crate) fn gh_pr_raw_to_pr(r: GhPrRaw) -> PullRequest {
         merge_state_status: r.merge_state_status.unwrap_or_default(),
         checks_rollup,
         comment_count,
-        auto_merge: Default::default(),
+        auto_merge: crate::commands::gh::gh_auto_merge_state(&serde_json::json!({
+            "autoMergeRequest": r.auto_merge_request
+        })),
     }
 }
 

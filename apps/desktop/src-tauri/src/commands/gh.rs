@@ -102,7 +102,7 @@ fn gh_list_prs_inner(
     cmd.args([
         "pr", "list",
         "--state", st,
-        "--json", "number,title,state,author,headRefName,baseRefName,isDraft,createdAt,updatedAt,url,labels,assignees,mergeStateStatus,statusCheckRollup",
+        "--json", "number,title,state,author,headRefName,baseRefName,isDraft,createdAt,updatedAt,url,labels,assignees,mergeStateStatus,statusCheckRollup,autoMergeRequest",
         "--limit", &total,
     ]);
     if let Some(ref nwo) = target_repo {
@@ -460,7 +460,7 @@ fn gh_create_pr_inner(
         .args([
             "pr", "view",
             &url,
-            "--json", "number,title,state,author,headRefName,baseRefName,isDraft,createdAt,updatedAt,url,additions,deletions,labels,assignees,reviewRequests,reviewDecision,mergeStateStatus,statusCheckRollup",
+            "--json", "number,title,state,author,headRefName,baseRefName,isDraft,createdAt,updatedAt,url,additions,deletions,labels,assignees,reviewRequests,reviewDecision,mergeStateStatus,statusCheckRollup,autoMergeRequest",
         ])
         .current_dir(&cwd)
         .output();
@@ -503,6 +503,10 @@ fn gh_create_pr_inner(
         merge_state_status: String::new(),
         checks_rollup: String::new(),
         comment_count: 0,
+        // No PR JSON was ever parsed on this branch (the post-create `gh pr
+        // view` failed or came back unparseable), so there is nothing to
+        // derive an auto-merge state from. Fails closed, same as every other
+        // field on this minimal-info fallback.
         auto_merge: Default::default(),
     })
 }
@@ -898,7 +902,7 @@ fn gh_pr_detail_inner(cwd: String, number: i64) -> Result<PullRequestDetail, Str
     let mut cmd = hidden_cmd("gh");
     cmd.args([
         "pr", "view", &num,
-        "--json", "number,title,body,state,author,headRefName,headRefOid,baseRefName,isDraft,createdAt,updatedAt,mergedAt,url,additions,deletions,changedFiles,comments,reviewRequests,labels,reviews,mergeable,statusCheckRollup",
+        "--json", "number,title,body,state,author,headRefName,headRefOid,baseRefName,isDraft,createdAt,updatedAt,mergedAt,url,additions,deletions,changedFiles,comments,reviewRequests,labels,reviews,mergeable,statusCheckRollup,autoMergeRequest",
     ]);
     if let Some(ref nwo) = upstream {
         cmd.args(["--repo", nwo]);
@@ -920,7 +924,10 @@ fn gh_pr_detail_inner(cwd: String, number: i64) -> Result<PullRequestDetail, Str
         .map_err(|e| format!("Failed to parse gh pr view output: {}", e))?;
 
     let mut detail = gh_pr_detail_raw_to_detail(raw);
-    detail.can_merge = gh_viewer_can_merge(&cwd, &detail.url);
+    let (can_merge, auto_merge_support) =
+        gh_viewer_can_merge_and_auto_merge_support(&cwd, &detail.url);
+    detail.can_merge = can_merge;
+    detail.auto_merge_support = auto_merge_support;
     Ok(detail)
 }
 
@@ -1144,34 +1151,54 @@ fn gh_current_nwo(cwd: &str) -> Option<String> {
     }
 }
 
-/// Resolve whether the current viewer can merge this PR. A PR merges into its
-/// **base** repository — which, for a fork, is the upstream repo and not the
-/// fork the working copy points at. So permission must be checked against the
-/// base repo (parsed from the PR url), not `cwd`'s origin: owning a fork grants
-/// ADMIN on the fork but no merge rights on upstream.
+/// Resolve whether the current viewer can merge this PR, and whether the base
+/// repository allows forge-side auto-merge, off the **same** `gh api
+/// repos/{nwo}` response. A PR merges into its **base** repository — which,
+/// for a fork, is the upstream repo and not the fork the working copy points
+/// at. So both checks are made against the base repo (parsed from the PR
+/// url), not `cwd`'s origin: owning a fork grants ADMIN on the fork but no
+/// merge rights (and no auto-merge setting) on upstream.
 ///
-/// `push` access on the base repo means the viewer can merge. Returns `None` on
-/// any failure so the UI falls back to error-only gating.
-fn gh_viewer_can_merge(cwd: &str, pr_url: &str) -> Option<bool> {
-    let nwo = github_nwo_from_pr_url(pr_url)?;
+/// Previously this fetched `--jq '.permissions.push'` alone; auto-merge
+/// support needs `.allow_auto_merge` off the same object, and fetching the
+/// full JSON once serves both rather than adding a second `gh api` round
+/// trip per PR detail open.
+///
+/// `push` access on the base repo means the viewer can merge. `can_merge` is
+/// `None` on any failure so the UI falls back to error-only gating;
+/// `auto_merge_support` fails closed to "unsupported" via `gh_auto_merge_support`
+/// on the same failure (an absent/unreadable field must never read as
+/// available).
+fn gh_viewer_can_merge_and_auto_merge_support(
+    cwd: &str,
+    pr_url: &str,
+) -> (Option<bool>, crate::types::AutoMergeSupport) {
+    let fail_closed = || gh_auto_merge_support(&serde_json::Value::Null);
+    let Some(nwo) = github_nwo_from_pr_url(pr_url) else {
+        return (None, fail_closed());
+    };
     let output = hidden_cmd("gh")
-        .args([
-            "api",
-            &format!("repos/{}", nwo),
-            "--jq",
-            ".permissions.push",
-        ])
+        .args(["api", &format!("repos/{}", nwo)])
         .current_dir(cwd)
-        .output()
-        .ok()?;
+        .output();
+    let Ok(output) = output else {
+        return (None, fail_closed());
+    };
     if !output.status.success() {
-        return None;
+        return (None, fail_closed());
     }
-    match String::from_utf8_lossy(&output.stdout).trim() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return (None, fail_closed());
+    };
+    let can_merge = v.get("permissions").and_then(|p| p.get("push")).and_then(|b| b.as_bool());
+    // REST's `allow_auto_merge` is the same repository setting `gh repo view
+    // --json autoMergeAllowed` exposes under its GraphQL name; translate it
+    // into the shape `gh_auto_merge_support` already expects and is tested
+    // against, rather than teaching that function a second field name.
+    let support = gh_auto_merge_support(&serde_json::json!({
+        "autoMergeAllowed": v.get("allow_auto_merge")
+    }));
+    (can_merge, support)
 }
 
 /// Extract `owner/repo` from a GitHub PR url such as
@@ -1899,11 +1926,6 @@ mod gh_should_fetch_origin_tests {
 /// queued, explicitly `null` otherwise. GitHub has no per-PR precondition
 /// beyond the repository setting, so `available` is unconditionally true
 /// here; whether the repository allows it at all is `gh_auto_merge_support`.
-///
-/// `#[allow(dead_code)]`: not yet wired into a caller, a later task in the
-/// forge-side auto-merge plan populates `PullRequest::auto_merge`/
-/// `PullRequestDetail::auto_merge` with it.
-#[allow(dead_code)]
 pub(crate) fn gh_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeState {
     crate::types::AutoMergeState {
         armed: pr.get("autoMergeRequest").is_some_and(|v| !v.is_null()),
@@ -1917,9 +1939,6 @@ pub(crate) fn gh_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoM
 /// Fails closed: a missing or non-boolean field reads as unsupported. An
 /// older `gh`, or a shape we did not anticipate, must hide the button rather
 /// than offer one that cannot work.
-///
-/// `#[allow(dead_code)]`: not yet wired into a caller, see `gh_auto_merge_state`.
-#[allow(dead_code)]
 pub(crate) fn gh_auto_merge_support(
     repo_view: &serde_json::Value,
 ) -> crate::types::AutoMergeSupport {

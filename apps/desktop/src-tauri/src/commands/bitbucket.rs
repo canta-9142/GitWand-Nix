@@ -336,6 +336,10 @@ fn bb_pr_to_pr(pr: &serde_json::Value) -> PullRequest {
         merge_state_status: String::new(),
         checks_rollup: String::new(),
         comment_count: ji(pr, "comment_count"),
+        // Bitbucket has no forge-side merge-when-checks-pass, so there is no
+        // per-PR armed/available to derive (see `bb_auto_merge_support`,
+        // wired into `PullRequestDetail::auto_merge_support` below, for the
+        // repo-level "why not" the UI shows instead). Not a wiring gap.
         auto_merge: Default::default(),
     }
 }
@@ -394,7 +398,9 @@ fn bb_pr_to_detail(pr: &serde_json::Value) -> PullRequestDetail {
         // unknown ⇒ UI gates on errors only.
         can_merge: None,
         head_sha: jdeep(pr, "source", "commit", "hash"),
+        // Same rationale as `bb_pr_to_pr`: no per-PR auto-merge state exists.
         auto_merge: Default::default(),
+        auto_merge_support: bb_auto_merge_support(),
     }
 }
 
@@ -1441,7 +1447,6 @@ mod bb_list_issues_tests {
 
 /// Bitbucket has no forge-side auto-merge. Static, and stated rather than
 /// inferred from an absent field, so the UI can explain instead of hiding.
-#[allow(dead_code)] // wired into bb_pr_to_pr/bb_pr_to_detail by Task 3
 pub(crate) fn bb_auto_merge_support() -> crate::types::AutoMergeSupport {
     crate::types::AutoMergeSupport {
         supported: false,
