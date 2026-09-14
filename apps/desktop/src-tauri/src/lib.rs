@@ -315,6 +315,18 @@ pub fn gh_disable_auto_merge_parity(cwd: String, number: i64) -> Result<(), Stri
     tauri::async_runtime::block_on(commands::gh::gh_disable_auto_merge(cwd, number))
 }
 
+/// Parity entry point for `gl_enable_auto_merge`. Only a repo with no forge
+/// remote is checkable here (see the refusal test in `tests/parity/`): no
+/// test arms an auto-merge on a live MR.
+pub fn gl_enable_auto_merge_parity(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gitlab::gl_enable_auto_merge(cwd, iid, method))
+}
+
+/// Parity entry point for `gl_disable_auto_merge`.
+pub fn gl_disable_auto_merge_parity(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gitlab::gl_disable_auto_merge(cwd, iid))
+}
+
 pub fn snapshot_list_parity(cwd: String) -> Result<Vec<git::snapshot::SnapshotMeta>, String> {
     tauri::async_runtime::block_on(commands::snapshots::snapshot_list(cwd))
 }
@@ -717,6 +729,8 @@ pub fn run() {
             commands::gitlab::gl_mr_annotations,
             commands::gitlab::gl_create_mr,
             commands::gitlab::gl_merge_mr,
+            commands::gitlab::gl_enable_auto_merge,
+            commands::gitlab::gl_disable_auto_merge,
             commands::gitlab::gl_checkout_mr,
             commands::gitlab::gl_convert_draft_to_ready,
             commands::gitlab::gl_mr_notes,

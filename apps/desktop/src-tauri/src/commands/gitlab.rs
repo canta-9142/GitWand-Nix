@@ -1135,6 +1135,106 @@ pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result
         .map_err(|e| e.to_string())?
 }
 
+/// Queue this MR to merge when its pipeline succeeds.
+///
+/// `--when-pipeline-succeeds` is deprecated in current `glab` (renamed to
+/// `--auto-merge`, verified against the installed 1.117.0 binary's `glab mr
+/// merge --help`), but it is still accepted, and it is the only spelling that
+/// also works on the older `glab` releases that never got the `--auto-merge`
+/// rename, so it stays the safer choice here given this module does not pin
+/// a `glab` version. It is a no-op without a running pipeline, which is why
+/// `gl_auto_merge_state` reports `available: false` in that case: the button
+/// is hidden rather than offered and refused.
+///
+/// Unlike `gh_enable_auto_merge_inner`, there is no token/REST path: like
+/// `gl_merge_mr_inner` above, this is `glab`-only.
+///
+/// Deliberately uses `--remove-source-branch`, not the `--delete-source-branch`
+/// that `gl_merge_mr_inner` passes above: verified against the installed
+/// `glab` that `--delete-source-branch` is not a recognised flag at all (it
+/// errors "Unknown flag" before even reaching remote resolution), so mirroring
+/// it here would make this command permanently non-functional. This looks
+/// like a pre-existing bug in `gl_merge_mr_inner`, unrelated to this task and
+/// out of scope to fix here, flagged for a follow-up instead.
+fn gl_enable_auto_merge_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    let mut args: Vec<String> = vec![
+        "mr".to_string(),
+        "merge".to_string(),
+        iid.to_string(),
+        "--when-pipeline-succeeds".to_string(),
+    ];
+    match method.as_str() {
+        "squash" => args.push("--squash".to_string()),
+        "rebase" => args.push("--rebase".to_string()),
+        _ => {} // default merge
+    }
+    args.push("--yes".to_string());
+    args.push("--remove-source-branch".to_string());
+
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
+        .map_err(|e| format!("glab mr merge --when-pipeline-succeeds: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "glab mr merge --when-pipeline-succeeds failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn gl_enable_auto_merge(
+    cwd: String,
+    iid: i64,
+    method: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_enable_auto_merge_inner(cwd, iid, method))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Cancel a queued merge-when-pipeline-succeeds.
+///
+/// `glab mr update` has no unset-auto-merge flag in any version checked
+/// (confirmed against the installed 1.117.0 binary's `glab mr update --help`:
+/// only `--remove-source-branch`/`--squash-before-merge` toggles exist, no
+/// auto-merge equivalent), so this goes through `glab api -X PUT`, the same
+/// REST-passthrough pattern `gl_mr_update_note_inner` and `gl_request_reviewers`
+/// already use above.
+fn gl_disable_auto_merge_inner(cwd: String, iid: i64) -> Result<(), String> {
+    let endpoint = format!("projects/:fullpath/merge_requests/{}", iid);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args([
+        "api",
+        "-X",
+        "PUT",
+        &endpoint,
+        "-f",
+        "merge_when_pipeline_succeeds=false",
+    ])
+    .current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
+        .map_err(|e| format!("glab api unset merge_when_pipeline_succeeds: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "glab api unset merge_when_pipeline_succeeds failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn gl_disable_auto_merge(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_disable_auto_merge_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Checkout a MR branch locally using `glab mr checkout`.
 #[tauri::command]
 fn gl_checkout_mr_inner(cwd: String, iid: i64) -> Result<(), String> {

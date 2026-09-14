@@ -2,7 +2,7 @@
 // Extracted from backend.ts as part of the v2.11 backend split to keep module size manageable.
 // Consumers should import directly from this file instead of backend.ts for these symbols.
 
-import { isTauri, tauriInvoke } from "./backend-core";
+import { isTauri, tauriInvoke, devFetch, DEV_SERVER } from "./backend-core";
 import {
   PullRequest,
   PullRequestDetail,
@@ -25,6 +25,12 @@ import {
 // These mirror the gh* functions above but call the `glab` CLI via Rust.
 // All functions are Tauri-only for now — no dev-server fallback needed
 // since GitLab repos are only accessible in the native Tauri app context.
+//
+// Exception: `glEnableAutoMerge`/`glDisableAutoMerge` (v3.11.0) have a
+// dev-server fallback like the gh* functions above, so the auto-merge
+// parity suite (`tests/parity/auto-merge-refusal.test.mjs`) can exercise
+// both backends. This is the first GitLab write path with one; earlier
+// gl* commands are unaffected.
 //
 // Auth: managed by `glab auth login` — no token is ever passed via IPC.
 
@@ -186,6 +192,40 @@ export async function glMergeMr(
 ): Promise<void> {
   if (!isTauri()) throw new Error("glMergeMr requires Tauri");
   return tauriInvoke<void>("gl_merge_mr", { cwd, iid, method });
+}
+
+/** Queue this MR to merge once its pipeline succeeds. */
+export async function glEnableAutoMerge(
+  cwd: string,
+  iid: number,
+  method: string = "merge",
+): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gl_enable_auto_merge", { cwd, iid, method });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gl-enable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, iid, method }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
+/** Cancel a queued auto-merge on a MR. */
+export async function glDisableAutoMerge(cwd: string, iid: number): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gl_disable_auto_merge", { cwd, iid });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gl-disable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, iid }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
 }
 
 /** Checkout a MR branch locally. */

@@ -29,6 +29,17 @@ async function nodeEnableAutoMerge(dev, cwd, number, method) {
   return res.ok ? { ok: true, value: data } : { ok: false, error: data.error };
 }
 
+/** POST /api/gl-enable-auto-merge, returning the same {ok, error} shape as runProbe. */
+async function nodeEnableAutoMergeGl(dev, cwd, iid, method) {
+  const res = await dev.fetch("/api/gl-enable-auto-merge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, iid, method }),
+  });
+  const data = await res.json().catch(() => ({}));
+  return res.ok ? { ok: true, value: data } : { ok: false, error: data.error };
+}
+
 /**
  * Collapse the parts that legitimately differ between the two backends down
  * to a single class. The dev-server route always shells out to `gh` CLI; the
@@ -106,6 +117,50 @@ describe("parity: auto-merge refusal", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd, number: 1 }),
+    });
+    const nodeData = await res.json().catch(() => ({}));
+    const node = res.ok ? { ok: true } : { ok: false, error: nodeData.error };
+
+    if (looksLikeProbeTimeout(rust)) {
+      throw new Error(
+        "parity-probe timed out. This is almost certainly the first keychain " +
+          "access by a freshly built probe binary, not a bug in the command. " +
+          "Re-run the suite once; the OS remembers the decision.",
+      );
+    }
+
+    expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(normalizeForgeError(rust.error)).toBe("no-remote");
+    expect(normalizeForgeError(node.error)).toBe(normalizeForgeError(rust.error));
+  });
+
+  it("both backends refuse enabling auto-merge on a GitLab MR with no forge remote", async () => {
+    const cwd = mkTempRepo("gw-auto-merge-refusal-");
+    const rust = runProbe("gl-enable-auto-merge", { cwd, iid: 1, method: "merge" });
+    const node = await nodeEnableAutoMergeGl(dev, cwd, 1, "merge");
+
+    if (looksLikeProbeTimeout(rust)) {
+      throw new Error(
+        "parity-probe timed out. This is almost certainly the first keychain " +
+          "access by a freshly built probe binary, not a bug in the command. " +
+          "Re-run the suite once; the OS remembers the decision.",
+      );
+    }
+
+    expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(normalizeForgeError(rust.error)).toBe("no-remote");
+    expect(normalizeForgeError(node.error)).toBe(normalizeForgeError(rust.error));
+  });
+
+  it("both backends refuse disabling auto-merge on a GitLab MR with no forge remote", async () => {
+    const cwd = mkTempRepo("gw-auto-merge-refusal-");
+    const rust = runProbe("gl-disable-auto-merge", { cwd, iid: 1 });
+    const res = await dev.fetch("/api/gl-disable-auto-merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd, iid: 1 }),
     });
     const nodeData = await res.json().catch(() => ({}));
     const node = res.ok ? { ok: true } : { ok: false, error: nodeData.error };

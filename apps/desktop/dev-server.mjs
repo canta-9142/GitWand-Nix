@@ -91,6 +91,7 @@ function resolveBin(name) {
 }
 
 const GH = resolveBin("gh");
+const GLAB = resolveBin("glab");
 const GIT = resolveBin("git");
 
 /**
@@ -5341,6 +5342,55 @@ async function handleRequest(req, res) {
         });
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() || "gh pr merge --disable-auto failed";
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/gl-enable-auto-merge  { cwd, iid, method }
+    // Queue a MR to merge when its pipeline succeeds, via `glab mr merge
+    // --when-pipeline-succeeds`. Mirrors `gl_enable_auto_merge_inner`
+    // (src-tauri/src/commands/gitlab.rs): no token path, `glab`-only.
+    if (url.pathname === "/api/gl-enable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, iid, method } = await readBody(req);
+        if (!cwd || !iid) return jsonResponse(req, res, { error: "Missing cwd or iid" }, 400);
+        const args = ["mr", "merge", String(iid), "--when-pipeline-succeeds"];
+        if (method === "squash") args.push("--squash");
+        else if (method === "rebase") args.push("--rebase");
+        args.push("--yes", "--remove-source-branch");
+        const r = spawnSync(GLAB, args, { cwd: resolve(cwd), encoding: "utf-8" });
+        if (r.status !== 0) {
+          const detail = (r.stderr || r.stdout || "").trim() ||
+            "glab mr merge --when-pipeline-succeeds failed";
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/gl-disable-auto-merge  { cwd, iid }
+    // Cancel a queued merge-when-pipeline-succeeds. `glab mr update` has no
+    // unset-auto-merge flag, so this goes through `glab api -X PUT`, mirroring
+    // `gl_disable_auto_merge_inner`.
+    if (url.pathname === "/api/gl-disable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, iid } = await readBody(req);
+        if (!cwd || !iid) return jsonResponse(req, res, { error: "Missing cwd or iid" }, 400);
+        const endpoint = `projects/:fullpath/merge_requests/${iid}`;
+        const r = spawnSync(
+          GLAB,
+          ["api", "-X", "PUT", endpoint, "-f", "merge_when_pipeline_succeeds=false"],
+          { cwd: resolve(cwd), encoding: "utf-8" },
+        );
+        if (r.status !== 0) {
+          const detail = (r.stderr || r.stdout || "").trim() ||
+            "glab api unset merge_when_pipeline_succeeds failed";
           return jsonResponse(req, res, { error: detail }, 500);
         }
         return jsonResponse(req, res, { ok: true });
