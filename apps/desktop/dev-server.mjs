@@ -5376,21 +5376,23 @@ async function handleRequest(req, res) {
 
     // POST /api/gl-disable-auto-merge  { cwd, iid }
     // Cancel a queued merge-when-pipeline-succeeds. `glab mr update` has no
-    // unset-auto-merge flag, so this goes through `glab api -X PUT`, mirroring
-    // `gl_disable_auto_merge_inner`.
+    // unset-auto-merge flag, and `merge_when_pipeline_succeeds` is not an
+    // attribute of the merge request update endpoint either, so this goes
+    // through GitLab's dedicated cancel route, mirroring
+    // `gl_disable_auto_merge_inner`. No request body, so no `-f` flag.
     if (url.pathname === "/api/gl-disable-auto-merge" && req.method === "POST") {
       try {
         const { cwd, iid } = await readBody(req);
         if (!cwd || !iid) return jsonResponse(req, res, { error: "Missing cwd or iid" }, 400);
-        const endpoint = `projects/:fullpath/merge_requests/${iid}`;
+        const endpoint = `projects/:fullpath/merge_requests/${Number(iid)}/cancel_merge_when_pipeline_succeeds`;
         const r = spawnSync(
           GLAB,
-          ["api", "-X", "PUT", endpoint, "-f", "merge_when_pipeline_succeeds=false"],
+          ["api", "-X", "POST", endpoint],
           { cwd: resolve(cwd), encoding: "utf-8" },
         );
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() ||
-            "glab api unset merge_when_pipeline_succeeds failed";
+            "glab api cancel_merge_when_pipeline_succeeds failed";
           return jsonResponse(req, res, { error: detail }, 500);
         }
         return jsonResponse(req, res, { ok: true });

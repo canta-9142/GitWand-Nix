@@ -1212,27 +1212,36 @@ pub(crate) async fn gl_enable_auto_merge(
 /// `glab mr update` has no unset-auto-merge flag in any version checked
 /// (confirmed against the installed 1.117.0 binary's `glab mr update --help`:
 /// only `--remove-source-branch`/`--squash-before-merge` toggles exist, no
-/// auto-merge equivalent), so this goes through `glab api -X PUT`, the same
-/// REST-passthrough pattern `gl_mr_update_note_inner` and `gl_request_reviewers`
-/// already use above.
+/// auto-merge equivalent). GitLab does not expose this as an attribute of the
+/// merge request update endpoint either: `merge_when_pipeline_succeeds=false`
+/// on `PUT projects/:id/merge_requests/:iid` is silently ignored, since that
+/// attribute does not exist there. GitLab's own docs give it a dedicated
+/// route instead: `POST
+/// projects/:id/merge_requests/:merge_request_iid/cancel_merge_when_pipeline_succeeds`,
+/// which returns 201 on success and 406 when the MR cannot be cancelled (no
+/// pending auto-merge to cancel). No request body, so no `-f` flag.
+///
+/// Extracted so the exact route (and the absence of a `-f` body flag) can be
+/// pinned by a test rather than only exercised at runtime, the same shape as
+/// `gl_merge_args`.
+fn gl_disable_auto_merge_args(iid: i64) -> Vec<String> {
+    let endpoint = format!(
+        "projects/:fullpath/merge_requests/{}/cancel_merge_when_pipeline_succeeds",
+        iid
+    );
+    vec!["api".to_string(), "-X".to_string(), "POST".to_string(), endpoint]
+}
+
 fn gl_disable_auto_merge_inner(cwd: String, iid: i64) -> Result<(), String> {
-    let endpoint = format!("projects/:fullpath/merge_requests/{}", iid);
+    let args = gl_disable_auto_merge_args(iid);
     let mut cmd = hidden_cmd("glab");
-    cmd.args([
-        "api",
-        "-X",
-        "PUT",
-        &endpoint,
-        "-f",
-        "merge_when_pipeline_succeeds=false",
-    ])
-    .current_dir(&cwd);
+    cmd.args(&args).current_dir(&cwd);
     let output = output_with_timeout(cmd, GLAB_TIMEOUT)
-        .map_err(|e| format!("glab api unset merge_when_pipeline_succeeds: {}", e))?;
+        .map_err(|e| format!("glab api cancel_merge_when_pipeline_succeeds: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
-            "glab api unset merge_when_pipeline_succeeds failed: {}",
+            "glab api cancel_merge_when_pipeline_succeeds failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -2518,5 +2527,35 @@ mod gl_merge_args_tests {
         let args = gl_merge_args(7, "merge");
         assert!(!args.iter().any(|a| a == "--delete-source-branch"));
         assert!(args.iter().any(|a| a == "--remove-source-branch"));
+    }
+}
+
+/// Regression coverage for `gl_disable_auto_merge_args`: GitLab has no
+/// `merge_when_pipeline_succeeds` attribute on the merge request update
+/// endpoint, only a dedicated `cancel_merge_when_pipeline_succeeds` route,
+/// with no request body.
+#[cfg(test)]
+mod gl_disable_auto_merge_args_tests {
+    use super::gl_disable_auto_merge_args;
+
+    #[test]
+    fn posts_to_the_dedicated_cancel_route_with_no_body_flag() {
+        assert_eq!(
+            gl_disable_auto_merge_args(7),
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "projects/:fullpath/merge_requests/7/cancel_merge_when_pipeline_succeeds",
+            ]
+        );
+    }
+
+    #[test]
+    fn never_sends_the_nonexistent_update_attribute() {
+        let args = gl_disable_auto_merge_args(7);
+        assert!(!args.iter().any(|a| a.contains("merge_when_pipeline_succeeds=")));
+        assert!(!args.iter().any(|a| a == "-f"));
+        assert!(!args.iter().any(|a| a == "PUT"));
     }
 }
