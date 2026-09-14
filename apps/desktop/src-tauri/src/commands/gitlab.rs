@@ -2189,8 +2189,11 @@ fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
     let armed = mr
         .get("merge_when_pipeline_succeeds")
         .and_then(|v| v.as_bool())
-        .or_else(|| mr.get("auto_merge_enabled").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || mr
+            .get("auto_merge_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     let has_pipeline = mr.get("pipeline").is_some_and(|v| !v.is_null())
         || mr.get("head_pipeline").is_some_and(|v| !v.is_null());
     crate::types::AutoMergeState {
@@ -2259,6 +2262,21 @@ mod gl_auto_merge_tests {
         // GitLab 17.x renamed the flag. Both spellings must arm.
         let v: serde_json::Value = serde_json::from_str(
             r#"{"iid": 3, "auto_merge_enabled": true, "pipeline": {"status": "running"}}"#,
+        )
+        .unwrap();
+        assert!(gl_auto_merge_state(&v).armed);
+    }
+
+    #[test]
+    fn the_newer_field_arms_even_when_the_legacy_field_is_false() {
+        // GitLab's 17.x deprecation window can send both spellings on the
+        // same MR, with the old one explicitly false. `Option::or_else`
+        // only substitutes on `None`, never on `Some(false)`, so a naive
+        // fallback would let the legacy `false` mask the new `true` and
+        // read the MR as not armed. Either spelling being true must arm.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": false, "auto_merge_enabled": true,
+                "pipeline": {"status": "running"}}"#,
         )
         .unwrap();
         assert!(gl_auto_merge_state(&v).armed);
