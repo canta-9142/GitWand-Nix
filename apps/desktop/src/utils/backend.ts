@@ -25,7 +25,8 @@ import { isTauri, tauriInvoke, devFetch, DEV_SERVER, IPC_TIMEOUT, devTerminalOpe
 export { isTauri };
 // ─── Cross-module type imports for workspace helpers ─────────────────────────
 // PullRequest is defined in backend-pr.ts but used by workspacePrsAll here.
-import type { PullRequest } from './backend-pr';
+import type { PullRequest, AutoMergeState } from './backend-pr';
+import { CLOSED_AUTO_MERGE } from './backend-pr';
 // v3.5.0 — Secrets scanner IPC shapes, imported from @gitwand/core to avoid drift
 // between the frontend, the Rust command, and the dev-server route.
 import type { SecretFinding, SecretsScanConfig } from '@gitwand/core';
@@ -3015,6 +3016,9 @@ function mapRawPr(pr: Record<string, unknown>): PullRequest {
     mergeStateStatus: (pr.merge_state_status as string) ?? "",
     checksRollup: (pr.checks_rollup as string) ?? "",
     commentCount: (pr.comment_count as number) ?? 0,
+    // Fails closed: an absent descriptor (older backend, unwired path) must
+    // never offer the auto-merge action.
+    autoMerge: (pr.autoMerge as AutoMergeState) ?? CLOSED_AUTO_MERGE,
   };
 }
 

@@ -3,6 +3,11 @@ import { ref } from "vue";
 import type { PrWithRepo } from "../useLaunchpadPrs";
 import type { IssueWithRepo } from "../useLaunchpadIssues";
 
+// Not imported from "../../utils/backend": that module is mocked below
+// (vi.mock), so pulling the real CLOSED_AUTO_MERGE constant from it would
+// resolve to undefined at runtime instead. Inline the same closed-descriptor shape.
+const CLOSED_AUTO_MERGE = { armed: false, available: false, reason: null };
+
 vi.mock("../../utils/backend", () => ({
   ghCurrentUser: vi.fn(),
 }));
@@ -38,6 +43,7 @@ function pr(overrides: Partial<PrWithRepo>): PrWithRepo {
     mergeStateStatus: "CLEAN",
     checksRollup: "",
     commentCount: 0,
+    autoMerge: CLOSED_AUTO_MERGE,
     repoName: "repo",
     repoPath: "/repo",
     ...overrides,
