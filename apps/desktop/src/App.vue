@@ -2977,13 +2977,23 @@ async function openLaunchpadMergePr(pr: PullRequest & { repoPath?: string }) {
  * wrapper directly and never branches on forge name.
  *
  * No `mergeBlocked` gate here: unlike an immediate merge, arming auto-merge
- * is exactly what a PR that ISN'T mergeable yet needs. `armAutoMerge` never
- * throws, it catches its own errors (including `ForgeNotImplementedError`
- * from a forge with no auto-merge API, e.g. Bitbucket/Cursor) and leaves
- * them on `prPanel.error`, which is checked below the same way
- * `openLaunchpadMergePr` checks it on failure. The classifier should never
- * offer `auto-merge` for those forges (their descriptor reports
- * `available: false`), so this is a safety net, not the expected path.
+ * is exactly what a PR that ISN'T mergeable yet needs. There is a
+ * repo-level gate though: the inbox list row has no `autoMergeSupport` (it
+ * is only ever carried on the PR detail, deliberately not fetched per row —
+ * see `gh_auto_merge_state`), so a repository whose owner never enabled
+ * "Allow auto-merge" would otherwise offer this action on every row and
+ * fail on every click. `selectPr` + `loadChecks` (mirroring
+ * `openLaunchpadMergePr`) load the detail bundle that carries the real
+ * `autoMergeSupport`, and this refuses with the forge's own `reason` the
+ * same way `openLaunchpadMergePr` surfaces `mergeBlockedReason`.
+ *
+ * Past that gate, `armAutoMerge` never throws, it catches its own errors
+ * (including `ForgeNotImplementedError` from a forge with no auto-merge API,
+ * e.g. Bitbucket/Cursor) and leaves them on `prPanel.error`, which is checked
+ * below the same way `openLaunchpadMergePr` checks it on failure. The
+ * classifier should never offer `auto-merge` for those forges (their
+ * descriptor reports `available: false`), so that remains a safety net, not
+ * the expected path.
  */
 async function openLaunchpadAutoMergePr(pr: PullRequest & { repoPath?: string }) {
   if (pr.repoPath && pr.repoPath !== repoFolderPath.value) {
@@ -2992,6 +3002,14 @@ async function openLaunchpadAutoMergePr(pr: PullRequest & { repoPath?: string })
   }
   await prPanel.loadRemote();
   await prPanel.selectPr(pr);
+  await prPanel.loadChecks();
+  const support = prPanel.prDetail.value?.autoMergeSupport;
+  if (support && !support.supported) {
+    repoError.value = support.reason
+      ? `${t("pr.detail.autoMergeUnavailable")}: ${support.reason}`
+      : t("pr.detail.autoMergeUnavailable");
+    return;
+  }
   const confirmed = await askConfirm({
     title: t("launchpad.confirm.autoMerge.title"),
     message: t("launchpad.confirm.autoMerge.body", pr.title, pr.base),
