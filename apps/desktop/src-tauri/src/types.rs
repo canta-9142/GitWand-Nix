@@ -549,7 +549,7 @@ pub struct GhPrRaw {
     /// path (v2.16). Empty on the light sidebar list. We only need its length.
     #[serde(default)]
     pub comments: Vec<serde_json::Value>,
-    /// See `GhPrDetailRaw::auto_merge_request` — same fail-closed default.
+    /// See `GhPrDetailRaw::auto_merge_request`: same fail-closed default.
     #[serde(rename = "autoMergeRequest", default)]
     pub auto_merge_request: serde_json::Value,
 }

@@ -1153,7 +1153,7 @@ fn gh_current_nwo(cwd: &str) -> Option<String> {
 
 /// Resolve whether the current viewer can merge this PR, and whether the base
 /// repository allows forge-side auto-merge, off the **same** `gh api
-/// repos/{nwo}` response. A PR merges into its **base** repository — which,
+/// repos/{nwo}` response. A PR merges into its **base** repository, which,
 /// for a fork, is the upstream repo and not the fork the working copy points
 /// at. So both checks are made against the base repo (parsed from the PR
 /// url), not `cwd`'s origin: owning a fork grants ADMIN on the fork but no

@@ -265,7 +265,7 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
             .unwrap_or_else(|| js(mr, "sha")),
         auto_merge: gl_auto_merge_state(mr),
         // GitLab has no repository-level auto-merge gate (unlike GitHub's
-        // "Allow auto-merge" repo setting) — any MR can request it, subject
+        // "Allow auto-merge" repo setting): any MR can request it, subject
         // only to the per-MR pipeline precondition `gl_auto_merge_state`
         // already checks.
         auto_merge_support: crate::types::AutoMergeSupport { supported: true, reason: None },
@@ -2189,7 +2189,7 @@ mod gl_mr_diff_args_tests {
 ///
 /// Shared by `gl_auto_merge_state` (detail) and `gl_auto_merge_state_from_list`
 /// (list) so the two can never disagree on this one fact even though they
-/// disagree on `available` — factored out rather than copied so the OR
+/// disagree on `available`: factored out rather than copied so the OR
 /// expression can't drift between the two call sites.
 fn gl_auto_merge_armed(mr: &serde_json::Value) -> bool {
     mr.get("merge_when_pipeline_succeeds")
@@ -2206,7 +2206,7 @@ fn gl_auto_merge_armed(mr: &serde_json::Value) -> bool {
 /// The precondition is a pipeline: merge-when-pipeline-succeeds has nothing
 /// to wait for without one, and GitLab refuses the call. `pipeline` /
 /// `head_pipeline` are confirmed present on this endpoint (verified against
-/// gitlab-org/gitlab, inkscape/inkscape and gitlab-org/cli, 2026-09-14) —
+/// gitlab-org/gitlab, inkscape/inkscape and gitlab-org/cli, 2026-09-14):
 /// this is the ONLY of the two entry points allowed to read that key, see
 /// `gl_auto_merge_state_from_list` for the list endpoint's answer.
 fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
@@ -2227,8 +2227,8 @@ fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
 /// Per-MR auto-merge state from a GitLab merge-requests **list** response.
 ///
 /// GitLab's `/merge_requests` list payload carries `merge_when_pipeline_succeeds`
-/// but NOT `pipeline` or `head_pipeline` (verified against three public
-/// projects — gitlab-org/gitlab, inkscape/inkscape, gitlab-org/cli — 2026-09-14),
+/// but NOT `pipeline` or `head_pipeline` (verified 2026-09-14 against three
+/// public projects: gitlab-org/gitlab, inkscape/inkscape, gitlab-org/cli),
 /// so the pipeline precondition `gl_auto_merge_state` checks is unknowable
 /// here. Reporting `available: false` with "no pipeline running" would be a
 /// false statement about the MR (a pipeline may well be running); instead

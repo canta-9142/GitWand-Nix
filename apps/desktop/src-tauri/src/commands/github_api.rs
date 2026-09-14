@@ -797,7 +797,7 @@ pub(crate) fn rest_pr_detail(
     let sha = jnested(&v, "head", "sha");
     detail.checks_status = rest_rollup_for_sha(&repo, &sha, token);
     // The nested `base.repo` in a pulls response omits the `permissions` block
-    // (and `allow_auto_merge`) — only the top-level repo endpoint returns
+    // (and `allow_auto_merge`): only the top-level repo endpoint returns
     // them. `repo` is the *base* repo (upstream for a fork), so this checks
     // merge rights and the auto-merge setting on the right side.
     let (can_push, auto_merge_support) = rest_repo_can_push_and_auto_merge_support(&repo, token);

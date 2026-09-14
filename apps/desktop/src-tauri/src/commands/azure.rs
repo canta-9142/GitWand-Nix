@@ -623,7 +623,7 @@ fn json_to_detail(r: &AzureRepo, pr: &serde_json::Value) -> PullRequestDetail {
         head_sha: jnested(pr, "lastMergeSourceCommit", "commitId"),
         auto_merge: az_auto_merge_state(pr),
         // Azure has no repository-level auto-complete gate (unlike GitHub's
-        // "Allow auto-merge" repo setting) — any non-draft PR can request it,
+        // "Allow auto-merge" repo setting): any non-draft PR can request it,
         // subject only to the per-PR draft precondition `az_auto_merge_state`
         // already checks.
         auto_merge_support: crate::types::AutoMergeSupport { supported: true, reason: None },
