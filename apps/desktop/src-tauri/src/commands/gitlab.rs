@@ -169,7 +169,7 @@ fn gl_mr_to_pr(mr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(mr, "merge_status"),
         checks_rollup: String::new(),
         comment_count: ji(mr, "user_notes_count"),
-        auto_merge: gl_auto_merge_state(mr),
+        auto_merge: gl_auto_merge_state_from_list(mr),
     }
 }
 
@@ -2182,32 +2182,35 @@ mod gl_mr_diff_args_tests {
     }
 }
 
-/// Per-MR auto-merge state from a GitLab merge-request JSON object.
+/// Whether an auto-merge is queued on a GitLab merge-request JSON object.
 ///
 /// Two spellings of the same flag: `merge_when_pipeline_succeeds` is the
 /// historical name, `auto_merge_enabled` the 17.x one. Either arms.
 ///
-/// The precondition is a pipeline: merge-when-pipeline-succeeds has nothing
-/// to wait for without one, and GitLab refuses the call.
-///
-/// OPEN QUESTION (unverified, needs a live capture — see forge-side
-/// auto-merge design doc step 4): the GitLab merge-requests **list** endpoint
-/// (`gl_mr_to_pr`'s caller) may not embed `pipeline`/`head_pipeline` the way
-/// the single-MR **detail** endpoint does. If it doesn't, every MR in the
-/// list reads `available: false` here even when a pipeline is actually
-/// running, which would wrongly hide the Today auto-merge action from the
-/// list view. Confirm against a real `glab api
-/// "projects/:id/merge_requests?per_page=1"` response before relying on the
-/// list path's `available` value.
-fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
-    let armed = mr
-        .get("merge_when_pipeline_succeeds")
+/// Shared by `gl_auto_merge_state` (detail) and `gl_auto_merge_state_from_list`
+/// (list) so the two can never disagree on this one fact even though they
+/// disagree on `available` — factored out rather than copied so the OR
+/// expression can't drift between the two call sites.
+fn gl_auto_merge_armed(mr: &serde_json::Value) -> bool {
+    mr.get("merge_when_pipeline_succeeds")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
         || mr
             .get("auto_merge_enabled")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(false)
+}
+
+/// Per-MR auto-merge state from a GitLab **single-MR** (detail) response.
+///
+/// The precondition is a pipeline: merge-when-pipeline-succeeds has nothing
+/// to wait for without one, and GitLab refuses the call. `pipeline` /
+/// `head_pipeline` are confirmed present on this endpoint (verified against
+/// gitlab-org/gitlab, inkscape/inkscape and gitlab-org/cli, 2026-09-14) —
+/// this is the ONLY of the two entry points allowed to read that key, see
+/// `gl_auto_merge_state_from_list` for the list endpoint's answer.
+fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
+    let armed = gl_auto_merge_armed(mr);
     let has_pipeline = mr.get("pipeline").is_some_and(|v| !v.is_null())
         || mr.get("head_pipeline").is_some_and(|v| !v.is_null());
     crate::types::AutoMergeState {
@@ -2221,9 +2224,27 @@ fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
     }
 }
 
+/// Per-MR auto-merge state from a GitLab merge-requests **list** response.
+///
+/// GitLab's `/merge_requests` list payload carries `merge_when_pipeline_succeeds`
+/// but NOT `pipeline` or `head_pipeline` (verified against three public
+/// projects — gitlab-org/gitlab, inkscape/inkscape, gitlab-org/cli — 2026-09-14),
+/// so the pipeline precondition `gl_auto_merge_state` checks is unknowable
+/// here. Reporting `available: false` with "no pipeline running" would be a
+/// false statement about the MR (a pipeline may well be running); instead
+/// this reports the real cause; still fails closed (no button offered) so no
+/// surface promises an action it cannot complete from list data alone.
+fn gl_auto_merge_state_from_list(mr: &serde_json::Value) -> crate::types::AutoMergeState {
+    crate::types::AutoMergeState {
+        armed: gl_auto_merge_armed(mr),
+        available: false,
+        reason: Some("Open this merge request to check whether it can be scheduled.".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod gl_auto_merge_tests {
-    use super::gl_auto_merge_state;
+    use super::{gl_auto_merge_state, gl_auto_merge_state_from_list};
 
     #[test]
     fn an_mr_with_merge_when_pipeline_succeeds_is_armed() {
@@ -2294,5 +2315,47 @@ mod gl_auto_merge_tests {
         )
         .unwrap();
         assert!(gl_auto_merge_state(&v).armed);
+    }
+
+    #[test]
+    fn the_list_variant_reports_unavailable_with_the_real_reason_not_no_pipeline() {
+        // GitLab's list endpoint carries `merge_when_pipeline_succeeds` but not
+        // `pipeline`/`head_pipeline` (verified 2026-09-14). Claiming "no
+        // pipeline is running" here would be a false statement about the MR.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": true}"#,
+        )
+        .unwrap();
+        let s = gl_auto_merge_state_from_list(&v);
+        assert!(s.armed);
+        assert!(!s.available);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("Open this merge request to check whether it can be scheduled.")
+        );
+    }
+
+    #[test]
+    fn the_list_and_detail_variants_agree_on_armed_for_the_same_input() {
+        // Pins the shared gl_auto_merge_armed helper against drift: whatever
+        // the two variants disagree on (`available`), `armed` must always
+        // match between them for identical input.
+        let armed_input: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": true, "pipeline": {"status": "running"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gl_auto_merge_state(&armed_input).armed,
+            gl_auto_merge_state_from_list(&armed_input).armed
+        );
+        assert!(gl_auto_merge_state_from_list(&armed_input).armed);
+
+        let not_armed_input: serde_json::Value =
+            serde_json::from_str(r#"{"iid": 3, "merge_when_pipeline_succeeds": false}"#).unwrap();
+        assert_eq!(
+            gl_auto_merge_state(&not_armed_input).armed,
+            gl_auto_merge_state_from_list(&not_armed_input).armed
+        );
+        assert!(!gl_auto_merge_state_from_list(&not_armed_input).armed);
     }
 }
