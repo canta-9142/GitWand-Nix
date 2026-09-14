@@ -119,19 +119,22 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
   // classified as kind:"dep" if they surface to me at all — i.e.
   // if I own the PR, my review was requested, or I am an assignee.
   if (isDependencyBump(pr) && (isMine || reviewRequested || isAssigned)) {
-    // Forge-side auto-merge shipped in v3.11.0 (Task 4/8), so a fresh
-    // dep-bump PR, almost always blocked on CI that hasn't finished yet,
-    // is exactly the "schedule it and forget it" case. Offer it wherever the
-    // forge's descriptor says it can be armed; a forge without an equivalent
-    // (Bitbucket) reports `available: false`, and that PR keeps the older
-    // honest immediate merge: the button opens the merge dialog like
-    // always, which still correctly refuses while `openLaunchpadMergePr`'s
-    // `mergeBlocked` guard is true. GitLab is excluded for a different
-    // reason: it DOES support auto-merge, and the PR detail panel offers it
-    // there, but its list payload lacks the pipeline status needed to know
-    // whether arming makes sense, so `available` is false here specifically
-    // (not absent capability, an unknowable precondition from a list).
-    if (pr.autoMerge.available && !pr.autoMerge.armed) {
+    // Forge-side auto-merge shipped in v3.11.0 (Task 4/8), so a dep-bump PR
+    // that is not yet mergeable is exactly the "schedule it and forget it"
+    // case. Guarded the same way as the sibling branch below: only offer it
+    // while `mergeStateStatus` is BLOCKED, never on an already-mergeable PR,
+    // matching the binding rule that auto-merge is never offered in place of
+    // an immediate merge that is already available. A forge without an
+    // equivalent (Bitbucket) reports `available: false`, and that PR keeps
+    // the older honest immediate merge: the button opens the merge dialog
+    // like always, which still correctly refuses while
+    // `openLaunchpadMergePr`'s `mergeBlocked` guard is true. GitLab is
+    // excluded for a different reason: it DOES support auto-merge, and the
+    // PR detail panel offers it there, but its list payload lacks the
+    // pipeline status needed to know whether arming makes sense, so
+    // `available` is false here specifically (not absent capability, an
+    // unknowable precondition from a list).
+    if (pr.mergeStateStatus === "BLOCKED" && pr.autoMerge.available && !pr.autoMerge.armed) {
       return { tier: "later", case: "merge", action: "auto-merge", kind: "dep" };
     }
     return { tier: "later", case: "merge", action: "merge", kind: "dep" };

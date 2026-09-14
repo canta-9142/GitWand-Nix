@@ -106,4 +106,23 @@ describe("Today inbox, auto-merge action", () => {
     );
     expect(r?.action).not.toBe("auto-merge");
   });
+
+  it("keeps the immediate merge for an already-mergeable dep-bump PR, never auto-merge", () => {
+    // A dep-bump PR that is CLEAN, approved, and checks-passing is already
+    // mergeable right now; scheduling it would be "merge later" on a PR the
+    // user could merge immediately, exactly the case the design forbids.
+    const r = classifyInboxPr(
+      pr({
+        author: ME,
+        labels: ["dependencies"],
+        reviewDecision: "APPROVED",
+        mergeStateStatus: "CLEAN",
+        checksRollup: "SUCCESS",
+        autoMerge: { armed: false, available: true, reason: null },
+      }),
+      ME,
+    );
+    expect(r?.action).toBe("merge");
+    expect(r?.action).not.toBe("auto-merge");
+  });
 });
