@@ -1167,20 +1167,29 @@ pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result
 /// builds via `gl_merge_args`: `--delete-source-branch` is not a recognised
 /// `glab` flag at all, verified against the installed `glab` 1.117.0, which
 /// rejects it with "Unknown flag" before even reaching remote resolution.
-fn gl_enable_auto_merge_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+///
+/// Extracted into `gl_enable_auto_merge_args` so the exact flag order can be
+/// pinned by a test rather than only exercised at runtime, the same shape as
+/// `gl_merge_args` (commit 5425a10).
+fn gl_enable_auto_merge_args(iid: i64, method: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "mr".to_string(),
         "merge".to_string(),
         iid.to_string(),
         "--when-pipeline-succeeds".to_string(),
     ];
-    match method.as_str() {
+    match method {
         "squash" => args.push("--squash".to_string()),
         "rebase" => args.push("--rebase".to_string()),
         _ => {} // default merge
     }
     args.push("--yes".to_string());
     args.push("--remove-source-branch".to_string());
+    args
+}
+
+fn gl_enable_auto_merge_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    let args = gl_enable_auto_merge_args(iid, &method);
 
     let mut cmd = hidden_cmd("glab");
     cmd.args(&args).current_dir(&cwd);
@@ -2525,6 +2534,84 @@ mod gl_merge_args_tests {
     #[test]
     fn never_emits_the_delete_source_branch_flag_glab_rejects_outright() {
         let args = gl_merge_args(7, "merge");
+        assert!(!args.iter().any(|a| a == "--delete-source-branch"));
+        assert!(args.iter().any(|a| a == "--remove-source-branch"));
+    }
+}
+
+/// Regression coverage for `gl_enable_auto_merge_args`: pins the exact
+/// `glab mr merge --when-pipeline-succeeds` argument vector per merge
+/// method, the same precedent as `gl_merge_args_tests` above (issue: this
+/// argv used to be built inline with no test at all).
+#[cfg(test)]
+mod gl_enable_auto_merge_args_tests {
+    use super::gl_enable_auto_merge_args;
+
+    #[test]
+    fn default_merge_uses_when_pipeline_succeeds_and_remove_source_branch() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "merge"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn squash_adds_the_squash_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "squash"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--squash",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn rebase_adds_the_rebase_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "rebase"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--rebase",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_method_falls_back_to_a_plain_merge() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "bogus"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn never_emits_the_delete_source_branch_flag_glab_rejects_outright() {
+        let args = gl_enable_auto_merge_args(7, "merge");
         assert!(!args.iter().any(|a| a == "--delete-source-branch"));
         assert!(args.iter().any(|a| a == "--remove-source-branch"));
     }
