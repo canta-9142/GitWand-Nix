@@ -27,6 +27,10 @@ import {
   type ForkInfo,
   ghPrFreshnessSignal,
   type PrFreshnessSignal,
+  type AutoMergeState,
+  type AutoMergeSupport,
+  CLOSED_AUTO_MERGE,
+  UNSUPPORTED_AUTO_MERGE,
 } from "../utils/backend";
 import { forgeFromRemoteInfo, githubProvider } from "./forge/useForge";
 import { ForgeNotImplementedError, CURSOR_WEB_BASE, forgeSupportsPRs } from "./forge/types";
@@ -77,6 +81,38 @@ const CLI_MISSING_INFO: Record<string, { cli: string; url: string }> = {
  */
 export function isMergeConflict(mergeable: string | null | undefined): boolean {
   return ["CONFLICTING", "CONFLICTS", "DIRTY"].includes((mergeable || "").toUpperCase());
+}
+
+/** What the PR detail panel should offer for forge-side auto-merge (v3.11.0). */
+export type AutoMergeOffer =
+  | { kind: "arm" }
+  | { kind: "disarm" }
+  | { kind: "explain"; reason: string }
+  | { kind: "none" };
+
+/**
+ * What the panel should offer for forge-side auto-merge.
+ *
+ * The load-bearing rule is the second branch: auto-merge is never offered on
+ * a PR that is already mergeable. An auto-merge that cannot be armed must
+ * never become a merge, and `gh pr merge --auto` against an already-clean PR
+ * may merge immediately. Hiding the button there deletes the whole class of
+ * problem, and costs nothing, since the immediate merge sits next to it.
+ *
+ * Exported as a free function (same precedent as `isMergeConflict` above) so
+ * it is unit-testable without instantiating the whole composable.
+ */
+export function computeAutoMergeOffer(
+  support: AutoMergeSupport,
+  state: AutoMergeState,
+  readiness: { ready: boolean; reason: string } | null,
+): AutoMergeOffer {
+  if (state.armed) return { kind: "disarm" };
+  if (!support.supported) return { kind: "explain", reason: support.reason ?? "" };
+  if (!state.available) return { kind: "explain", reason: state.reason ?? "" };
+  if (readiness === null) return { kind: "none" };
+  if (readiness.ready) return { kind: "none" };
+  return { kind: "arm" };
 }
 
 /** Optional host hooks so the panel can notify the app of side effects. */
@@ -430,6 +466,21 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     const r = mergeReadiness.value;
     return r && !r.ready ? r.reason : "";
   });
+
+  /**
+   * Forge-side auto-merge offer for the selected PR (v3.11.0), see
+   * `computeAutoMergeOffer`'s doc comment for the load-bearing rule. Falls
+   * back to the closed/unsupported descriptors before the detail bundle
+   * (or its repo-level `autoMergeSupport`) has loaded, so the panel never
+   * offers to arm something it hasn't confirmed the forge can do.
+   */
+  const autoMergeOffer = computed<AutoMergeOffer>(() =>
+    computeAutoMergeOffer(
+      prDetail.value?.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
+      prDetail.value?.autoMerge ?? CLOSED_AUTO_MERGE,
+      mergeReadiness.value,
+    ),
+  );
 
   /**
    * v2.10 — Virtual 'Merge Conflict' check surfaced in the CI tab.
@@ -1143,6 +1194,44 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     } catch (err: any) { error.value = err.message; }
   }
 
+  /**
+   * Arm forge-side auto-merge on the selected PR (v3.11.0), through the
+   * `ForgeProvider` abstraction: this composable never branches on which
+   * forge is active. `method` defaults to whatever the merge dialog's radio
+   * is set to, so a user who already picked squash/rebase there gets the
+   * same method here.
+   *
+   * On failure the forge's message is surfaced as-is (not translated, it is
+   * the forge's own text, not GitWand copy) and the PR is re-fetched either
+   * way, so a stale `autoMerge` descriptor corrects itself instead of the app
+   * remembering a refusal that may no longer hold.
+   */
+  async function armAutoMerge(method?: "merge" | "squash" | "rebase") {
+    if (!selectedPr.value) return;
+    try {
+      await forge.value.enableAutoMerge(cwd.value, selectedPr.value.number, method ?? mergeMethod.value);
+      error.value = null;
+    } catch (err: any) {
+      error.value = err.message;
+    } finally {
+      await revalidateOpenDetail();
+    }
+  }
+
+  /** Cancel a previously armed auto-merge. Same refetch-either-way contract
+   *  as `armAutoMerge`. */
+  async function disarmAutoMerge() {
+    if (!selectedPr.value) return;
+    try {
+      await forge.value.disableAutoMerge(cwd.value, selectedPr.value.number);
+      error.value = null;
+    } catch (err: any) {
+      error.value = err.message;
+    } finally {
+      await revalidateOpenDetail();
+    }
+  }
+
   // ─── Comment actions ────────────────────────────────────
   async function handleCreateComment(params: CreatePrCommentParams & { path: string }) {
     if (!selectedPr.value) return;
@@ -1564,10 +1653,11 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     // Computed
     forge, forgeLabel,
     commentsForFile, commentCount, mergeReadiness, mergeBlocked, mergeBlockedReason, selectedDiff, displayedPrs,
+    autoMergeOffer,
     // Actions
     init, ensurePrsLoaded, loadRemote, loadPrs, loadMorePrs, loadCurrentUser, selectPr, loadDiff, loadChecks,
     revalidateOpenDetail,
-    createPr, checkoutPr, mergePr, convertDraftToReady,
+    createPr, checkoutPr, mergePr, armAutoMerge, disarmAutoMerge, convertDraftToReady,
     handleCreateComment, handleReplyComment, handleEditComment,
     handleDeleteComment, handleApplySuggestion, handleAddToReview, handleSubmitReview,
     handleDismissReview, handleRequestReviewers, forgeSupportsDismissReview, forgeSupportsRequestReviewers,
