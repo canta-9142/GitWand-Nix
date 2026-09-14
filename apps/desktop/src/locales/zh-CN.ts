@@ -1727,6 +1727,7 @@ const zhCN: Locale = {
     },
     action: {
       merge: "合并",
+      "auto-merge": "计划合并",
       review: "审查",
       seeFailure: "查看失败",
       reply: "回复",

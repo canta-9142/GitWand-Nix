@@ -1716,6 +1716,7 @@ const ptBR: Locale = {
     },
     action: {
       merge: "Mesclar",
+      "auto-merge": "Agendar merge",
       review: "Revisar",
       seeFailure: "Ver falha",
       reply: "Responder",

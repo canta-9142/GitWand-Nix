@@ -1725,6 +1725,7 @@ const fr: Locale = {
     },
     action: {
       merge: "Merger",
+      "auto-merge": "Planifier la fusion",
       review: "Reviewer",
       seeFailure: "Voir l'échec",
       reply: "Répondre",

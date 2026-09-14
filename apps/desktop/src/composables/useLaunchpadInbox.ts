@@ -37,6 +37,7 @@ export type InboxCase =
 
 export type InboxAction =
   | "merge"
+  | "auto-merge" // queue the forge-side merge for once checks/reviews clear (v3.11.0)
   | "review"
   | "seeFailure"
   | "reply"
@@ -118,13 +119,17 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
   // classified as kind:"dep" if they surface to me at all — i.e.
   // if I own the PR, my review was requested, or I am an assignee.
   if (isDependencyBump(pr) && (isMine || reviewRequested || isAssigned)) {
-    // `action: "merge"`, not an "auto-merge": there is no forge auto-merge
-    // call anywhere in the app, and `openLaunchpadMergePr` refuses to merge
-    // while `mergeBlocked` is true, which a fresh dep-bump PR almost always
-    // is, since its CI is still running. Labelling the button "Auto-merge"
-    // promised a queue-it-for-later behaviour that could only ever surface
-    // "waiting: <check>". Enabling real forge-side auto-merge is tracked in
-    // roadmap.md.
+    // Forge-side auto-merge shipped in v3.11.0 (Task 4/8), so a fresh
+    // dep-bump PR, almost always blocked on CI that hasn't finished yet,
+    // is exactly the "schedule it and forget it" case. Offer it wherever the
+    // forge's descriptor says it can be armed; a forge without an equivalent
+    // (Bitbucket) reports `available: false`, and that PR keeps the older
+    // honest immediate merge: the button opens the merge dialog like
+    // always, which still correctly refuses while `openLaunchpadMergePr`'s
+    // `mergeBlocked` guard is true.
+    if (pr.autoMerge.available && !pr.autoMerge.armed) {
+      return { tier: "later", case: "merge", action: "auto-merge", kind: "dep" };
+    }
     return { tier: "later", case: "merge", action: "merge", kind: "dep" };
   }
 
@@ -143,6 +148,15 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
     // 3. Failing CI
     if (pr.checksRollup === "FAILURE") {
       return { tier: "now", case: "ci", action: "seeFailure", kind: "pr" };
+    }
+
+    // 3.5. Blocked on required checks/reviews the forge can pick back up on
+    // its own once satisfied, offer scheduling instead of just "follow".
+    // Never reached once the PR is already mergeable (see the CLEAN branch
+    // below): computeAutoMergeOffer's rule that auto-merge is redundant on an
+    // already-ready PR holds here too.
+    if (pr.mergeStateStatus === "BLOCKED" && pr.autoMerge.available && !pr.autoMerge.armed) {
+      return { tier: "now", case: "merge", action: "auto-merge", kind: "pr" };
     }
 
     // 4. Approved — ready to merge (or blocked / dirty)

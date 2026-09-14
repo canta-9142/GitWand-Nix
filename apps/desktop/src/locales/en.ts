@@ -1749,6 +1749,7 @@ const en = {
     },
     action: {
       merge: "Merge",
+      "auto-merge": "Schedule merge",
       review: "Review",
       seeFailure: "See failure",
       reply: "Reply",

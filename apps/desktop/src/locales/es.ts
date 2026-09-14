@@ -1716,6 +1716,7 @@ const es: Locale = {
     },
     action: {
       merge: "Fusionar",
+      "auto-merge": "Programar fusión",
       review: "Revisar",
       seeFailure: "Ver fallo",
       reply: "Responder",
