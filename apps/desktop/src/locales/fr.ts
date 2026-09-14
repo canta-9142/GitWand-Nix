@@ -336,6 +336,9 @@ const fr: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Modifier ce hunk",
+    editBusy: "Terminez d'abord le hunk en cours d'\u00e9dition",
+    editStale: "Le fichier a chang\u00e9 depuis le calcul de ce diff. Rafra\u00eechissez et r\u00e9essayez.",
     newFolder: "Nouveau dossier",
     newFolderCount: "{0} fichier(s)",
     nestedRepo: "D\u00e9p\u00f4t Git imbriqu\u00e9",
@@ -520,6 +523,20 @@ const fr: Locale = {
 
   // ─── Merge Preview (Phase 8.1) ──────────────────────────
   mergePreview: {
+    applying: "Application\u2026",
+    applyAndMerge: "Fusionner et auto-r\u00e9soudre",
+    applyEstimate: "Estimation : {0} hunks sur {1} auto-r\u00e9solvables",
+    applyDone: "Termin\u00e9",
+    applyStopped: "Arr\u00eat sur les conflits qui vous attendent",
+    applyLoopBound: "Arr\u00eat apr\u00e8s trop d'\u00e9tapes de rebase",
+    applyFailed: "L'op\u00e9ration a \u00e9chou\u00e9",
+    applyCounts: "{0} appliqu\u00e9s, {1} restants \u00e0 r\u00e9soudre",
+    applyDrift: "L'aper\u00e7u estimait {0}. L'op\u00e9ration r\u00e9elle voit un merge diff\u00e9rent, les deux peuvent donc diverger.",
+    applyNoSnapshot: "Aucun snapshot n'a \u00e9t\u00e9 pris : pas de retour en un clic.",
+    hunkHeldBack: "retenu ({0} %)",
+    thresholdLabel: "Appliquer seulement au-dessus de",
+    thresholdOff: "Aucun",
+    thresholdSummary: "{0} auto-resolvables, {1} retenus par le seuil, {2} manuels",
     aiRisk: "Analyse des risques",
     aiRiskHint: "Demande \u00e0 l'IA un avis sur la s\u00e9curit\u00e9 de ce merge.",
     aiRiskAnalyzing: "Analyse des risques\u2026",
@@ -745,6 +762,7 @@ const fr: Locale = {
     resolveAutoSummaryBody: "{0} conflit(s) seront r\u00e9solus ainsi :",
     resolveAutoSummaryConfirm: "Confirmer",
     resolveAutoSummaryCancel: "Annuler",
+    resolveAutoSummaryToggle: "Appliquer le conflit {0}",
     bulkLabel: "Tout accepter :",
     bulkOurs: "Courante",
     bulkTheirs: "Entrante",
@@ -1079,6 +1097,13 @@ const fr: Locale = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Confiance de resolution",
+      subtitle: "Un seuil sur la confiance par hunk du moteur, applique partout ou GitWand resout.",
+      minConfidenceScore: "Appliquer seulement au-dessus de",
+      minConfidenceScoreHint: "Les auto-resolutions sous ce score sont proposees au lieu d etre appliquees. Ne laisse jamais passer ce que le moteur a deja refuse.",
+      barOff: "Aucun",
+    },
     title: "Param\u00e8tres",
     tabGeneral: "G\u00e9n\u00e9ral",
     tabDock: "Dock",
@@ -1890,6 +1915,7 @@ const fr: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Modifier le conflit {0}",
     aiButton: "IA",
     aiLoading: "IA\u2026",
     aiErrorPrefix: "IA",

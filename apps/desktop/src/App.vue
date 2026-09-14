@@ -85,7 +85,11 @@ import { useSplitCommit } from "./composables/useSplitCommit";
 import type { GitLogEntry } from "./utils/backend";
 import { getPersistedDiffMode, persistDiffMode, type DiffMode } from "./utils/diffMode";
 import { isImagePath } from "./utils/imagePath";
-import { useGitWand } from "./composables/useGitWand";
+import { useGitWand, type ApplyPredicate } from "./composables/useGitWand";
+import { useResolutionSelection, contentStamp } from "./composables/useResolutionSelection";
+import { getPendingSplitForHash, resolvePendingSplit } from "./composables/useInteractiveRebase";
+import { spliceHunk } from "./composables/useDiffEdit";
+import { useApplyFromPreview, assertOperationSucceeded, type ApplyOutcome } from "./composables/useApplyFromPreview";
 import { useResolutionMemory, type ResolutionMemoryEntry, type ResolutionStrategy } from "./composables/useResolutionMemory";
 import { useRepoTabs } from "./composables/useRepoTabs";
 import { useAiTasks } from "./composables/useAiTasks";
@@ -209,6 +213,10 @@ const {
   selectFile: mergeSelectFile,
   refreshLlmFallbackConfig: mergeRefreshLlmFallbackConfig,
 } = useGitWand();
+
+// v3.11 — shared per-hunk opt-out + confidence bar. Module-level singleton, so
+// the merge editor, the summary modal and the apply paths all read one set.
+const resolutionSelection = useResolutionSelection();
 
 // ─── Repo mode (useGitRepo) — single shared instance ────
 const {
@@ -839,9 +847,133 @@ async function handleResolveHunk(path: string, hunkIndex: number, choice: "ours"
   await checkAndSaveIfResolved(path);
 }
 
+/**
+ * v3.11 — the predicate the apply paths consult, built from the shared
+ * selection store. App.vue owns both sides (the `useGitWand` instance and the
+ * singleton), so this is where they meet: `useGitWand` stays a pure function
+ * of its arguments and never reaches for hidden state.
+ *
+ * Returning `undefined` when nothing is filtered matters. It is what lets
+ * `buildResolvedContent` keep using the engine's `mergedContent` shortcut on
+ * the common path, instead of rebuilding content marker by marker every time.
+ */
+function applyPredicateFor(path: string): ApplyPredicate | undefined {
+  const file = mergeFiles.value.find((f) => f.path === path);
+  if (!file) return undefined;
+  const stamp = contentStamp(file.content);
+  const selection = resolutionSelection;
+  const anythingFiltered =
+    selection.minScore.value > 0 || selection.excludedCount(path) > 0;
+  if (!anythingFiltered) return undefined;
+  return (index, resolution) =>
+    selection.shouldApply(path, index, resolution as never, stamp);
+}
+
+/** Which hunk indices a filtered apply consumed, so the selection can remap. */
+function appliedIndicesFor(path: string, predicate: ApplyPredicate | undefined): number[] {
+  const file = mergeFiles.value.find((f) => f.path === path);
+  if (!file) return [];
+  const out: number[] = [];
+  file.result.resolutions.forEach((r, i) => {
+    const engineApplied = r.autoResolved && r.resolvedLines !== null;
+    if (engineApplied && (!predicate || predicate(i, r))) out.push(i);
+  });
+  return out;
+}
+
 async function handleResolveFile(path: string) {
-  await resolveFile(path);
+  const predicate = applyPredicateFor(path);
+  const consumed = appliedIndicesFor(path, predicate);
+  await resolveFile(path, { shouldApply: predicate });
+  // Indices renumber once blocks are removed; remap before anything reads the
+  // selection again, or a stale index would point at the wrong hunk.
+  const after = mergeFiles.value.find((f) => f.path === path);
+  if (after) resolutionSelection.remapAfterApply(path, consumed, contentStamp(after.content));
   await checkAndSaveIfResolved(path);
+}
+
+// ─── Apply from preview (v3.11.0) ─────────────────────────
+//
+// The predictor simulates; applying runs the real operation and re-resolves
+// what git actually produced. The composable takes its dependencies
+// explicitly, so this is the one place that knows how to satisfy them.
+const applyingFromPreview = ref(false);
+const applyOutcome = ref<ApplyOutcome | null>(null);
+
+const { apply: runApplyFromPreview } = useApplyFromPreview({
+  cwd: () => repoFolderPath.value ?? "",
+  repoState: async () => {
+    const { gitRepoState } = await import("./utils/backend");
+    return gitRepoState(repoFolderPath.value ?? "");
+  },
+  snapshot: (cwd, kind, label) => snapshots.capture(cwd, kind, label) as never,
+  // Straight to the backend, NOT through useGitRepo's UI wrappers: those catch
+  // into `error.value` and never throw, so a refused merge would reach the
+  // orchestrator looking like a clean success. See assertOperationSucceeded.
+  runMerge: async (ref_) => {
+    const { gitMerge } = await import("./utils/backend");
+    const result = await gitMerge(repoFolderPath.value ?? "", ref_, false);
+    assertOperationSucceeded(result, `merge ${ref_}`);
+  },
+  runCherryPick: async (sha) => {
+    const { gitCherryPick } = await import("./utils/backend");
+    const result = await gitCherryPick(repoFolderPath.value ?? "", [sha]);
+    assertOperationSucceeded(result, `cherry-pick ${sha}`);
+  },
+  runRebaseOnto: async (onto) => {
+    const { gitRebaseOnto } = await import("./utils/backend");
+    return gitRebaseOnto(repoFolderPath.value ?? "", onto);
+  },
+  refresh: async () => { await repoRefresh(); await refreshRepoState(); },
+  // git's own conflicted set, not our in-memory list: it is the only thing
+  // that knows whether staging actually landed.
+  conflictedPaths: () => repoStatus.value?.conflicted ?? [],
+  openConflicts: async (cwd) => { await mergeOpenPath(cwd); },
+  resolveAll: (opts) => resolveAll(opts),
+  saveAll: () => saveAllFiles(),
+  stage: (paths) => stageFiles(paths),
+  files: () => mergeFiles.value as never,
+  finalize: async (operation) => {
+    const { gitRebaseAction } = await import("./utils/backend");
+    const cwd = repoFolderPath.value ?? "";
+    // Same reasoning as the runners above: doMergeContinue and
+    // doCherryPickContinue swallow failure into `error.value`, so a refused
+    // --continue would be reported as a finished merge.
+    if (operation === "rebase") {
+      await gitRebaseAction(cwd, "continue");
+      return;
+    }
+    const { gitMergeContinue, gitCherryPickContinue } = await import("./utils/backend");
+    const result = operation === "cherry-pick"
+      ? await gitCherryPickContinue(cwd)
+      : await gitMergeContinue(cwd);
+    assertOperationSucceeded(result as never, `${operation} --continue`);
+  },
+  applyPredicateFor,
+});
+
+async function handleApplyFromPreview(operation: string, ref_: string, estimatedHunks: number) {
+  if (!repoFolderPath.value || applyingFromPreview.value) return;
+  applyingFromPreview.value = true;
+  applyOutcome.value = null;
+  try {
+    const out = await runApplyFromPreview(operation as never, ref_, estimatedHunks);
+    applyOutcome.value = out;
+    // Land the user on the first file that still needs them, if any.
+    if (out.residualFiles.length > 0) {
+      viewMode.value = "changes";
+      await repoSelectFile(out.residualFiles[0], false);
+    }
+  } catch (err: unknown) {
+    repoError.value = `apply: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    applyingFromPreview.value = false;
+  }
+}
+
+async function handleOpenResidual(path: string) {
+  viewMode.value = "changes";
+  await repoSelectFile(path, false);
 }
 
 async function handleResolveHunkCustom(path: string, hunkIndex: number, content: string) {
@@ -941,6 +1073,85 @@ async function handleSplitCommitRequest(entry: GitLogEntry) {
     message: entry.message,
     body: entry.body,
     parents: entry.parents,
+  });
+}
+
+/**
+ * v3.11 — write an inline diff edit back to the working tree.
+ *
+ * DiffViewer hands up the hunk and the replacement text; the read, the splice
+ * and the write happen here because they are repo I/O and the component only
+ * renders. The file is re-read rather than spliced against whatever the diff
+ * was built from: it may have moved since (an external edit, the watcher, a
+ * branch switch), and `spliceHunk` refuses rather than writing one line off.
+ *
+ * The result is a plain working-tree change. It is not staged, and it is not
+ * turned into a patch: an edit is something you stage afterwards like any
+ * other, and synthesizing a unified patch from arbitrary text would mean
+ * re-diffing the hunk and surfacing apply failures as opaque backend errors.
+ */
+async function handleEditHunk(path: string, hunkIdx: number, replacement: string) {
+  const cwd = repoFolderPath.value;
+  const hunk = repoDiff.value?.hunks[hunkIdx];
+  if (!cwd || !hunk) return;
+
+  try {
+    const { readFile, writeFile } = await import("./utils/backend");
+    const current = await readFile(cwd, path);
+    const result = spliceHunk(current, hunk, replacement);
+    if (!result.ok) {
+      repoError.value = t("diff.editStale");
+      return;
+    }
+    await writeFile(cwd, path, result.text);
+    await repoRefresh();
+  } catch (err: unknown) {
+    repoError.value = `edit: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/**
+ * v3.11 (#128 follow-up) — the split affordance on the rebase banner.
+ *
+ * Closing `RebaseEditor` for the conflict banner took "Split this commit…"
+ * with it, leaving only Continue/Skip/Abort for the rest of the rebase. The
+ * banner outlives the editor, so the affordance belongs there.
+ *
+ * `operationHead` is `.git/REBASE_HEAD`, which at both halt kinds is the
+ * ORIGINAL pre-rebase commit, and that is exactly what `pendingSplits` keys
+ * on. Gated on `!hasConflict` for correctness, not neatness: `gitSplitCommit`
+ * runs `reset --mixed HEAD^`, so HEAD has to BE the commit being split. At an
+ * `edit` stop it is; at a conflict stop the commit has not been created yet
+ * and HEAD is its parent.
+ */
+const pendingSplitAtHalt = computed(() => {
+  const st = repoOperationState.value;
+  if (!showRebaseBanner.value || !st || st.hasConflict) return null;
+  return getPendingSplitForHash(st.operationHead ?? null);
+});
+
+async function onRebaseBannerSplit() {
+  const pending = pendingSplitAtHalt.value;
+  const cwd = repoFolderPath.value;
+  if (!pending || !cwd) return;
+
+  // Deliberately NOT `pending.fullHash`, which is what the equivalent handler
+  // in RebaseEditor passes. That is the original pre-rebase commit, and it
+  // drives `getGitShow` for the modal's diff, while `gitSplitCommit` operates
+  // on HEAD. Whenever the replay rewrote the commit (a moved base, or a
+  // conflict the user just resolved) those are two different commits, so the
+  // modal would show the pre-rebase diff while the split acted on the
+  // post-rebase content. Use HEAD, which is the commit that will actually be
+  // split; `pending` only decides whether to offer the action at all.
+  // "HEAD" names the commit git just created at this `edit` stop, which is the
+  // one `reset --mixed HEAD^` will split.
+  await splitCommit.openFor(cwd, { hash: "HEAD", message: pending.message }, async () => {
+    // Keyed on the original hash, which is what `pendingSplits` stores.
+    resolvePendingSplit(pending.fullHash);
+    const { gitRebaseAction } = await import("./utils/backend");
+    await gitRebaseAction(cwd, "continue");
+    await refreshRepoState();
+    await repoRefresh();
   });
 }
 
@@ -1498,7 +1709,22 @@ watch(
 // plain staging change within the SAME repo (e.g. the "Review now" round trip).
 watch(repoFolderPath, () => {
   commitReviewDecision.value = null;
+  // v3.11 — the per-hunk opt-out set is keyed by repo-relative path, so it
+  // must not survive a repo change: the same path means a different file. The
+  // confidence bar does: it is a user preference, so it is re-seeded from
+  // Settings rather than cleared.
+  resolutionSelection.resetAll();
+  resolutionSelection.minScore.value = settings.value.resolution.minConfidenceScore;
 });
+
+// The bar governs every apply path, including the merge editor's "Resolve
+// auto" and the MERGE_HEAD automation, so it has to hold the Setting's value
+// whether or not the user ever opens the Conflict Predictor.
+watch(
+  () => settings.value.resolution.minConfidenceScore,
+  (score) => { resolutionSelection.minScore.value = score; },
+  { immediate: true },
+);
 
 function onDiscardSection(sectionKey: string, paths: string[]) {
   discardSectionConfirm.value = { sectionKey, paths };
@@ -2540,7 +2766,7 @@ async function onRebaseBannerAutoResolve() {
       }
       // Resolve this step.
       await mergeOpenPath(cwd);
-      await resolveAll();
+      await resolveAll({ shouldApply: applyPredicateFor });
       await saveAllFiles();
       const resolved = mergeFiles.value
         .filter((f) => f.result.stats.totalConflicts === 0)
@@ -3502,7 +3728,7 @@ const scheduler = useScheduler({
   onLog: (msg) => pushErrorLog(msg),
   resolveConflicts: async () => {
     if (!repoFolderPath.value) return;
-    await resolveAll();
+    await resolveAll({ shouldApply: applyPredicateFor });
     await repoRefresh();
   },
   pullAndRebase: async () => {
@@ -3973,6 +4199,10 @@ onUnmounted(() => {
       @sync="doSync" @publish="doPublish" @rebase-onto-remote="doRebaseOntoRemote" @merge-remote="doMergeRemote"
       @force-push="doForcePush" @discard-all="handleWipDiscardAll"
       @merge-branch="doMerge" @open-settings="settingsInitialTab = undefined; showSettings = true"
+      :applying-from-preview="applyingFromPreview" :apply-outcome="applyOutcome"
+      @apply-from-preview="handleApplyFromPreview"
+      @dismiss-apply="applyOutcome = null"
+      @open-residual="handleOpenResidual"
 
       :error-count="logUnreadCount" :is-offline="isOffline" @switch-branch="handleSwitchBranch" @open-logs="openLogsTab"
       @change-view="onViewModeChange"
@@ -4024,6 +4254,8 @@ onUnmounted(() => {
             <RebaseProgressBanner v-if="showRebaseBanner && repoOperationState" :repo-state="repoOperationState"
               :cwd="repoFolderPath ?? ''" :auto-resolving="rebaseAutoResolving"
               @action-done="onRebaseBannerActionDone"
+              :pending-split="pendingSplitAtHalt !== null"
+              @split="onRebaseBannerSplit"
               @auto-resolve="onRebaseBannerAutoResolve" @error="(msg) => { repoError = msg; }" />
 
             <!-- Conflict banner (merge or cherry-pick) — suppressed during a
@@ -4087,7 +4319,9 @@ onUnmounted(() => {
                   @select-dir-file="(path) => repoSelectFile(path, false)"
                   @open-repo-tab="handleOpenNestedRepo"
                   @add-to-gitignore="addToGitignore"
-                  @dismiss-finding="(id) => commitReview.dismiss(id)" />
+                  @dismiss-finding="(id) => commitReview.dismiss(id)"
+                  :editable="!repoSelectedFileStaged && !isSelectedFileConflicted"
+                  @edit-hunk="handleEditHunk" />
               </div>
 
               <div v-if="showCommitRail" class="sidebar-handle" :class="{ 'sidebar-handle--active': sidebarResizing }"

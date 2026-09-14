@@ -1048,6 +1048,33 @@ export async function gitRebaseAction(
 }
 
 /**
+ * Rebase the current branch onto `onto`, non-interactively.
+ *
+ * v3.11 — apply-from-preview needs to actually run the operation the Conflict
+ * Predictor simulated. Returns `{ conflict }`, true when the rebase halted on
+ * a conflict, so the caller drives continue/skip/abort exactly as it does
+ * after `gitInteractiveRebase`.
+ */
+export async function gitRebaseOnto(
+  cwd: string,
+  onto: string,
+): Promise<{ conflict: boolean }> {
+  if (isTauri()) {
+    return tauriInvoke<{ conflict: boolean }>("git_rebase_onto", { cwd, onto });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-rebase-onto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, onto }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error ?? `git rebase onto ${onto} failed`);
+  }
+  return res.json();
+}
+
+/**
  * Start an interactive rebase with a caller-supplied todo list.
  * Returns `{ conflict }` — true when the rebase halted on a merge conflict.
  * Throws on a hard failure.
@@ -2580,18 +2607,19 @@ export async function previewMerge(
       sourceBranch,
     });
   }
-  // Dev mode: endpoint optionnel (pas critique pour le dev)
-  try {
-    const res = await devFetch(`${DEV_SERVER}/api/preview-merge`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd, sourceBranch }),
-    });
-    if (res.ok) return await res.json();
-  } catch {
-    // Pas de serveur dev → retourner un tableau vide
+  // Never swallow the failure into `[]`: an empty preview reads as "this merge
+  // is clean", which is the most misleading answer possible. `useMergePreview`
+  // already catches into `error.value`, so a real message reaches the user.
+  const res = await devFetch(`${DEV_SERVER}/api/preview-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, sourceBranch }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview merge of ${sourceBranch}`);
   }
-  return [];
+  return res.json();
 }
 
 // ─── Conflict Predictor — rebase & cherry-pick (v2.20.0) ────
@@ -2607,8 +2635,16 @@ export async function previewRebase(
   if (isTauri()) {
     return tauriInvoke<FileMergePreview[]>("preview_rebase", { cwd, onto });
   }
-  // Dev mode: pas d'endpoint mock → aperçu vide (stub-safe).
-  return [];
+  const res = await devFetch(`${DEV_SERVER}/api/preview-rebase`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, onto }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview rebase onto ${onto}`);
+  }
+  return res.json();
 }
 
 /**
@@ -2622,8 +2658,16 @@ export async function previewCherryPick(
   if (isTauri()) {
     return tauriInvoke<FileMergePreview[]>("preview_cherry_pick", { cwd, commit });
   }
-  // Dev mode: pas d'endpoint mock → aperçu vide (stub-safe).
-  return [];
+  const res = await devFetch(`${DEV_SERVER}/api/preview-cherry-pick`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, commit }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview cherry-pick of ${commit}`);
+  }
+  return res.json();
 }
 
 // ─── Scratch worktree (v2.20.0) ─────────────────────────────

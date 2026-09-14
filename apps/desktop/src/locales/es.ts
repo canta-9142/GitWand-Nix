@@ -331,6 +331,9 @@ const es: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Editar este hunk",
+    editBusy: "Termina primero el hunk que est\u00e1s editando",
+    editStale: "El archivo cambi\u00f3 desde que se calcul\u00f3 este diff. Actualiza e int\u00e9ntalo de nuevo.",
     newFolder: "Carpeta nueva",
     newFolderCount: "{0} archivo(s)",
     nestedRepo: "Repositorio Git anidado",
@@ -515,6 +518,20 @@ const es: Locale = {
 
   // ─── Merge Preview ──────────────────────────────────────
   mergePreview: {
+    applying: "Aplicando\u2026",
+    applyAndMerge: "Fusionar y auto-resolver",
+    applyEstimate: "Estimado: {0} de {1} hunks auto-resolubles",
+    applyDone: "Listo",
+    applyStopped: "Detenido en los conflictos que te necesitan",
+    applyLoopBound: "Detenido tras demasiados pasos de rebase",
+    applyFailed: "La operaci\u00f3n fall\u00f3",
+    applyCounts: "{0} aplicados, {1} por resolver",
+    applyDrift: "La vista previa estim\u00f3 {0}. La operaci\u00f3n real ve otra fusi\u00f3n, as\u00ed que pueden diferir.",
+    applyNoSnapshot: "No se captur\u00f3 ninguna instant\u00e1nea, no hay vuelta atr\u00e1s en un clic.",
+    hunkHeldBack: "retenido ({0} %)",
+    thresholdLabel: "Aplicar solo por encima de",
+    thresholdOff: "Ninguno",
+    thresholdSummary: "{0} auto-resolubles, {1} retenidos por el umbral, {2} manuales",
     aiRisk: "Evaluación de riesgo",
     aiRiskHint: "Pregunta a la IA si este merge parece seguro.",
     aiRiskAnalyzing: "Analizando riesgos…",
@@ -740,6 +757,7 @@ const es: Locale = {
     resolveAutoSummaryBody: "Se resolverán {0} conflicto(s) así:",
     resolveAutoSummaryConfirm: "Confirmar",
     resolveAutoSummaryCancel: "Cancelar",
+    resolveAutoSummaryToggle: "Aplicar el conflicto {0}",
     bulkLabel: "Aceptar todo:",
     bulkOurs: "Actual",
     bulkTheirs: "Entrante",
@@ -1070,6 +1088,13 @@ const es: Locale = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Confianza de resolucion",
+      subtitle: "Un umbral sobre la confianza por hunk del motor, aplicado dondequiera que GitWand resuelva.",
+      minConfidenceScore: "Aplicar solo por encima de",
+      minConfidenceScoreHint: "Las auto-resoluciones por debajo de este valor se proponen en lugar de aplicarse. Nunca deja pasar lo que el motor ya rechazo.",
+      barOff: "Ninguno",
+    },
     title: "Ajustes",
     tabGeneral: "General",
     tabDock: "Dock",
@@ -1880,6 +1905,7 @@ const es: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Editar el conflicto {0}",
     aiButton: "IA",
     aiLoading: "IA…",
     aiErrorPrefix: "IA",

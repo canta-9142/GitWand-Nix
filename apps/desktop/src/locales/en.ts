@@ -343,6 +343,9 @@ const en = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Edit this hunk",
+    editBusy: "Finish the hunk you are editing first",
+    editStale: "The file changed since this diff was computed. Refresh and try again.",
     newFolder: "New folder",
     newFolderCount: "{0} file(s)",
     nestedRepo: "Nested Git repository",
@@ -527,6 +530,20 @@ const en = {
 
   // ─── Merge Preview (Phase 8.1) ──────────────────────────
   mergePreview: {
+    applying: "Applying\u2026",
+    applyAndMerge: "Merge & auto-resolve",
+    applyEstimate: "Estimated {0} of {1} hunks auto-resolvable",
+    applyDone: "Done",
+    applyStopped: "Stopped on the conflicts that need you",
+    applyLoopBound: "Stopped after too many rebase steps",
+    applyFailed: "The operation failed",
+    applyCounts: "{0} applied, {1} left to resolve",
+    applyDrift: "The preview estimated {0}. The real operation sees a different merge, so the two can differ.",
+    applyNoSnapshot: "No snapshot was captured, so there is no one-click way back.",
+    hunkHeldBack: "held back ({0}%)",
+    thresholdLabel: "Apply only above",
+    thresholdOff: "Off",
+    thresholdSummary: "{0} auto-resolvable, {1} held back by the bar, {2} manual",
     aiRisk: "Risk assessment",
     aiRiskHint: "Ask the AI whether this merge looks safe.",
     aiRiskAnalyzing: "Analysing risks\u2026",
@@ -752,6 +769,7 @@ const en = {
     resolveAutoSummaryBody: "{0} conflict(s) will be resolved as follows:",
     resolveAutoSummaryConfirm: "Confirm",
     resolveAutoSummaryCancel: "Cancel",
+    resolveAutoSummaryToggle: "Apply conflict {0}",
     bulkLabel: "Accept all:",
     bulkOurs: "Current",
     bulkTheirs: "Incoming",
@@ -1086,6 +1104,13 @@ const en = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Resolution confidence",
+      subtitle: "A bar on the engine per-hunk confidence, applied everywhere GitWand resolves.",
+      minConfidenceScore: "Apply only above",
+      minConfidenceScoreHint: "Auto-resolutions scoring below this are proposed instead of applied. Never lets through what the engine already refused.",
+      barOff: "Off",
+    },
     title: "Settings",
     // Tab titles
     tabGeneral: "General",
@@ -1914,6 +1939,7 @@ const en = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Edit conflict {0}",
     aiButton: "AI",
     aiLoading: "AI\u2026",
     aiErrorPrefix: "AI",
