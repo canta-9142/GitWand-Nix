@@ -1110,6 +1110,14 @@ pub(crate) async fn gl_create_mr(
 /// merge from GitWand failed on this until fixed. Pulled out of
 /// `gl_merge_mr_inner` so the argument list can be pinned by a test, the same
 /// shape as `gl_state_flag` (issue #138).
+///
+/// Also passes `--auto-merge=false`: `glab mr merge --help` on the installed
+/// 1.117.0 binary states "When a pipeline is running, auto-merge is enabled
+/// by default. Pass `--auto-merge=false` to merge immediately", and lists
+/// `--auto-merge (true)`. This is the immediate-merge path, distinct from
+/// `gl_enable_auto_merge_args`'s schedule-merge path above, so without this
+/// flag a MR with a running pipeline would silently defer instead of merge,
+/// indistinguishable from scheduling it.
 fn gl_merge_args(iid: i64, method: &str) -> Vec<String> {
     let mut args: Vec<String> = vec!["mr".to_string(), "merge".to_string(), iid.to_string()];
 
@@ -1121,6 +1129,7 @@ fn gl_merge_args(iid: i64, method: &str) -> Vec<String> {
 
     args.push("--yes".to_string());
     args.push("--remove-source-branch".to_string());
+    args.push("--auto-merge=false".to_string());
     args
 }
 
@@ -2503,7 +2512,7 @@ mod gl_merge_args_tests {
     fn default_merge_uses_the_remove_source_branch_flag() {
         assert_eq!(
             gl_merge_args(7, "merge"),
-            vec!["mr", "merge", "7", "--yes", "--remove-source-branch"]
+            vec!["mr", "merge", "7", "--yes", "--remove-source-branch", "--auto-merge=false"]
         );
     }
 
@@ -2511,7 +2520,10 @@ mod gl_merge_args_tests {
     fn squash_adds_the_squash_flag_before_yes_and_remove_source_branch() {
         assert_eq!(
             gl_merge_args(7, "squash"),
-            vec!["mr", "merge", "7", "--squash", "--yes", "--remove-source-branch"]
+            vec![
+                "mr", "merge", "7", "--squash", "--yes", "--remove-source-branch",
+                "--auto-merge=false",
+            ]
         );
     }
 
@@ -2519,7 +2531,10 @@ mod gl_merge_args_tests {
     fn rebase_adds_the_rebase_flag_before_yes_and_remove_source_branch() {
         assert_eq!(
             gl_merge_args(7, "rebase"),
-            vec!["mr", "merge", "7", "--rebase", "--yes", "--remove-source-branch"]
+            vec![
+                "mr", "merge", "7", "--rebase", "--yes", "--remove-source-branch",
+                "--auto-merge=false",
+            ]
         );
     }
 
@@ -2527,7 +2542,7 @@ mod gl_merge_args_tests {
     fn an_unrecognised_method_falls_back_to_a_plain_merge() {
         assert_eq!(
             gl_merge_args(7, "bogus"),
-            vec!["mr", "merge", "7", "--yes", "--remove-source-branch"]
+            vec!["mr", "merge", "7", "--yes", "--remove-source-branch", "--auto-merge=false"]
         );
     }
 
@@ -2536,6 +2551,26 @@ mod gl_merge_args_tests {
         let args = gl_merge_args(7, "merge");
         assert!(!args.iter().any(|a| a == "--delete-source-branch"));
         assert!(args.iter().any(|a| a == "--remove-source-branch"));
+    }
+
+    /// `glab mr merge --help` on 1.117.0: "When a pipeline is running,
+    /// auto-merge is enabled by default. Pass `--auto-merge=false` to merge
+    /// immediately", flag list shows `--auto-merge (true)`. Without this
+    /// flag, "Merge" on a MR with a running pipeline silently defers instead
+    /// of merging, indistinguishable from "Schedule merge".
+    #[test]
+    fn passes_auto_merge_false_so_merge_is_immediate_even_with_a_running_pipeline() {
+        assert_eq!(
+            gl_merge_args(7, "merge"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--yes",
+                "--remove-source-branch",
+                "--auto-merge=false",
+            ]
+        );
     }
 }
 
