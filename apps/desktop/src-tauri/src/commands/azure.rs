@@ -1165,21 +1165,30 @@ fn rest_merge_pr(cwd: &str, number: i64, method: &str) -> Result<(), String> {
 
 /// Body for the PATCH that arms or clears Azure auto-complete.
 ///
-/// `Some(id)` arms with that identity, `None` clears it. The null is
-/// explicit rather than an omitted key: Azure treats an absent field as "do
-/// not change", so omitting it would leave auto-complete armed while the
-/// call reported success.
+/// `Some(id)` arms with that identity and its merge strategy. `None` clears
+/// it by sending ONLY an explicit null `autoCompleteSetBy`, no
+/// `completionOptions`: the null is explicit rather than an omitted key,
+/// since Azure treats an absent field as "do not change" and would leave
+/// auto-complete armed while the call reported success, but sending
+/// `completionOptions` alongside the null on a disarm silently rewrites the
+/// PR's merge strategy as a side effect of cancelling, which is not what
+/// cancelling should do.
 fn az_auto_complete_body(identity_id: Option<&str>, method: &str) -> serde_json::Value {
-    let strategy = match method {
-        "squash" => "squash",
-        "rebase" => "rebase",
-        "merge" => "noFastForward",
-        _ => "noFastForward",
-    };
-    serde_json::json!({
-        "autoCompleteSetBy": identity_id.map(|id| serde_json::json!({ "id": id })),
-        "completionOptions": { "mergeStrategy": strategy },
-    })
+    match identity_id {
+        Some(id) => {
+            let strategy = match method {
+                "squash" => "squash",
+                "rebase" => "rebase",
+                "merge" => "noFastForward",
+                _ => "noFastForward",
+            };
+            serde_json::json!({
+                "autoCompleteSetBy": { "id": id },
+                "completionOptions": { "mergeStrategy": strategy },
+            })
+        }
+        None => serde_json::json!({ "autoCompleteSetBy": null }),
+    }
 }
 
 /// Queue this PR to merge once its checks pass, by PATCHing it with the
@@ -2427,6 +2436,15 @@ mod az_auto_complete_body_tests {
              armed while the call reported success"
         );
         assert!(obj["autoCompleteSetBy"].is_null());
+    }
+
+    #[test]
+    fn disarming_never_sends_completion_options_alongside_the_null_identity() {
+        // completionOptions.mergeStrategy alongside a null identity silently
+        // rewrites the PR's merge strategy as a side effect of cancelling.
+        let b = az_auto_complete_body(None, "squash");
+        let obj = b.as_object().expect("body is a JSON object");
+        assert!(!obj.contains_key("completionOptions"));
     }
 
     #[test]

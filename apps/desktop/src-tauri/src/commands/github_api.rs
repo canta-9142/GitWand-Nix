@@ -349,8 +349,10 @@ fn rest_pr_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeSt
 }
 
 /// Same translation as `rest_pr_auto_merge_state`, for the repository-level
-/// setting: REST's `allow_auto_merge` is `gh repo view --json
-/// autoMergeAllowed`'s GraphQL name for the same boolean.
+/// setting: REST's `allow_auto_merge` is `autoMergeAllowed` on GitHub's
+/// GraphQL `Repository` type, reachable via `gh api graphql` (NOT `gh repo
+/// view --json autoMergeAllowed`, which `gh repo view` rejects with "Unknown
+/// JSON field").
 fn rest_repo_auto_merge_support(repo: &serde_json::Value) -> crate::types::AutoMergeSupport {
     crate::commands::gh::gh_auto_merge_support(&serde_json::json!({
         "autoMergeAllowed": repo.get("allow_auto_merge")

@@ -546,7 +546,10 @@ pub(crate) fn gh_pr_detail_raw_to_detail(r: GhPrDetailRaw) -> PullRequestDetail 
             "autoMergeRequest": r.auto_merge_request
         })),
         // Populated by the caller (gh_pr_detail_inner): needs a repo-level
-        // `autoMergeAllowed` lookup this per-PR JSON object doesn't carry.
+        // `autoMergeAllowed` lookup this per-PR JSON object doesn't carry —
+        // GitHub's GraphQL `Repository` type, reachable via `gh api
+        // graphql`, not `gh repo view --json autoMergeAllowed` (`gh repo
+        // view` rejects that field with "Unknown JSON field").
         auto_merge_support: Default::default(),
     }
 }

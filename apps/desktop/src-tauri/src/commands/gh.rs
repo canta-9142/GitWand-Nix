@@ -1264,9 +1264,11 @@ fn gh_viewer_can_merge_and_auto_merge_support(
         return (None, fail_closed());
     };
     let can_merge = v.get("permissions").and_then(|p| p.get("push")).and_then(|b| b.as_bool());
-    // REST's `allow_auto_merge` is the same repository setting `gh repo view
-    // --json autoMergeAllowed` exposes under its GraphQL name; translate it
-    // into the shape `gh_auto_merge_support` already expects and is tested
+    // REST's `allow_auto_merge` is the same repository setting exposed as
+    // `autoMergeAllowed` on GitHub's GraphQL `Repository` type, reachable via
+    // `gh api graphql` (NOT `gh repo view --json autoMergeAllowed`, which
+    // `gh repo view` rejects with "Unknown JSON field"); translate it into
+    // the shape `gh_auto_merge_support` already expects and is tested
     // against, rather than teaching that function a second field name.
     let support = gh_auto_merge_support(&serde_json::json!({
         "autoMergeAllowed": v.get("allow_auto_merge")
@@ -2007,7 +2009,10 @@ pub(crate) fn gh_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoM
     }
 }
 
-/// Repository-level capability from `gh repo view --json autoMergeAllowed`.
+/// Repository-level capability from `autoMergeAllowed` on GitHub's GraphQL
+/// `Repository` type, reachable via `gh api graphql` (NOT `gh repo view
+/// --json autoMergeAllowed`, which `gh repo view` rejects with "Unknown JSON
+/// field").
 ///
 /// Fails closed: a missing or non-boolean field reads as unsupported. An
 /// older `gh`, or a shape we did not anticipate, must hide the button rather

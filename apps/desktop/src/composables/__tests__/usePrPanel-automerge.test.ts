@@ -93,6 +93,22 @@ describe("computeAutoMergeOffer", () => {
   it("offers nothing when readiness is still unknown", () => {
     expect(computeAutoMergeOffer(supported, open, null)).toEqual({ kind: "none" });
   });
+
+  it("explains instead of offering when the viewer cannot merge (canMerge === false)", () => {
+    expect(
+      computeAutoMergeOffer(supported, open, { ready: false, reason: "" }, false),
+    ).toEqual({ kind: "explain", reason: "" });
+  });
+
+  it("still offers arming when canMerge is unknown (null/undefined, not strictly false)", () => {
+    // GitLab, Azure and Bitbucket never populate canMerge, and a failed gh
+    // permission lookup also leaves it null/undefined — none of that means
+    // "no permission", so the button must not disappear on its own.
+    expect(computeAutoMergeOffer(supported, open, { ready: false, reason: "" }, null))
+      .toEqual({ kind: "arm" });
+    expect(computeAutoMergeOffer(supported, open, { ready: false, reason: "" }, undefined))
+      .toEqual({ kind: "arm" });
+  });
 });
 
 const fakePr = { number: 42, title: "Sample PR", author: "octocat", branch: "feature/x", base: "main" } as any;

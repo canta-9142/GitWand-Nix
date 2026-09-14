@@ -99,6 +99,11 @@ export type AutoMergeOffer =
  * may merge immediately. Hiding the button there deletes the whole class of
  * problem, and costs nothing, since the immediate merge sits next to it.
  *
+ * `canMerge` is gated strictly against `false`: it must never be a loose
+ * falsy check, since `null`/`undefined` (what GitLab, Azure and Bitbucket
+ * produce, and what any failed `gh` permission lookup also produces) means
+ * "unknown", not "no permission", and must not remove the button on its own.
+ *
  * Exported as a free function (same precedent as `isMergeConflict` above) so
  * it is unit-testable without instantiating the whole composable.
  */
@@ -106,8 +111,10 @@ export function computeAutoMergeOffer(
   support: AutoMergeSupport,
   state: AutoMergeState,
   readiness: { ready: boolean; reason: string } | null,
+  canMerge?: boolean | null,
 ): AutoMergeOffer {
   if (state.armed) return { kind: "disarm" };
+  if (canMerge === false) return { kind: "explain", reason: "" };
   if (!support.supported) return { kind: "explain", reason: support.reason ?? "" };
   if (!state.available) return { kind: "explain", reason: state.reason ?? "" };
   if (readiness === null) return { kind: "none" };
@@ -479,6 +486,7 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
       prDetail.value?.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
       prDetail.value?.autoMerge ?? CLOSED_AUTO_MERGE,
       mergeReadiness.value,
+      prDetail.value?.canMerge,
     ),
   );
 
