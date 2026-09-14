@@ -1163,13 +1163,10 @@ pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result
 /// Unlike `gh_enable_auto_merge_inner`, there is no token/REST path: like
 /// `gl_merge_mr_inner` above, this is `glab`-only.
 ///
-/// Deliberately uses `--remove-source-branch`, not the `--delete-source-branch`
-/// that `gl_merge_mr_inner` passes above: verified against the installed
-/// `glab` that `--delete-source-branch` is not a recognised flag at all (it
-/// errors "Unknown flag" before even reaching remote resolution), so mirroring
-/// it here would make this command permanently non-functional. This looks
-/// like a pre-existing bug in `gl_merge_mr_inner`, unrelated to this task and
-/// out of scope to fix here, flagged for a follow-up instead.
+/// Uses `--remove-source-branch`, the same flag `gl_merge_mr_inner` now
+/// builds via `gl_merge_args`: `--delete-source-branch` is not a recognised
+/// `glab` flag at all, verified against the installed `glab` 1.117.0, which
+/// rejects it with "Unknown flag" before even reaching remote resolution.
 fn gl_enable_auto_merge_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
     let mut args: Vec<String> = vec![
         "mr".to_string(),

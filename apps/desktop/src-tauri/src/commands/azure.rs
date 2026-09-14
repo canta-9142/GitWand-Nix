@@ -2419,7 +2419,14 @@ mod az_auto_complete_body_tests {
         // Azure clears auto-complete by nulling the identity. Omitting the
         // key would leave it armed, which is the silent failure to avoid.
         let b = az_auto_complete_body(None, "merge");
-        assert!(b["autoCompleteSetBy"].is_null());
+        let obj = b.as_object().expect("body is a JSON object");
+        assert!(
+            obj.contains_key("autoCompleteSetBy"),
+            "the key must be PRESENT with a null value: Azure reads an absent \
+             field as 'do not change', so omitting it would leave auto-complete \
+             armed while the call reported success"
+        );
+        assert!(obj["autoCompleteSetBy"].is_null());
     }
 
     #[test]
