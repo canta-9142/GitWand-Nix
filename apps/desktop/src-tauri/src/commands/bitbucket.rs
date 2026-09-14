@@ -1438,3 +1438,32 @@ mod bb_list_issues_tests {
         assert_eq!(i.milestone, "");
     }
 }
+
+/// Bitbucket has no forge-side auto-merge. Static, and stated rather than
+/// inferred from an absent field, so the UI can explain instead of hiding.
+#[allow(dead_code)] // wired into bb_pr_to_pr/bb_pr_to_detail by Task 3
+pub(crate) fn bb_auto_merge_support() -> crate::types::AutoMergeSupport {
+    crate::types::AutoMergeSupport {
+        supported: false,
+        reason: Some(
+            "Bitbucket has no merge-when-checks-pass equivalent. Merging immediately still works."
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod bb_auto_merge_tests {
+    use super::bb_auto_merge_support;
+
+    #[test]
+    fn bitbucket_is_unsupported_and_says_what_still_works() {
+        let s = bb_auto_merge_support();
+        assert!(!s.supported);
+        let reason = s.reason.expect("a reason, not a silent false");
+        assert!(
+            reason.contains("Merging immediately still works"),
+            "the message must say what DOES work, per the forgeUnsupported precedent"
+        );
+    }
+}

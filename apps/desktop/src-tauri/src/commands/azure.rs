@@ -2224,3 +2224,66 @@ mod tests {
         assert!(form_config(&[("code", "AQABbase64url-_token")]).is_ok());
     }
 }
+
+/// Per-PR auto-complete state from an Azure DevOps pull-request object.
+///
+/// `autoCompleteSetBy` carries the identity that armed it, so its presence
+/// is the armed flag. Azure refuses auto-complete on a draft.
+#[allow(dead_code)] // wired into json_to_pr/json_to_detail by Task 3
+fn az_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeState {
+    let is_draft = pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+    crate::types::AutoMergeState {
+        armed: pr.get("autoCompleteSetBy").is_some_and(|v| !v.is_null()),
+        available: !is_draft,
+        reason: if is_draft {
+            Some("A draft pull request cannot be set to auto-complete.".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+#[cfg(test)]
+mod az_auto_merge_tests {
+    use super::az_auto_merge_state;
+
+    #[test]
+    fn a_pr_with_auto_complete_set_is_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"pullRequestId": 4, "isDraft": false,
+                "autoCompleteSetBy": {"id": "11111111-2222-3333-4444-555555555555"}}"#,
+        )
+        .unwrap();
+        let s = az_auto_merge_state(&v);
+        assert!(s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn a_draft_pr_is_unavailable_with_a_reason() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"pullRequestId": 4, "isDraft": true}"#).unwrap();
+        let s = az_auto_merge_state(&v);
+        assert!(!s.available);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("A draft pull request cannot be set to auto-complete.")
+        );
+    }
+
+    #[test]
+    fn a_non_draft_pr_without_auto_complete_is_available_but_not_armed() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"pullRequestId": 4, "isDraft": false}"#).unwrap();
+        let s = az_auto_merge_state(&v);
+        assert!(!s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn a_missing_is_draft_field_reads_as_not_draft() {
+        // Azure omits `isDraft` on some API versions rather than sending false.
+        let v: serde_json::Value = serde_json::from_str(r#"{"pullRequestId": 4}"#).unwrap();
+        assert!(az_auto_merge_state(&v).available);
+    }
+}

@@ -2176,3 +2176,91 @@ mod gl_mr_diff_args_tests {
         assert_eq!(gl_mr_diff_args(42), vec!["mr", "diff", "42", "--raw"]);
     }
 }
+
+/// Per-MR auto-merge state from a GitLab merge-request JSON object.
+///
+/// Two spellings of the same flag: `merge_when_pipeline_succeeds` is the
+/// historical name, `auto_merge_enabled` the 17.x one. Either arms.
+///
+/// The precondition is a pipeline: merge-when-pipeline-succeeds has nothing
+/// to wait for without one, and GitLab refuses the call.
+#[allow(dead_code)] // wired into gl_mr_to_pr/gl_mr_to_detail by Task 3
+fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
+    let armed = mr
+        .get("merge_when_pipeline_succeeds")
+        .and_then(|v| v.as_bool())
+        .or_else(|| mr.get("auto_merge_enabled").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let has_pipeline = mr.get("pipeline").is_some_and(|v| !v.is_null())
+        || mr.get("head_pipeline").is_some_and(|v| !v.is_null());
+    crate::types::AutoMergeState {
+        armed,
+        available: has_pipeline,
+        reason: if has_pipeline {
+            None
+        } else {
+            Some("No pipeline is running for this merge request.".to_string())
+        },
+    }
+}
+
+#[cfg(test)]
+mod gl_auto_merge_tests {
+    use super::gl_auto_merge_state;
+
+    #[test]
+    fn an_mr_with_merge_when_pipeline_succeeds_is_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": true,
+                "pipeline": {"id": 9, "status": "running"}}"#,
+        )
+        .unwrap();
+        let s = gl_auto_merge_state(&v);
+        assert!(s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn an_mr_with_a_running_pipeline_is_available_but_not_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": false,
+                "pipeline": {"id": 9, "status": "running"}}"#,
+        )
+        .unwrap();
+        let s = gl_auto_merge_state(&v);
+        assert!(!s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn an_mr_with_no_pipeline_is_unavailable_with_a_reason() {
+        // GitLab's merge-when-pipeline-succeeds needs a pipeline to succeed.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"iid": 3, "merge_when_pipeline_succeeds": false}"#).unwrap();
+        let s = gl_auto_merge_state(&v);
+        assert!(!s.available);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("No pipeline is running for this merge request.")
+        );
+    }
+
+    #[test]
+    fn a_null_pipeline_reads_the_same_as_an_absent_one() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": false, "pipeline": null}"#,
+        )
+        .unwrap();
+        assert!(!gl_auto_merge_state(&v).available);
+    }
+
+    #[test]
+    fn the_newer_auto_merge_enabled_field_is_honoured_when_present() {
+        // GitLab 17.x renamed the flag. Both spellings must arm.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "auto_merge_enabled": true, "pipeline": {"status": "running"}}"#,
+        )
+        .unwrap();
+        assert!(gl_auto_merge_state(&v).armed);
+    }
+}
