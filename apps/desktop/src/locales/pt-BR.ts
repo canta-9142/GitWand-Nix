@@ -1797,6 +1797,10 @@ const ptBR: Locale = {
         title: "Mesclar esta pull request?",
         body: "{0} será mesclada em {1}.",
       },
+      autoMerge: {
+        title: "Agendar o merge desta pull request?",
+        body: "{0} será mesclada em {1} assim que as verificações passarem.",
+      },
       nudge: {
         title: "Enviar um lembrete?",
         body: "Um comentário será publicado em {0}.",
@@ -1807,6 +1811,7 @@ const ptBR: Locale = {
     },
     toast: {
       merged: "Pull request mesclada.",
+      autoMergeArmed: "Merge agendado.",
       nudged: "Lembrete enviado.",
     },
     noWorkspace: {

@@ -1808,6 +1808,10 @@ const zhCN: Locale = {
         title: "合并此拉取请求？",
         body: "{0} 将被合并到 {1}。",
       },
+      autoMerge: {
+        title: "计划合并此拉取请求？",
+        body: "检查通过后，{0} 将被合并到 {1}。",
+      },
       nudge: {
         title: "发送提醒？",
         body: "将在 {0} 上发布一条评论。",
@@ -1818,6 +1822,7 @@ const zhCN: Locale = {
     },
     toast: {
       merged: "拉取请求已合并。",
+      autoMergeArmed: "合并已计划。",
       nudged: "提醒已发送。",
     },
     noWorkspace: {

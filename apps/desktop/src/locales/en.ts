@@ -1830,6 +1830,10 @@ const en = {
         title: "Merge this pull request?",
         body: "{0} will be merged into {1}.",
       },
+      autoMerge: {
+        title: "Schedule this pull request to merge?",
+        body: "{0} will be merged into {1} once checks pass.",
+      },
       nudge: {
         title: "Send a reminder?",
         body: "A comment will be posted on {0}.",
@@ -1840,6 +1844,7 @@ const en = {
     },
     toast: {
       merged: "Pull request merged.",
+      autoMergeArmed: "Merge scheduled.",
       nudged: "Reminder posted.",
     },
     noWorkspace: {

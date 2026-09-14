@@ -2969,6 +2969,44 @@ async function openLaunchpadMergePr(pr: PullRequest & { repoPath?: string }) {
 }
 
 /**
+ * Arm forge-side auto-merge on a PR straight from its Launchpad inbox card
+ * (v3.11.0, Task 10). Same repo-switch + confirm dance as
+ * `openLaunchpadMergePr`, but calls `prPanel.armAutoMerge()` instead of
+ * `prPanel.mergePr()`, that composable method is the single caller of
+ * `forge.value.enableAutoMerge`, so this handler never talks to a per-forge
+ * wrapper directly and never branches on forge name.
+ *
+ * No `mergeBlocked` gate here: unlike an immediate merge, arming auto-merge
+ * is exactly what a PR that ISN'T mergeable yet needs. `armAutoMerge` never
+ * throws, it catches its own errors (including `ForgeNotImplementedError`
+ * from a forge with no auto-merge API, e.g. Bitbucket/Cursor) and leaves
+ * them on `prPanel.error`, which is checked below the same way
+ * `openLaunchpadMergePr` checks it on failure. The classifier should never
+ * offer `auto-merge` for those forges (their descriptor reports
+ * `available: false`), so this is a safety net, not the expected path.
+ */
+async function openLaunchpadAutoMergePr(pr: PullRequest & { repoPath?: string }) {
+  if (pr.repoPath && pr.repoPath !== repoFolderPath.value) {
+    await handleOpenPath(pr.repoPath);
+    await nextTick();
+  }
+  await prPanel.loadRemote();
+  await prPanel.selectPr(pr);
+  const confirmed = await askConfirm({
+    title: t("launchpad.confirm.autoMerge.title"),
+    message: t("launchpad.confirm.autoMerge.body", pr.title, pr.base),
+  });
+  if (!confirmed) return;
+  prPanel.mergeMethod.value = "merge";
+  await prPanel.armAutoMerge();
+  if (prPanel.error.value) {
+    repoError.value = prPanel.error.value;
+  } else {
+    showLaunchpadToast(t("launchpad.toast.autoMergeArmed"));
+  }
+}
+
+/**
  * Nudge state for the Launchpad "post a reminder comment" flow (v3.10, Phase
  * G). GitHub-only for this release (decision #6): `ghIssueAddComment` posts a
  * plain top-level comment on the PR's issue thread, which is what a reminder
@@ -4457,7 +4495,7 @@ onUnmounted(() => {
             <IssueDetailView v-else-if="viewMode === 'issue'" />
 
             <!-- Launchpad view: cross-repo dashboard (v2.10 nav revamp) -->
-            <LaunchpadView v-else-if="viewMode === 'launchpad'" :repos="launchpadRepos" @open-pr="openLaunchpadPr" @open-issue="openLaunchpadIssue" @open-repo-changes="openLaunchpadRepoChanges" @merge-pr="openLaunchpadMergePr" @nudge-pr="openLaunchpadNudgePr" @resolve-pr="openLaunchpadResolvePr" />
+            <LaunchpadView v-else-if="viewMode === 'launchpad'" :repos="launchpadRepos" @open-pr="openLaunchpadPr" @open-issue="openLaunchpadIssue" @open-repo-changes="openLaunchpadRepoChanges" @merge-pr="openLaunchpadMergePr" @auto-merge-pr="openLaunchpadAutoMergePr" @nudge-pr="openLaunchpadNudgePr" @resolve-pr="openLaunchpadResolvePr" />
           </template>
         </template>
       </main>

@@ -1806,6 +1806,10 @@ const fr: Locale = {
         title: "Merger cette pull request ?",
         body: "{0} sera mergée dans {1}.",
       },
+      autoMerge: {
+        title: "Planifier la fusion de cette pull request ?",
+        body: "{0} sera fusionnée dans {1} une fois les vérifications réussies.",
+      },
       nudge: {
         title: "Envoyer une relance ?",
         body: "Un commentaire sera posté sur {0}.",
@@ -1816,6 +1820,7 @@ const fr: Locale = {
     },
     toast: {
       merged: "Pull request mergée.",
+      autoMergeArmed: "Fusion planifiée.",
       nudged: "Relance envoyée.",
     },
     noWorkspace: {

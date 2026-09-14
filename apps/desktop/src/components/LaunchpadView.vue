@@ -32,6 +32,8 @@ const emit = defineEmits<{
   (e: "open-repo-changes", repoPath: string): void;
   /** Merge a PR straight from its inbox card — handled by App.vue. */
   (e: "merge-pr", pr: PrWithRepo): void;
+  /** Arm forge-side auto-merge on a PR straight from its inbox card, handled by App.vue. */
+  (e: "auto-merge-pr", pr: PrWithRepo): void;
   /** Post a reminder comment on a PR that has been waiting for review — handled by App.vue. */
   (e: "nudge-pr", pr: PrWithRepo): void;
   /** Open the conflict resolver on the PR's repo and branch — handled by App.vue. */
@@ -98,6 +100,9 @@ function runInboxAction(item: InboxItem): void {
   switch (item.classification.action) {
     case "merge":
       emit("merge-pr", pr);
+      return;
+    case "auto-merge":
+      emit("auto-merge-pr", pr);
       return;
     case "nudge":
       emit("nudge-pr", pr);

@@ -126,6 +126,7 @@ interface MountResult {
     mergePr: unknown[];
     nudgePr: unknown[];
     resolvePr: unknown[];
+    autoMergePr: unknown[];
   };
 }
 
@@ -140,6 +141,7 @@ function mountLaunchpad(repos: { path: string; name: string }[] = []): MountResu
     mergePr: [] as unknown[],
     nudgePr: [] as unknown[],
     resolvePr: [] as unknown[],
+    autoMergePr: [] as unknown[],
   };
 
   const app = createApp(LaunchpadView, {
@@ -161,6 +163,9 @@ function mountLaunchpad(repos: { path: string; name: string }[] = []): MountResu
     },
     onResolvePr: (pr: unknown) => {
       emitted.resolvePr.push(pr);
+    },
+    onAutoMergePr: (pr: unknown) => {
+      emitted.autoMergePr.push(pr);
     },
   });
   app.mount(container);
@@ -657,6 +662,24 @@ describe("LaunchpadView — mutating action routing (Phase G)", () => {
 
     expect(mounted.emitted.mergePr).toHaveLength(1);
     expect((mounted.emitted.mergePr[0] as { number: number }).number).toBe(77);
+
+    unmount(mounted);
+  });
+
+  it("routes 'auto-merge' action to auto-merge-pr", async () => {
+    settingsRef.value.launchpadActiveTab = "inbox";
+    sectionsRef.value = sectionWithAction("auto-merge");
+    inboxTotalRef.value = 1;
+
+    const mounted = mountLaunchpad();
+    await nextTick();
+
+    mounted.container.querySelector<HTMLButtonElement>(".launchpad-view__pr-action")!.click();
+    await nextTick();
+
+    expect(mounted.emitted.autoMergePr).toHaveLength(1);
+    expect((mounted.emitted.autoMergePr[0] as { number: number }).number).toBe(77);
+    expect(mounted.emitted.openPr).toHaveLength(0);
 
     unmount(mounted);
   });
