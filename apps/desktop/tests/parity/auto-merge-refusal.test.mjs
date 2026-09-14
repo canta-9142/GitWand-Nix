@@ -66,6 +66,11 @@ describe("parity: auto-merge refusal", () => {
 
     expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
     expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
+    // Pin the actual reason, not just cross-side agreement: if both sides
+    // failed for some unrelated cause (e.g. `gh` missing entirely), they'd
+    // still agree with each other while never having exercised the missing
+    // remote this test is named for.
+    expect(normalizeForgeError(rust.error)).toBe("no-remote");
     expect(normalizeForgeError(node.error)).toBe(normalizeForgeError(rust.error));
   });
 
@@ -82,6 +87,7 @@ describe("parity: auto-merge refusal", () => {
 
     expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
     expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(normalizeForgeError(rust.error)).toBe("no-remote");
     expect(normalizeForgeError(node.error)).toBe(normalizeForgeError(rust.error));
   });
 });

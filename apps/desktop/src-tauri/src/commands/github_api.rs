@@ -1494,6 +1494,21 @@ pub(crate) fn rest_pr_ready(cwd: &str, number: i64, token: &str) -> Result<(), S
 /// `rest_pr_ready` resolves it above: fetch the PR through the existing REST
 /// path (origin or upstream), read its `node_id`, and error out explicitly if
 /// it is missing rather than sending an empty id to GraphQL.
+///
+/// Known limitation, not fixed here: `gh_enable_auto_merge_inner`'s CLI path
+/// passes `--delete-branch` when arming. `enablePullRequestAutoMerge` has no
+/// branch-deletion parameter, so this mutation cannot request one; a token
+/// user and a `gh`-CLI user may see different branch cleanup after the same
+/// button. There is nothing to delete yet at the time this command runs
+/// either way (the merge itself hasn't happened), so a best-effort delete
+/// here would be premature, not just missing.
+///
+/// Also unverified, and not something this comment can settle: whether
+/// `gh pr merge --auto --delete-branch` actually deletes the branch once the
+/// deferred merge later fires, or whether `gh` only honours `--delete-branch`
+/// on an immediate merge. If it turns out `gh` doesn't honour it either, the
+/// two paths don't actually diverge and this note is the record of why we
+/// checked. Manual verification against a real armed PR should confirm this.
 pub(crate) fn rest_enable_auto_merge(
     cwd: &str,
     number: i64,
