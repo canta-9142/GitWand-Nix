@@ -10,7 +10,7 @@ _Ordered by priority, last verified 2026-09-14 (v3.11.0 in progress: the resolut
 
 | Version | Codename | Why now |
 |---------|----------|---------|
-| **v3.11.0** | Merge preview-to-apply | Close the resolution loop — apply straight from preview, editable diff. Resolution-loop half done (PR #194), 3 lots left before the tag |
+| **v3.11.0** | Merge preview-to-apply | Close the resolution loop: apply straight from preview, editable diff. Resolution-loop half done (PR #194), 3 lots left before the tag |
 | **v3.12.0** | Stacked Branches | Native stacked PRs, sequenced after v3.11 (leans on preview→apply) |
 | **v3.13.0** | Combined Diffs | Multi-commit, non-contiguous aggregated diff |
 | **v3.14.0** | Voice Input | Experimental — local dictation via embedded Whisper |
