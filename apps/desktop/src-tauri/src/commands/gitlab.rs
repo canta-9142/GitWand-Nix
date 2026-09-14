@@ -1098,21 +1098,35 @@ pub(crate) async fn gl_create_mr(
     .map_err(|e| e.to_string())?
 }
 
-/// Merge a MR using `glab mr merge`.
+/// Build the `glab mr merge` argument vector for `gl_merge_mr_inner`.
 ///
 /// `method` accepts "merge" (default), "squash", "rebase".
-#[tauri::command]
-fn gl_merge_mr_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+///
+/// Uses `--remove-source-branch`, not `--delete-source-branch`: the latter is
+/// not a recognised `glab` flag at all (verified against the installed
+/// `glab` 1.117.0: `glab mr merge --delete-source-branch 1` fails with
+/// "ERROR Unknown flag: --delete-source-branch." before doing anything, while
+/// `glab mr merge --help` lists `-d, --remove-source-branch`). Every GitLab
+/// merge from GitWand failed on this until fixed. Pulled out of
+/// `gl_merge_mr_inner` so the argument list can be pinned by a test, the same
+/// shape as `gl_state_flag` (issue #138).
+fn gl_merge_args(iid: i64, method: &str) -> Vec<String> {
     let mut args: Vec<String> = vec!["mr".to_string(), "merge".to_string(), iid.to_string()];
 
-    match method.as_str() {
+    match method {
         "squash" => args.push("--squash".to_string()),
         "rebase" => args.push("--rebase".to_string()),
         _ => {} // default merge
     }
 
     args.push("--yes".to_string());
-    args.push("--delete-source-branch".to_string());
+    args.push("--remove-source-branch".to_string());
+    args
+}
+
+#[tauri::command]
+fn gl_merge_mr_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    let args = gl_merge_args(iid, &method);
 
     let mut cmd = hidden_cmd("glab");
     cmd.args(&args).current_dir(&cwd);
@@ -2457,5 +2471,55 @@ mod gl_auto_merge_tests {
             gl_auto_merge_state_from_list(&not_armed_input).armed
         );
         assert!(!gl_auto_merge_state_from_list(&not_armed_input).armed);
+    }
+}
+
+/// Regression coverage for `gl_merge_args`: `glab mr merge` has no
+/// `--delete-source-branch` flag at all. `glab` rejects it outright with
+/// "Unknown flag: --delete-source-branch." before doing anything, so every
+/// GitLab merge from GitWand failed until this was caught. The correct flag
+/// is `--remove-source-branch` (`glab mr merge --help`'s `-d,
+/// --remove-source-branch  Remove source branch on merge.`).
+#[cfg(test)]
+mod gl_merge_args_tests {
+    use super::gl_merge_args;
+
+    #[test]
+    fn default_merge_uses_the_remove_source_branch_flag() {
+        assert_eq!(
+            gl_merge_args(7, "merge"),
+            vec!["mr", "merge", "7", "--yes", "--remove-source-branch"]
+        );
+    }
+
+    #[test]
+    fn squash_adds_the_squash_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_merge_args(7, "squash"),
+            vec!["mr", "merge", "7", "--squash", "--yes", "--remove-source-branch"]
+        );
+    }
+
+    #[test]
+    fn rebase_adds_the_rebase_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_merge_args(7, "rebase"),
+            vec!["mr", "merge", "7", "--rebase", "--yes", "--remove-source-branch"]
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_method_falls_back_to_a_plain_merge() {
+        assert_eq!(
+            gl_merge_args(7, "bogus"),
+            vec!["mr", "merge", "7", "--yes", "--remove-source-branch"]
+        );
+    }
+
+    #[test]
+    fn never_emits_the_delete_source_branch_flag_glab_rejects_outright() {
+        let args = gl_merge_args(7, "merge");
+        assert!(!args.iter().any(|a| a == "--delete-source-branch"));
+        assert!(args.iter().any(|a| a == "--remove-source-branch"));
     }
 }
