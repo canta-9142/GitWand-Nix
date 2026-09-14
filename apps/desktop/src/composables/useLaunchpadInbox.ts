@@ -126,7 +126,11 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
     // (Bitbucket) reports `available: false`, and that PR keeps the older
     // honest immediate merge: the button opens the merge dialog like
     // always, which still correctly refuses while `openLaunchpadMergePr`'s
-    // `mergeBlocked` guard is true.
+    // `mergeBlocked` guard is true. GitLab is excluded for a different
+    // reason: it DOES support auto-merge, and the PR detail panel offers it
+    // there, but its list payload lacks the pipeline status needed to know
+    // whether arming makes sense, so `available` is false here specifically
+    // (not absent capability, an unknowable precondition from a list).
     if (pr.autoMerge.available && !pr.autoMerge.armed) {
       return { tier: "later", case: "merge", action: "auto-merge", kind: "dep" };
     }
