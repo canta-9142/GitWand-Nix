@@ -327,22 +327,6 @@ pub fn gl_disable_auto_merge_parity(cwd: String, iid: i64) -> Result<(), String>
     tauri::async_runtime::block_on(commands::gitlab::gl_disable_auto_merge(cwd, iid))
 }
 
-/// Parity entry point for `az_enable_auto_merge`. Only a repo with no forge
-/// remote is checkable here (see the refusal test in `tests/parity/`): no
-/// test arms auto-complete on a live PR.
-pub fn az_enable_auto_merge_parity(cwd: String, number: i64, method: String) -> Result<(), String> {
-    tauri::async_runtime::block_on(commands::azure::az_enable_auto_merge(
-        cwd,
-        number,
-        Some(method),
-    ))
-}
-
-/// Parity entry point for `az_disable_auto_merge`.
-pub fn az_disable_auto_merge_parity(cwd: String, number: i64) -> Result<(), String> {
-    tauri::async_runtime::block_on(commands::azure::az_disable_auto_merge(cwd, number))
-}
-
 pub fn snapshot_list_parity(cwd: String) -> Result<Vec<git::snapshot::SnapshotMeta>, String> {
     tauri::async_runtime::block_on(commands::snapshots::snapshot_list(cwd))
 }

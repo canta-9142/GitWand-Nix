@@ -33,9 +33,9 @@
 // proc-macro de Tauri génère une aide `__cmd__<name>` qui entre en conflit si
 // la fn elle-même est `pub`. Voir le bloc "Parity probe re-exports" dans lib.rs.
 use gitwand_desktop_lib::{
-    az_disable_auto_merge_parity, az_enable_auto_merge_parity, gh_disable_auto_merge_parity,
-    gh_enable_auto_merge_parity, git_blame_parity, git_branches_parity,
-    git_commit_submodule_changes_parity, git_diff_parity, git_log_parity, git_rebase_onto_parity,
+    gh_disable_auto_merge_parity, gh_enable_auto_merge_parity, git_blame_parity,
+    git_branches_parity, git_commit_submodule_changes_parity, git_diff_parity, git_log_parity,
+    git_rebase_onto_parity,
     git_remote_info_parity, git_stash_list_parity, git_status_libgit2_parity, git_status_parity,
     git_submodule_branches_parity, gl_disable_auto_merge_parity, gl_enable_auto_merge_parity,
     preview_cherry_pick_parity, preview_merge_parity, preview_rebase_parity, read_file_parity,
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: parity-probe <command>");
-        eprintln!("commands: git-status, git-status-fast, git-log, git-branches, git-diff, git-blame, read-file, git-stash-list, git-submodule-branches, git-commit-submodule-changes, scan-secrets, gh-enable-auto-merge, gh-disable-auto-merge, gl-enable-auto-merge, gl-disable-auto-merge, az-enable-auto-merge, az-disable-auto-merge");
+        eprintln!("commands: git-status, git-status-fast, git-log, git-branches, git-diff, git-blame, read-file, git-stash-list, git-submodule-branches, git-commit-submodule-changes, scan-secrets, gh-enable-auto-merge, gh-disable-auto-merge, gl-enable-auto-merge, gl-disable-auto-merge");
         return ExitCode::from(2);
     }
 
@@ -368,33 +368,6 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             to_json(gl_disable_auto_merge_parity(cwd, iid))
-        }
-        "az-enable-auto-merge" => {
-            let cwd = match must_str("cwd") {
-                Ok(v) => v,
-                Err(code) => return code,
-            };
-            let number = match must_i64("number") {
-                Ok(v) => v,
-                Err(code) => return code,
-            };
-            let method = input
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("merge")
-                .to_string();
-            to_json(az_enable_auto_merge_parity(cwd, number, method))
-        }
-        "az-disable-auto-merge" => {
-            let cwd = match must_str("cwd") {
-                Ok(v) => v,
-                Err(code) => return code,
-            };
-            let number = match must_i64("number") {
-                Ok(v) => v,
-                Err(code) => return code,
-            };
-            to_json(az_disable_auto_merge_parity(cwd, number))
         }
         other => {
             eprintln!("unknown command: {}", other);
