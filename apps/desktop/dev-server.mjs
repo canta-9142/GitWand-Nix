@@ -5307,6 +5307,48 @@ async function handleRequest(req, res) {
       }
     }
 
+    // POST /api/gh-enable-auto-merge  { cwd, number, method }
+    if (url.pathname === "/api/gh-enable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, number, method } = await readBody(req);
+        if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const mergeFlag = method === "squash" ? "--squash"
+          : method === "rebase" ? "--rebase"
+          : "--merge";
+        const r = spawnSync(
+          GH,
+          ["pr", "merge", String(number), "--auto", mergeFlag, "--delete-branch"],
+          { cwd: resolve(cwd), encoding: "utf-8" },
+        );
+        if (r.status !== 0) {
+          const detail = (r.stderr || r.stdout || "").trim() || "gh pr merge --auto failed";
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/gh-disable-auto-merge  { cwd, number }
+    if (url.pathname === "/api/gh-disable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, number } = await readBody(req);
+        if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const r = spawnSync(GH, ["pr", "merge", String(number), "--disable-auto"], {
+          cwd: resolve(cwd),
+          encoding: "utf-8",
+        });
+        if (r.status !== 0) {
+          const detail = (r.stderr || r.stdout || "").trim() || "gh pr merge --disable-auto failed";
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
     // POST /api/gh-dismiss-review  { cwd, number, reviewId, message } (B4, v3.6.0)
     if (url.pathname === "/api/gh-dismiss-review" && req.method === "POST") {
       try {

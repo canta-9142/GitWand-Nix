@@ -790,6 +790,79 @@ pub(crate) async fn gh_merge_pr(cwd: String, number: i64, method: String) -> Res
         .map_err(|e| e.to_string())?
 }
 
+fn gh_enable_auto_merge_inner(cwd: String, number: i64, method: String) -> Result<(), String> {
+    if let Some(tok) = github_api::settings_github_token() {
+        return github_api::rest_enable_auto_merge(&cwd, number, &method, &tok);
+    }
+    let merge_flag = match method.as_str() {
+        "squash" => "--squash",
+        "rebase" => "--rebase",
+        _ => "--merge",
+    };
+    let output = hidden_cmd("gh")
+        .args([
+            "pr",
+            "merge",
+            &number.to_string(),
+            "--auto",
+            merge_flag,
+            "--delete-branch",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| format!("Failed to enable auto-merge: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr merge --auto failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Queue this PR to merge once its required checks pass.
+///
+/// A separate command from `gh_merge_pr` rather than a flag on it: arming
+/// takes a merge method, disarming takes none, and the two fail for
+/// unrelated reasons. `git_rebase_action`'s mode argument works because its
+/// three modes share every argument; these do not.
+#[tauri::command]
+pub(crate) async fn gh_enable_auto_merge(
+    cwd: String,
+    number: i64,
+    method: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gh_enable_auto_merge_inner(cwd, number, method))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn gh_disable_auto_merge_inner(cwd: String, number: i64) -> Result<(), String> {
+    if let Some(tok) = github_api::settings_github_token() {
+        return github_api::rest_disable_auto_merge(&cwd, number, &tok);
+    }
+    let output = hidden_cmd("gh")
+        .args(["pr", "merge", &number.to_string(), "--disable-auto"])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| format!("Failed to disable auto-merge: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr merge --disable-auto failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Cancel a queued auto-merge. Takes no method: there is nothing to choose.
+#[tauri::command]
+pub(crate) async fn gh_disable_auto_merge(cwd: String, number: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gh_disable_auto_merge_inner(cwd, number))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn gh_pr_ready_inner(cwd: String, number: i64) -> Result<(), String> {
     if let Some(tok) = github_api::settings_github_token() {
         return github_api::rest_pr_ready(&cwd, number, &tok);

@@ -299,6 +299,22 @@ pub fn git_stash_list_parity(cwd: String) -> Result<Vec<types::StashEntry>, Stri
     tauri::async_runtime::block_on(commands::ops::git_stash_list(cwd))
 }
 
+/// Parity entry point for `gh_enable_auto_merge`. Only a repo with no forge
+/// remote is checkable here (see the refusal test in `tests/parity/`) — no
+/// test arms an auto-merge on a live PR.
+pub fn gh_enable_auto_merge_parity(
+    cwd: String,
+    number: i64,
+    method: String,
+) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gh::gh_enable_auto_merge(cwd, number, method))
+}
+
+/// Parity entry point for `gh_disable_auto_merge`.
+pub fn gh_disable_auto_merge_parity(cwd: String, number: i64) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gh::gh_disable_auto_merge(cwd, number))
+}
+
 pub fn snapshot_list_parity(cwd: String) -> Result<Vec<git::snapshot::SnapshotMeta>, String> {
     tauri::async_runtime::block_on(commands::snapshots::snapshot_list(cwd))
 }
@@ -571,6 +587,8 @@ pub fn run() {
             commands::gh::gh_branches,
             commands::gh::gh_checkout_pr,
             commands::gh::gh_merge_pr,
+            commands::gh::gh_enable_auto_merge,
+            commands::gh::gh_disable_auto_merge,
             commands::gh::gh_pr_detail,
             commands::gh::gh_pr_diff,
             commands::gh::gh_pr_checks,

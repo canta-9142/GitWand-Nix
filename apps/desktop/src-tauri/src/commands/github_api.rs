@@ -1488,6 +1488,49 @@ pub(crate) fn rest_pr_ready(cwd: &str, number: i64, token: &str) -> Result<(), S
     Ok(())
 }
 
+/// GraphQL equivalent of `gh pr merge --auto`, for the configured-token path.
+///
+/// `enablePullRequestAutoMerge` takes the PR's node id, resolved the same way
+/// `rest_pr_ready` resolves it above: fetch the PR through the existing REST
+/// path (origin or upstream), read its `node_id`, and error out explicitly if
+/// it is missing rather than sending an empty id to GraphQL.
+pub(crate) fn rest_enable_auto_merge(
+    cwd: &str,
+    number: i64,
+    method: &str,
+    token: &str,
+) -> Result<(), String> {
+    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let node_id = js(&pr, "node_id");
+    if node_id.is_empty() {
+        return Err("Could not resolve PR node_id for auto-merge.".to_string());
+    }
+    let merge_method = match method {
+        "squash" => "SQUASH",
+        "rebase" => "REBASE",
+        _ => "MERGE",
+    };
+    let query = "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId } }";
+    graphql(
+        token,
+        query,
+        serde_json::json!({ "id": node_id, "method": merge_method }),
+    )?;
+    Ok(())
+}
+
+/// GraphQL equivalent of `gh pr merge --disable-auto`.
+pub(crate) fn rest_disable_auto_merge(cwd: &str, number: i64, token: &str) -> Result<(), String> {
+    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let node_id = js(&pr, "node_id");
+    if node_id.is_empty() {
+        return Err("Could not resolve PR node_id for auto-merge.".to_string());
+    }
+    let query = "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }";
+    graphql(token, query, serde_json::json!({ "id": node_id }))?;
+    Ok(())
+}
+
 pub(crate) fn rest_checkout_pr(cwd: &str, number: i64) -> Result<(), String> {
     // Resolve which repo the PR actually lives in. When the local repo is a
     // fork, the listed PRs belong to the upstream *parent*, so `pull/N/head`

@@ -516,6 +516,43 @@ export async function ghMergePr(cwd: string, number: number, method: string = "m
   if (data.error) throw new Error(data.error);
 }
 
+/**
+ * Queue a PR to merge automatically once its required checks pass.
+ * @param method - "merge", "squash", or "rebase"
+ */
+export async function ghEnableAutoMerge(
+  cwd: string,
+  number: number,
+  method: string = "merge",
+): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gh_enable_auto_merge", { cwd, number, method });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gh-enable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number, method }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
+/** Cancel a queued auto-merge on a PR. */
+export async function ghDisableAutoMerge(cwd: string, number: number): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gh_disable_auto_merge", { cwd, number });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gh-disable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
 /** Convert a draft PR to ready-for-review via `gh pr ready`. */
 export async function ghPrReady(cwd: string, number: number): Promise<void> {
   if (!isTauri()) throw new Error("ghPrReady requires Tauri");
