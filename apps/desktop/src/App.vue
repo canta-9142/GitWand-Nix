@@ -2978,11 +2978,11 @@ async function openLaunchpadMergePr(pr: PullRequest & { repoPath?: string }) {
  *
  * No `mergeBlocked` gate here: unlike an immediate merge, arming auto-merge
  * is exactly what a PR that ISN'T mergeable yet needs. There is a
- * repo-level gate though: the inbox list row has no `autoMergeSupport` (it
- * is only ever carried on the PR detail, deliberately not fetched per row —
- * see `gh_auto_merge_state`), so a repository whose owner never enabled
- * "Allow auto-merge" would otherwise offer this action on every row and
- * fail on every click. `selectPr` + `loadChecks` (mirroring
+ * repo-level gate though: the inbox list row has no `autoMergeSupport`
+ * (it is only ever carried on the PR detail, deliberately not fetched per
+ * row, see `gh_auto_merge_state`), so a repository whose owner never
+ * enabled "Allow auto-merge" would otherwise offer this action on every row
+ * and fail on every click. `selectPr` + `loadChecks` (mirroring
  * `openLaunchpadMergePr`) load the detail bundle that carries the real
  * `autoMergeSupport`, and this refuses with the forge's own `reason` the
  * same way `openLaunchpadMergePr` surfaces `mergeBlockedReason`.

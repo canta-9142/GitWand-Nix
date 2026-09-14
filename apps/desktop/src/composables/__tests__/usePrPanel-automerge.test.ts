@@ -102,7 +102,7 @@ describe("computeAutoMergeOffer", () => {
 
   it("still offers arming when canMerge is unknown (null/undefined, not strictly false)", () => {
     // GitLab, Azure and Bitbucket never populate canMerge, and a failed gh
-    // permission lookup also leaves it null/undefined — none of that means
+    // permission lookup also leaves it null/undefined. None of that means
     // "no permission", so the button must not disappear on its own.
     expect(computeAutoMergeOffer(supported, open, { ready: false, reason: "" }, null))
       .toEqual({ kind: "arm" });

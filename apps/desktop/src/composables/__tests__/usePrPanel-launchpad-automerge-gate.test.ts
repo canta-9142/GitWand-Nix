@@ -6,7 +6,7 @@
  * click. `gh_auto_merge_state` hardcodes `available: true` per PR, so the
  * repo-level `supported` flag only ever arrives on the loaded PR detail's
  * `autoMergeSupport` (never on list rows, see `gh_auto_merge_state`'s doc
- * comment) — `selectPr()` + `loadChecks()` (the same dance
+ * comment). `selectPr()` + `loadChecks()` (the same dance
  * `openLaunchpadMergePr` already does before reading `mergeBlocked`) must
  * load it before the handler decides.
  */
@@ -61,7 +61,7 @@ async function armWithRepoGate(p: ReturnType<typeof usePrPanel>, pr: { number: n
   return { refused: false, reason: null };
 }
 
-describe("usePrPanel — Launchpad quick auto-merge repo-level gate", () => {
+describe("usePrPanel: Launchpad quick auto-merge repo-level gate", () => {
   beforeEach(() => {
     ghPrDetail.mockReset();
     ghPrChecks.mockReset().mockResolvedValue([]);
