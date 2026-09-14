@@ -404,6 +404,136 @@ function getRepoNwo(cwd) {
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
+/**
+ * Parse `{org, project, repo}` from a `git remote get-url origin` URL for
+ * Azure DevOps. Mirrors `parse_azure_remote` in
+ * `src-tauri/src/commands/azure.rs`, keep in sync. Returns `null` when the
+ * URL doesn't look like an Azure DevOps remote.
+ */
+function parseAzureRemote(remoteUrl) {
+  // SSH: git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
+  const sshMarker = "ssh.dev.azure.com:";
+  const sshIdx = remoteUrl.indexOf(sshMarker);
+  if (sshIdx !== -1) {
+    const rest = remoteUrl
+      .slice(sshIdx + sshMarker.length)
+      .replace(/^v3\//, "")
+      .replace(/\.git$/, "");
+    const parts = rest.split("/").filter(Boolean);
+    if (parts.length >= 3) {
+      return { org: parts[0], project: parts[1], repo: parts.slice(2).join("/") };
+    }
+    return null;
+  }
+
+  const afterScheme = remoteUrl.includes("://") ? remoteUrl.split("://")[1] : remoteUrl;
+  const afterUserinfo = afterScheme.includes("@")
+    ? afterScheme.split("@").slice(-1)[0]
+    : afterScheme;
+  const slashIdx = afterUserinfo.indexOf("/");
+  if (slashIdx === -1) return null;
+  const host = afterUserinfo.slice(0, slashIdx);
+  const path = afterUserinfo
+    .slice(slashIdx + 1)
+    .replace(/\/+$/, "")
+    .replace(/\.git$/, "");
+
+  // dev.azure.com/{org}/{project}/_git/{repo}
+  if (host.toLowerCase() === "dev.azure.com") {
+    const gitIdx = path.indexOf("/_git/");
+    if (gitIdx === -1) return null;
+    const left = path.slice(0, gitIdx);
+    const repo = path.slice(gitIdx + "/_git/".length);
+    const segs = left.split("/").filter(Boolean);
+    if (segs.length >= 2) {
+      return { org: segs[0], project: segs.slice(1).join("/"), repo };
+    }
+    return null;
+  }
+
+  // {org}.visualstudio.com[/DefaultCollection]/{project}/_git/{repo}
+  const vsMatch = host.match(/^(.+)\.visualstudio\.com$/i);
+  if (vsMatch) {
+    const gitIdx = path.indexOf("/_git/");
+    if (gitIdx === -1) return null;
+    const left = path.slice(0, gitIdx);
+    const repo = path.slice(gitIdx + "/_git/".length);
+    const segs = left.split("/").filter((s) => s && s.toLowerCase() !== "defaultcollection");
+    if (segs.length > 0) {
+      return { org: vsMatch[1], project: segs.join("/"), repo };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve `{org, project, repo}` from `cwd`'s `origin` remote. Throws with
+ * the same wording as `azure_repo` in `azure.rs` when there's no remote or it
+ * doesn't parse, so both backends refuse identically (see
+ * `tests/parity/auto-merge-refusal.test.mjs`).
+ */
+function azureRepo(cwd) {
+  const r = spawnSync(GIT, ["remote", "get-url", "origin"], { cwd, encoding: "utf-8" });
+  if (r.status !== 0) {
+    throw new Error("No 'origin' remote found in this repo.");
+  }
+  const remoteUrl = (r.stdout || "").trim();
+  const parsed = parseAzureRemote(remoteUrl);
+  if (!parsed) {
+    throw new Error(`Could not parse an Azure DevOps repo from remote URL: ${remoteUrl}`);
+  }
+  return parsed;
+}
+
+/** Base URL for the git REST surface of an Azure DevOps repo. */
+function azureApiBase(repo) {
+  return `https://dev.azure.com/${encodeURIComponent(repo.org)}/${encodeURIComponent(repo.project)}/_apis/git/repositories/${encodeURIComponent(repo.repo)}`;
+}
+
+/** Cache of the signed-in identity's GUID, keyed by organisation. Dev-server
+ *  analogue of `AZ_IDENTITY_CACHE` in azure.rs: the identity doesn't change
+ *  during a session. */
+const azIdentityCache = new Map();
+
+/**
+ * Resolve the signed-in user's Azure DevOps identity id (a GUID), required by
+ * `autoCompleteSetBy.id` when arming auto-complete. Mirrors
+ * `az_current_identity_id`: hits the organisation-scoped `connectionData`
+ * endpoint (not the global profile endpoint, which returns a display name,
+ * not an id).
+ */
+async function azureCurrentIdentityId(org, token) {
+  if (azIdentityCache.has(org)) return azIdentityCache.get(org);
+  const resp = await fetch(
+    `https://dev.azure.com/${encodeURIComponent(org)}/_apis/connectionData?api-version=7.1`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Azure DevOps API error (${resp.status}): ${text}`);
+  }
+  const data = await resp.json();
+  const id = data?.authenticatedUser?.id;
+  if (!id) throw new Error("Azure DevOps did not return an identity id for this token.");
+  azIdentityCache.set(org, id);
+  return id;
+}
+
+/**
+ * Body for the PATCH that arms or clears Azure auto-complete. `identityId`
+ * of `null` sends an EXPLICIT null (not an omitted key). Azure treats an
+ * absent field as "do not change", so omitting it would leave auto-complete
+ * armed while the call reported success. Mirrors `az_auto_complete_body` in
+ * `azure.rs`, keep in sync.
+ */
+function azAutoCompleteBody(identityId, method) {
+  const strategy = method === "squash" ? "squash" : method === "rebase" ? "rebase" : "noFastForward";
+  return {
+    autoCompleteSetBy: identityId ? { id: identityId } : null,
+    completionOptions: { mergeStrategy: strategy },
+  };
+}
+
 /** Cache of resolved PR repo nwo, keyed by `<origin>#<number>`. The repo a PR
  *  lives in is stable for the PR's lifetime, so one resolution per dev-server
  *  process is enough — without this the 3 per-PR endpoints each re-resolve
@@ -5396,6 +5526,90 @@ async function handleRequest(req, res) {
         return jsonResponse(req, res, { ok: true });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/az-enable-auto-merge  { cwd, number, method }
+    // Queue a PR to merge once its checks pass, by PATCHing it with the
+    // signed-in identity in `autoCompleteSetBy`. Mirrors
+    // `rest_enable_auto_merge` (src-tauri/src/commands/azure.rs).
+    //
+    // Unlike the gh/gl routes above, there is no installed CLI to shell out
+    // to here (Azure auth is Entra device-flow, stored in the desktop app's
+    // OS keychain, which this Node process cannot read), so this route is
+    // therefore the first real Azure REST plumbing in dev-server.mjs. The
+    // no-forge-remote refusal exercised by the parity suite never reaches
+    // the network call below; a live call needs `GITWAND_AZURE_TOKEN` set in
+    // the dev-server's environment (dev-only convenience, analogous to
+    // `GH_TOKEN`/`GITHUB_TOKEN` above, since there is no keychain access from here).
+    if (url.pathname === "/api/az-enable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, number, method } = await readBody(req);
+        if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const repo = azureRepo(resolve(cwd));
+        const token = process.env.GITWAND_AZURE_TOKEN;
+        if (!token) {
+          return jsonResponse(
+            req,
+            res,
+            {
+              error:
+                "Not signed in to Azure DevOps. Set GITWAND_AZURE_TOKEN to exercise this route in dev mode.",
+            },
+            401,
+          );
+        }
+        const identityId = await azureCurrentIdentityId(repo.org, token);
+        const payload = azAutoCompleteBody(identityId, method);
+        const resp = await fetch(`${azureApiBase(repo)}/pullrequests/${number}?api-version=7.1`, {
+          method: "PATCH",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          return jsonResponse(req, res, { error: `Azure DevOps API error (${resp.status}): ${text}` }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // POST /api/az-disable-auto-merge  { cwd, number }
+    // Cancel a queued auto-complete by clearing `autoCompleteSetBy` with an
+    // explicit null (an omitted key leaves auto-complete armed). Mirrors
+    // `rest_disable_auto_merge`.
+    if (url.pathname === "/api/az-disable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, number } = await readBody(req);
+        if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const repo = azureRepo(resolve(cwd));
+        const token = process.env.GITWAND_AZURE_TOKEN;
+        if (!token) {
+          return jsonResponse(
+            req,
+            res,
+            {
+              error:
+                "Not signed in to Azure DevOps. Set GITWAND_AZURE_TOKEN to exercise this route in dev mode.",
+            },
+            401,
+          );
+        }
+        const payload = azAutoCompleteBody(null, "merge");
+        const resp = await fetch(`${azureApiBase(repo)}/pullrequests/${number}?api-version=7.1`, {
+          method: "PATCH",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const text = await resp.text();
+          return jsonResponse(req, res, { error: `Azure DevOps API error (${resp.status}): ${text}` }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
       }
     }
 

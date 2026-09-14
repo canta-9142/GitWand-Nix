@@ -1403,6 +1403,40 @@ export async function azMergePr(cwd: string, number: number, method: string = "m
   throw new Error(AZURE_WEB_ONLY);
 }
 
+/** Queue this PR to merge once its checks pass (Azure "auto-complete"). */
+export async function azEnableAutoMerge(
+  cwd: string,
+  number: number,
+  method: string = "merge",
+): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("az_enable_auto_merge", { cwd, number, method });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/az-enable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number, method }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
+/** Cancel a queued auto-complete on a PR. */
+export async function azDisableAutoMerge(cwd: string, number: number): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("az_disable_auto_merge", { cwd, number });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/az-disable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
 export async function azPrReady(cwd: string, number: number): Promise<void> {
   if (isTauri()) return tauriInvoke<void>("az_pr_ready", { cwd, number });
   throw new Error(AZURE_WEB_ONLY);

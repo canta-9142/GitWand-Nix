@@ -40,6 +40,17 @@ async function nodeEnableAutoMergeGl(dev, cwd, iid, method) {
   return res.ok ? { ok: true, value: data } : { ok: false, error: data.error };
 }
 
+/** POST /api/az-enable-auto-merge, returning the same {ok, error} shape as runProbe. */
+async function nodeEnableAutoMergeAz(dev, cwd, number, method) {
+  const res = await dev.fetch("/api/az-enable-auto-merge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number, method }),
+  });
+  const data = await res.json().catch(() => ({}));
+  return res.ok ? { ok: true, value: data } : { ok: false, error: data.error };
+}
+
 /**
  * Collapse the parts that legitimately differ between the two backends down
  * to a single class. The dev-server route always shells out to `gh` CLI; the
@@ -161,6 +172,50 @@ describe("parity: auto-merge refusal", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd, iid: 1 }),
+    });
+    const nodeData = await res.json().catch(() => ({}));
+    const node = res.ok ? { ok: true } : { ok: false, error: nodeData.error };
+
+    if (looksLikeProbeTimeout(rust)) {
+      throw new Error(
+        "parity-probe timed out. This is almost certainly the first keychain " +
+          "access by a freshly built probe binary, not a bug in the command. " +
+          "Re-run the suite once; the OS remembers the decision.",
+      );
+    }
+
+    expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(normalizeForgeError(rust.error)).toBe("no-remote");
+    expect(normalizeForgeError(node.error)).toBe(normalizeForgeError(rust.error));
+  });
+
+  it("both backends refuse enabling auto-merge on an Azure PR with no forge remote", async () => {
+    const cwd = mkTempRepo("gw-auto-merge-refusal-");
+    const rust = runProbe("az-enable-auto-merge", { cwd, number: 1, method: "squash" });
+    const node = await nodeEnableAutoMergeAz(dev, cwd, 1, "squash");
+
+    if (looksLikeProbeTimeout(rust)) {
+      throw new Error(
+        "parity-probe timed out. This is almost certainly the first keychain " +
+          "access by a freshly built probe binary, not a bug in the command. " +
+          "Re-run the suite once; the OS remembers the decision.",
+      );
+    }
+
+    expect(rust.ok, "rust unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(node.ok, "node unexpectedly accepted a repo with no forge remote").toBe(false);
+    expect(normalizeForgeError(rust.error)).toBe("no-remote");
+    expect(normalizeForgeError(node.error)).toBe(normalizeForgeError(rust.error));
+  });
+
+  it("both backends refuse disabling auto-merge on an Azure PR with no forge remote", async () => {
+    const cwd = mkTempRepo("gw-auto-merge-refusal-");
+    const rust = runProbe("az-disable-auto-merge", { cwd, number: 1 });
+    const res = await dev.fetch("/api/az-disable-auto-merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd, number: 1 }),
     });
     const nodeData = await res.json().catch(() => ({}));
     const node = res.ok ? { ok: true } : { ok: false, error: nodeData.error };
