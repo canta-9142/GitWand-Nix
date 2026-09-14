@@ -96,7 +96,13 @@ describe("parity: auto-merge refusal", () => {
       throw new Error(
         "parity-probe timed out. This is almost certainly the first keychain " +
           "access by a freshly built probe binary, not a bug in the command. " +
-          "Re-run the suite once; the OS remembers the decision.",
+          "Re-running the suite will NOT fix this: the suite's own 10 second " +
+          "timeout kills the probe before the OS authorization decision " +
+          "completes, so it is never remembered. Run the probe once directly " +
+          "with no timeout and let it finish (it can take several minutes), " +
+          "then run the suite again, for example: " +
+          "echo '{\"cwd\":\"/tmp/anyrepo\",\"number\":1,\"method\":\"squash\"}' " +
+          "| src-tauri/target/debug/examples/parity-probe gh-enable-auto-merge",
       );
     }
 
@@ -125,7 +131,13 @@ describe("parity: auto-merge refusal", () => {
       throw new Error(
         "parity-probe timed out. This is almost certainly the first keychain " +
           "access by a freshly built probe binary, not a bug in the command. " +
-          "Re-run the suite once; the OS remembers the decision.",
+          "Re-running the suite will NOT fix this: the suite's own 10 second " +
+          "timeout kills the probe before the OS authorization decision " +
+          "completes, so it is never remembered. Run the probe once directly " +
+          "with no timeout and let it finish (it can take several minutes), " +
+          "then run the suite again, for example: " +
+          "echo '{\"cwd\":\"/tmp/anyrepo\",\"number\":1,\"method\":\"squash\"}' " +
+          "| src-tauri/target/debug/examples/parity-probe gh-enable-auto-merge",
       );
     }
 
@@ -144,7 +156,13 @@ describe("parity: auto-merge refusal", () => {
       throw new Error(
         "parity-probe timed out. This is almost certainly the first keychain " +
           "access by a freshly built probe binary, not a bug in the command. " +
-          "Re-run the suite once; the OS remembers the decision.",
+          "Re-running the suite will NOT fix this: the suite's own 10 second " +
+          "timeout kills the probe before the OS authorization decision " +
+          "completes, so it is never remembered. Run the probe once directly " +
+          "with no timeout and let it finish (it can take several minutes), " +
+          "then run the suite again, for example: " +
+          "echo '{\"cwd\":\"/tmp/anyrepo\",\"number\":1,\"method\":\"squash\"}' " +
+          "| src-tauri/target/debug/examples/parity-probe gh-enable-auto-merge",
       );
     }
 
@@ -169,7 +187,13 @@ describe("parity: auto-merge refusal", () => {
       throw new Error(
         "parity-probe timed out. This is almost certainly the first keychain " +
           "access by a freshly built probe binary, not a bug in the command. " +
-          "Re-run the suite once; the OS remembers the decision.",
+          "Re-running the suite will NOT fix this: the suite's own 10 second " +
+          "timeout kills the probe before the OS authorization decision " +
+          "completes, so it is never remembered. Run the probe once directly " +
+          "with no timeout and let it finish (it can take several minutes), " +
+          "then run the suite again, for example: " +
+          "echo '{\"cwd\":\"/tmp/anyrepo\",\"number\":1,\"method\":\"squash\"}' " +
+          "| src-tauri/target/debug/examples/parity-probe gh-enable-auto-merge",
       );
     }
 

@@ -142,12 +142,27 @@ tue le process au bout de 10 s, et le résultat (`exitCode: -1`,
 `error` contenant `"ETIMEDOUT"`) ressemble à s'y méprendre à un vrai échec de
 la commande testée.
 
-Ce blocage se résout de lui-même : macOS mémorise la décision d'autorisation,
-donc un second run juste après passe en quelques centaines de millisecondes.
-`tests/parity/auto-merge-refusal.test.mjs` détecte cette forme de timeout
-(`looksLikeProbeTimeout`) et lève une erreur explicite plutôt que de laisser
-le test échouer avec un message qui ressemble à une divergence Rust/Node
-ordinaire.
+Relancer la suite ne résout PAS ce blocage : le timeout de 10 s de la suite
+est plus court que le délai d'autorisation OS, donc chaque run de la suite
+tue le probe avant que macOS ait fini de répondre, et la décision n'est
+jamais mémorisée. `tests/parity/auto-merge-refusal.test.mjs` détecte cette
+forme de timeout (`looksLikeProbeTimeout`) et lève une erreur explicite
+plutôt que de laisser le test échouer avec un message qui ressemble à une
+divergence Rust/Node ordinaire.
+
+Le vrai remède : lancer le probe UNE FOIS, directement, sans timeout, et
+laisser macOS répondre jusqu'au bout, ce qui peut prendre plusieurs minutes
+(mesuré : 235 s sur un run, plus de 600 s sur un autre). Ne pas tuer la
+commande en pensant qu'elle est bloquée, sinon la décision reste incomplète
+et le prochain run retombe dans le même blocage. Exemple :
+
+```bash
+echo '{"cwd":"/tmp/anyrepo","number":1,"method":"squash"}' \
+  | src-tauri/target/debug/examples/parity-probe gh-enable-auto-merge
+```
+
+Une fois cet appel direct terminé, la suite `pnpm test:parity` passe
+normalement (la décision est mémorisée pour ce binaire).
 
 CI n'est pas affecté : il n'y a ni trousseau ni token configuré sur les
 runners, donc `settings_github_token()` retourne toujours `None` et les deux
