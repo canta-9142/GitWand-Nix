@@ -887,6 +887,7 @@ const es: Locale = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Fusionar la PR",

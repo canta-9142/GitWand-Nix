@@ -888,6 +888,7 @@ const ptBR: Locale = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Mesclar a PR",

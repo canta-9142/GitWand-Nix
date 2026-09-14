@@ -903,6 +903,7 @@ const en = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Merge PR",
