@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ConflictFile } from "../composables/useGitWand";
+import { useResolutionSelection, contentStamp } from "../composables/useResolutionSelection";
 import { summarizeTiers, type ConflictHunk } from "@gitwand/core";
 import { highlightConflict } from "../utils/diffHighlight";
 import { useI18n } from "../composables/useI18n";
@@ -21,6 +22,12 @@ import {
 import LlmTracePanel from "./LlmTracePanel.vue";
 import TokenMergePanel from "./TokenMergePanel.vue";
 import ResolutionPreviewPanel from "./ResolutionPreviewPanel.vue";
+// Async on purpose, and NOT a contradiction of the static-import justification
+// above: that one covers thin BaseModal wrappers with no heavy dependencies.
+// CodeEditor is the entry point to CodeMirror (~400 KB), and it sits behind a
+// `v-if` on a default-null flag, which is verbatim the apps/desktop/CLAUDE.md
+// rule. Opening the merge editor must not pay for it; clicking Edit does.
+const CodeEditor = defineAsyncComponent(() => import("./CodeEditor.vue"));
 import AiSparkle from "./AiSparkle.vue";
 // Not lazy-loaded: this is a thin wrapper around BaseModal (already always-eager
 // per the P1.2 perf exception list) with no heavy additional deps — same static-import
@@ -52,6 +59,8 @@ const emit = defineEmits<{
   resolveTreeConflict: [path: string, choice: "ours" | "theirs" | "delete"];
   reconstructConflict: [path: string];
   keepWorkingTree: [path: string];
+  /** Conflicted file GitWand cannot decode: hand it to the user's own editor. */
+  openExternally: [path: string];
 }>();
 
 // ─── Inline Edit State ──────────────────────────────────
@@ -245,10 +254,25 @@ function resolveHunkCustomWithMemory(path: string, hunkIndex: number, content: s
 // We track rejection client-side (per file path) because the core has
 // already produced the resolution — we don't want to re-run it. The set
 // is reset when the active file changes.
-const rejectedLlmHunks = ref<Set<number>>(new Set());
+// v3.11 — one store for every kind of "do not apply this hunk". It used to be
+// three independent refs, and `rejectedPreviewHunks` was read only by the
+// `v-if` that hid its own panel: rejecting a resolution hid the panel and then
+// applied the resolution anyway. Sharing one store with the code that actually
+// writes is what stops that from happening again.
+const selection = useResolutionSelection();
 
-/** Number of `llm_proposed` hunks the user explicitly rejected (this file). */
-const rejectedLlmCount = computed(() => rejectedLlmHunks.value.size);
+/** Fingerprint of the content the hunk indices were computed against. */
+const fileStamp = computed(() => contentStamp(props.file.content));
+
+/** Is this hunk excluded from the apply, whatever route excluded it? */
+function isHunkExcluded(hunkIndex: number): boolean {
+  return selection.isExcluded(props.file.path, hunkIndex, fileStamp.value);
+}
+
+/** Exclude one hunk from the apply (idempotent). */
+function excludeHunk(hunkIndex: number): void {
+  selection.setExcluded(props.file.path, hunkIndex, true, fileStamp.value);
+}
 
 /**
  * `file.result.stats.autoResolved` counts every hunk the core marked as
@@ -258,7 +282,7 @@ const rejectedLlmCount = computed(() => rejectedLlmHunks.value.size);
  * actually be applied.
  */
 const canResolve = computed(
-  () => props.file.result.stats.autoResolved - rejectedLlmCount.value > 0,
+  () => appliedResolutions.value.length > 0,
 );
 
 const hunks = computed(() => props.file.result.hunks);
@@ -323,7 +347,7 @@ function hasLlmTrace(hunk: ConflictHunk): boolean {
  */
 function showLlmPanelFor(hunkIndex: number, hunk: ConflictHunk): boolean {
   if (!hasLlmTrace(hunk)) return false;
-  if (rejectedLlmHunks.value.has(hunkIndex)) return false;
+  if (isHunkExcluded(hunkIndex)) return false;
   return true;
 }
 
@@ -339,10 +363,7 @@ function onLlmAccept(hunkId: string | number) {
 function onLlmReject(hunkId: string | number) {
   const idx = Number(hunkId);
   if (!Number.isFinite(idx)) return;
-  // Use a fresh Set so reactivity fires (computed `canResolve` recomputes).
-  const next = new Set(rejectedLlmHunks.value);
-  next.add(idx);
-  rejectedLlmHunks.value = next;
+  excludeHunk(idx);
   // Drop a previously-recorded accept so the UX badge doesn't lie.
   if (acceptedLlmHunks.value.has(idx)) {
     const a = new Set(acceptedLlmHunks.value);
@@ -384,8 +405,6 @@ function showTokenMergePanelFor(hunkIndex: number, hunk: ConflictHunk): boolean 
 // the "Résoudre auto" button would, via resolveHunkCustom. This replaces the
 // classic action bar's "Accepter les deux" for these hunks, which previously
 // did a raw ours+theirs concatenation instead of the engine's real merge.
-const rejectedPreviewHunks = ref<Set<number>>(new Set());
-
 function onPreviewAccept(hunkIndex: number) {
   const resolution = resolutions.value[hunkIndex];
   if (!resolution?.resolvedLines) return;
@@ -393,16 +412,16 @@ function onPreviewAccept(hunkIndex: number) {
 }
 
 function onPreviewReject(hunkIndex: number) {
-  const next = new Set(rejectedPreviewHunks.value);
-  next.add(hunkIndex);
-  rejectedPreviewHunks.value = next;
+  // Records the refusal where the apply path can see it, not merely where the
+  // panel's own `v-if` can. That gap was the bug.
+  excludeHunk(hunkIndex);
 }
 
 function showResolutionPreviewFor(hunkIndex: number, hunk: ConflictHunk): boolean {
   if (hunk.type === "llm_proposed" || hunk.type === "token_level_merge") return false;
   if (!resolutions.value[hunkIndex]?.autoResolved) return false;
   if (!resolutions.value[hunkIndex]?.resolvedLines) return false;
-  return !rejectedPreviewHunks.value.has(hunkIndex);
+  return !isHunkExcluded(hunkIndex);
 }
 
 // ─── Reset per-file UI-only state on file change ────────
@@ -417,21 +436,66 @@ watch(
   () => {
     editingHunkIndex.value = null;
     editContent.value = "";
-    rejectedLlmHunks.value = new Set();
     acceptedLlmHunks.value = new Set();
     rejectedTokenMergeHunks.value = new Set();
-    rejectedPreviewHunks.value = new Set();
+    // The opt-out set is deliberately NOT cleared here. It is keyed by path
+    // and guarded by a content stamp, so tabbing between two conflicted files
+    // and back keeps the user's choices instead of silently discarding them.
+    // It is cleared when the repository changes (App.vue).
   },
 );
 
 // ─── "Résoudre auto" summary confirmation ───────────────
 const showResolveAutoSummary = ref(false);
 
+/**
+ * The resolutions that would actually be written right now: everything the
+ * engine auto-resolved, minus what the confidence bar holds back, minus what
+ * the user ticked off. This is the single source the summary modal, the
+ * "Resolve auto" button's enabled state and its count all read, so they cannot
+ * disagree with each other or with what the apply does.
+ */
+const appliedResolutions = computed(() =>
+  resolutions.value
+    .map((r, hunkIndex) => ({
+      hunkIndex,
+      resolvedLines: r.resolvedLines,
+      score: r.hunk?.confidence?.score ?? 0,
+      label: r.hunk?.confidence?.label ?? "low",
+    }))
+    .filter((r, i) =>
+      selection.shouldApply(props.file.path, i, resolutions.value[i] as never, fileStamp.value),
+    ) as Array<{ hunkIndex: number; resolvedLines: string[]; score: number; label: string }>,
+);
+
+/** Everything the engine offered, annotated with whether it is currently on. */
 const autoResolutionsSummary = computed(() =>
   resolutions.value
-    .map((r, hunkIndex) => ({ hunkIndex, resolvedLines: r.resolvedLines, autoResolved: r.autoResolved }))
-    .filter((r) => r.autoResolved && r.resolvedLines !== null) as Array<{ hunkIndex: number; resolvedLines: string[] }>,
+    .map((r, hunkIndex) => ({
+      hunkIndex,
+      resolvedLines: r.resolvedLines,
+      score: r.hunk?.confidence?.score ?? 0,
+      label: String(r.hunk?.confidence?.label ?? "low"),
+      excluded: !selection.shouldApply(
+        props.file.path,
+        hunkIndex,
+        r as never,
+        fileStamp.value,
+      ),
+    }))
+    .filter((r) => r.resolvedLines !== null) as Array<{
+      hunkIndex: number;
+      resolvedLines: string[];
+      score: number;
+      label: string;
+      excluded: boolean;
+    }>,
 );
+
+/** Toggle one row from the summary modal. */
+function toggleSummaryRow(hunkIndex: number) {
+  selection.toggle(props.file.path, hunkIndex, fileStamp.value);
+}
 
 function confirmResolveAuto() {
   showResolveAutoSummary.value = false;
@@ -831,8 +895,33 @@ useResizeObserver(contentEl, drawMinimap);
       </template>
     </div>
 
+    <!--
+      Unreadable conflict: git says the file is unmerged but its bytes could not
+      be decoded (read_file is read_to_string, so any non-UTF-8 file lands here).
+      There is no text to show hunks for, but the file still blocks the rebase,
+      so both side-picks are offered: they run `git checkout --ours/--theirs`,
+      which works on bytes and never needs to decode anything.
+    -->
+    <div v-if="file.loadError" class="me-tree-panel">
+      <h3 class="me-tree-title">{{ t('merge.unreadableTitle') }} — <span class="mono">{{ file.path }}</span></h3>
+      <p class="me-tree-explanation">{{ t('merge.unreadableExplanation') }}</p>
+      <div class="me-tree-actions">
+        <button class="me-bulk-btn" @click="emit('resolveTreeConflict', file.path, 'ours')">
+          {{ t('merge.unreadableKeepOurs') }}
+        </button>
+        <button class="me-bulk-btn" @click="emit('resolveTreeConflict', file.path, 'theirs')">
+          {{ t('merge.unreadableKeepTheirs') }}
+        </button>
+        <button class="me-bulk-btn" @click="emit('openExternally', file.path)">
+          {{ t('merge.unreadableOpenExternally') }}
+        </button>
+      </div>
+      <div class="me-tree-preview-label muted">{{ t('merge.unreadableReasonLabel') }}</div>
+      <pre class="me-tree-preview">{{ file.loadError }}</pre>
+    </div>
+
     <!-- Editor body: code + minimap -->
-    <div class="merge-body" v-if="!file.tree && !file.markerless">
+    <div class="merge-body" v-if="!file.tree && !file.markerless && !file.loadError">
       <div v-if="file.reconstructed" class="me-reconstructed-banner">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
           <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 10.5h-1.5v-1.5h1.5v1.5zm0-3h-1.5V4.5h1.5V8.5z"/>
@@ -904,6 +993,8 @@ useResizeObserver(contentEl, drawMinimap);
               :resolved-lines="resolutions[seg.hunkIndex]!.resolvedLines!"
               :hunk-id="seg.hunkIndex"
               :explanation="hunkForSegment(seg)!.explanation"
+              :confidence-score="hunkForSegment(seg)!.confidence.score"
+              :confidence-label="hunkForSegment(seg)!.confidence.label"
               @accept="onPreviewAccept"
               @reject="onPreviewReject"
             />
@@ -1029,13 +1120,21 @@ useResizeObserver(contentEl, drawMinimap);
                   >{{ t('common.cancel') }}</a>
                 </div>
               </div>
-              <textarea
-                class="edit-textarea mono"
+              <!-- `:key` is a correctness fix, not cosmetics. `requestAISuggestion`
+                   can point `editingHunkIndex` at a different hunk while a box is
+                   open; without the key Vue patches the existing component and
+                   CodeMirror's undo history survives across hunks, so enough
+                   Cmd+Z could resurrect hunk i's text into hunk j's write. -->
+              <CodeEditor
+                :key="seg.hunkIndex"
+                class="edit-cm"
                 v-model="editContent"
-                :aria-label="`Edit conflict ${seg.hunkIndex}`"
-                spellcheck="false"
-                rows="8"
-              ></textarea>
+                :file-path="props.file.path"
+                :aria-label="t('mergeEditor.editAriaLabel', String((seg.hunkIndex ?? 0) + 1))"
+                :min-lines="8"
+                :max-lines="24"
+                autofocus
+              />
             </div>
 
             <!-- ── Two-panel view (ours / theirs) ──────────── -->
@@ -1128,6 +1227,7 @@ useResizeObserver(contentEl, drawMinimap);
     <ResolveAutoSummaryModal
       v-if="showResolveAutoSummary"
       :resolutions="autoResolutionsSummary"
+      @toggle="toggleSummaryRow"
       @confirm="confirmResolveAuto"
       @cancel="showResolveAutoSummary = false"
     />
@@ -1498,22 +1598,26 @@ useResizeObserver(contentEl, drawMinimap);
   gap: 0;
 }
 
-.edit-textarea {
+/* The textarea this replaces had `resize: vertical`. That is deliberately not
+   carried over: a CodeMirror view inside a user-resizable box fights its own
+   measurement loop, and max-lines plus internal scrolling covers what the drag
+   handle was for. */
+.edit-cm {
   width: 100%;
-  min-height: 120px;
-  padding: 12px 20px;
-  background: var(--color-bg);
-  color: var(--color-text);
+  padding: 0 20px 12px;
+}
+.edit-cm :deep(.cm-editor) {
   border: none;
   border-bottom: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-bg);
   font-size: var(--text-md);
   line-height: 1.6;
-  resize: vertical;
-  outline: none;
   tab-size: 2;
 }
 
-.edit-textarea:focus {
+.edit-cm :deep(.cm-editor.cm-focused) {
+  outline: none;
   background: var(--color-bg-secondary);
   box-shadow: inset 0 0 0 2px var(--color-accent);
 }

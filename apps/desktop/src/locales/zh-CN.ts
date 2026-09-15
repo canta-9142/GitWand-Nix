@@ -64,6 +64,7 @@ const zhCN: Locale = {
     pull: "拉取",
     sync: "同步",
     syncTooltip: "获取远程分支并拉取",
+    fetchProgress: "正在获取… {0}%",
     merge: "合并",
     mergeTooltip: "将其他分支合并到当前分支",
     mergeNoFf: "始终创建合并提交",
@@ -331,6 +332,19 @@ const zhCN: Locale = {
   },
 
   diff: {
+
+    editHunk: "\u7f16\u8f91\u6b64\u53d8\u66f4\u5757",
+
+    editBusy: "\u8bf7\u5148\u5b8c\u6210\u6b63\u5728\u7f16\u8f91\u7684\u53d8\u66f4\u5757",
+
+    editStale: "\u81ea\u8ba1\u7b97\u6b64\u5dee\u5f02\u4ee5\u6765\u6587\u4ef6\u5df2\u66f4\u6539\u3002\u8bf7\u5237\u65b0\u540e\u91cd\u8bd5\u3002",
+    newFolder: "\u65b0\u6587\u4ef6\u5939",
+    newFolderCount: "{0} \u4e2a\u6587\u4ef6",
+    nestedRepo: "\u5d4c\u5957 Git \u4ed3\u5e93",
+    nestedRepoHint:
+      "\u8be5\u6587\u4ef6\u5939\u6709\u81ea\u5df1\u7684 .git\uff0c\u56e0\u6b64 Git \u4e0d\u4f1a\u4ece\u8fd9\u91cc\u8ddf\u8e2a\u5176\u5185\u5bb9\u3002\u53ef\u4ee5\u5c06\u5b83\u6dfb\u52a0\u4e3a\u5b50\u6a21\u5757\u3001\u5ffd\u7565\u5b83\uff0c\u6216\u5220\u9664\u5b83\u7684 .git \u4ee5\u8ddf\u8e2a\u8fd9\u4e9b\u6587\u4ef6\u3002",
+    nestedRepoOpen: "\u5728\u65b0\u6807\u7b7e\u9875\u4e2d\u6253\u5f00",
+    nestedRepoIgnore: "\u6dfb\u52a0\u5230 .gitignore",
     noDiff: "此文件没有可用的差异",
     noDiffHint: "新文件或二进制文件",
     selectFile: "选择文件以查看差异",
@@ -503,6 +517,34 @@ const zhCN: Locale = {
   },
 
   mergePreview: {
+
+    applying: "\u6b63\u5728\u5e94\u7528\u2026",
+
+    applyAndMerge: "\u5408\u5e76\u5e76\u81ea\u52a8\u89e3\u51b3",
+
+    applyEstimate: "\u9884\u8ba1 {1} \u4e2a\u51b2\u7a81\u5757\u4e2d\u6709 {0} \u4e2a\u53ef\u81ea\u52a8\u89e3\u51b3",
+
+    applyDone: "\u5b8c\u6210",
+
+    applyStopped: "\u5df2\u5728\u9700\u8981\u4f60\u5904\u7406\u7684\u51b2\u7a81\u5904\u505c\u4e0b",
+
+    applyLoopBound: "\u56e0 rebase \u6b65\u9aa4\u8fc7\u591a\u800c\u505c\u6b62",
+
+    applyFailed: "\u64cd\u4f5c\u5931\u8d25",
+
+    applyCounts: "\u5df2\u5e94\u7528 {0} \u4e2a\uff0c\u5269\u4f59 {1} \u4e2a\u5f85\u89e3\u51b3",
+
+    applyDrift: "\u9884\u89c8\u4f30\u8ba1\u4e3a {0}\u3002\u5b9e\u9645\u64cd\u4f5c\u770b\u5230\u7684\u662f\u53e6\u4e00\u6b21\u5408\u5e76\uff0c\u56e0\u6b64\u4e24\u8005\u53ef\u80fd\u4e0d\u540c\u3002",
+
+    applyNoSnapshot: "\u672a\u6355\u83b7\u5feb\u7167\uff0c\u65e0\u6cd5\u4e00\u952e\u56de\u9000\u3002",
+
+    hunkHeldBack: "已保留（{0}%）",
+
+    thresholdLabel: "仅应用高于",
+
+    thresholdOff: "关闭",
+
+    thresholdSummary: "{0} 个可自动解决，{1} 个被阈值保留，{2} 个需手动",
     aiRisk: "风险评估",
     aiRiskHint: "让 AI 判断此次合并是否安全。",
     aiRiskAnalyzing: "正在分析风险…",
@@ -722,6 +764,7 @@ const zhCN: Locale = {
     resolveAutoSummaryBody: "将按以下方式解决 {0} 个冲突：",
     resolveAutoSummaryConfirm: "确认",
     resolveAutoSummaryCancel: "取消",
+    resolveAutoSummaryToggle: "应用冲突 {0}",
     bulkLabel: "全部接受：",
     bulkOurs: "当前",
     bulkTheirs: "传入",
@@ -755,6 +798,12 @@ const zhCN: Locale = {
     markerlessExplanation: "Git 为此文件记录了冲突，但工作副本没有冲突标记，且与任何一方都不匹配。",
     reconstructConflict: "重建冲突",
     keepWorkingTree: "保留我的版本（直接暂存）",
+    unreadableTitle: "无法以文本方式读取该文件",
+    unreadableExplanation: "Git 报告此文件存在冲突，但其内容不是有效的 UTF-8 文本，因此没有可显示的区块。这通常是构建产物或二进制文件。你仍然可以整体保留其中一方来解决它（该操作直接作用于原始字节），或在你自己的编辑器中打开它。",
+    unreadableKeepOurs: "保留我方版本",
+    unreadableKeepTheirs: "保留对方版本",
+    unreadableOpenExternally: "在外部编辑器中打开",
+    unreadableReasonLabel: "报告的原因",
   },
 
   pr: {
@@ -1044,6 +1093,20 @@ const zhCN: Locale = {
   },
 
   settings: {
+
+    resolution: {
+
+      title: "\u89e3\u51b3\u7f6e\u4fe1\u5ea6",
+
+      subtitle: "\u5bf9\u5f15\u64ce\u6bcf\u4e2a\u51b2\u7a81\u5757\u7f6e\u4fe1\u5ea6\u7684\u9608\u503c\uff0c\u9002\u7528\u4e8e GitWand \u7684\u6240\u6709\u89e3\u51b3\u64cd\u4f5c\u3002",
+
+      minConfidenceScore: "\u4ec5\u5e94\u7528\u9ad8\u4e8e",
+
+      minConfidenceScoreHint: "\u4f4e\u4e8e\u6b64\u5206\u6570\u7684\u81ea\u52a8\u89e3\u51b3\u5c06\u6539\u4e3a\u63d0\u8bae\u800c\u975e\u76f4\u63a5\u5e94\u7528\u3002\u7edd\u4e0d\u4f1a\u653e\u884c\u5f15\u64ce\u5df2\u62d2\u7edd\u7684\u5185\u5bb9\u3002",
+
+      barOff: "\u5173\u95ed",
+
+    },
     title: "设置",
     tabGeneral: "通用",
     tabDock: "停靠栏",
@@ -1320,6 +1383,8 @@ const zhCN: Locale = {
     defaultBranch: "默认分支",
     commitSignature: "在描述中添加 \u201c🪄 Commit via GitWand\u201d",
     commitSignatureHint: "自动添加的小签名 — 可随时移除",
+    liveRepoWatcher: "仓库实时更新",
+    liveRepoWatcherHint: "通过文件系统事件即时刷新，而不是定时轮询。如果仓库位于网络驱动器上，请关闭此选项。",
     blameAlgorithm: "Blame 差异算法",
     blameAlgorithmHint: "控制 git blame 如何检测移动的行。histogram 在大多数仓库中效果最佳。",
     secretsScannerEnabled: "扫描暂存的更改中的密钥",
@@ -1664,7 +1729,6 @@ const zhCN: Locale = {
       resolve: "解决",
       follow: "跟进",
       nudge: "提醒",
-      autoMerge: "自动合并",
       view: "查看",
     },
     case: {
@@ -1733,6 +1797,23 @@ const zhCN: Locale = {
     reviewersShort: "审阅者",
     refreshAll: "全部刷新",
     refreshAllTooltip: "并行刷新所有 4 个标签页",
+    confirm: {
+      merge: {
+        title: "合并此拉取请求？",
+        body: "{0} 将被合并到 {1}。",
+      },
+      nudge: {
+        title: "发送提醒？",
+        body: "将在 {0} 上发布一条评论。",
+      },
+    },
+    nudge: {
+      comment: "友情提醒：此拉取请求已准备好接受审查。",
+    },
+    toast: {
+      merged: "拉取请求已合并。",
+      nudged: "提醒已发送。",
+    },
     noWorkspace: {
       warning: "请先创建工作区以使用 Today",
     },
@@ -1833,6 +1914,7 @@ const zhCN: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "\u7f16\u8f91\u51b2\u7a81 {0}",
     aiButton: "AI",
     aiLoading: "AI…",
     aiErrorPrefix: "AI",
