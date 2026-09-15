@@ -33,10 +33,12 @@
 // proc-macro de Tauri génère une aide `__cmd__<name>` qui entre en conflit si
 // la fn elle-même est `pub`. Voir le bloc "Parity probe re-exports" dans lib.rs.
 use gitwand_desktop_lib::{
-    git_branches_parity, git_commit_submodule_changes_parity, git_log_parity,
-    git_remote_info_parity, git_stash_list_parity, git_status_libgit2_parity, git_status_parity,
-    git_submodule_branches_parity, scan_secrets_parity, snapshot_create_parity,
-    snapshot_list_parity, snapshot_prune_parity, snapshot_restore_parity,
+    git_blame_parity, git_branches_parity, git_commit_submodule_changes_parity, git_diff_parity,
+    git_log_parity, git_rebase_onto_parity, git_remote_info_parity, git_stash_list_parity,
+    git_status_libgit2_parity, git_status_parity, git_submodule_branches_parity,
+    preview_cherry_pick_parity, preview_merge_parity, preview_rebase_parity, read_file_parity,
+    scan_secrets_parity, snapshot_create_parity, snapshot_list_parity, snapshot_prune_parity,
+    snapshot_restore_parity,
 };
 use serde_json::{json, Value};
 use std::io::{self, Read};
@@ -46,7 +48,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: parity-probe <command>");
-        eprintln!("commands: git-status, git-status-fast, git-log, git-branches, git-stash-list, git-submodule-branches, git-commit-submodule-changes, scan-secrets");
+        eprintln!("commands: git-status, git-status-fast, git-log, git-branches, git-diff, git-blame, read-file, git-stash-list, git-submodule-branches, git-commit-submodule-changes, scan-secrets");
         return ExitCode::from(2);
     }
 
@@ -104,6 +106,21 @@ fn main() -> ExitCode {
             };
             to_json(git_status_libgit2_parity(cwd))
         }
+        "git-diff" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let path = match must_str("path") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let staged = input
+                .get("staged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            to_json(git_diff_parity(cwd, path, staged))
+        }
         "git-log" => {
             let cwd = match must_str("cwd") {
                 Ok(v) => v,
@@ -126,6 +143,76 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             to_json(git_branches_parity(cwd))
+        }
+        "git-rebase-onto" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let onto = match must_str("onto") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            to_json(git_rebase_onto_parity(cwd, onto))
+        }
+        "preview-merge" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let source_branch = match must_str("sourceBranch") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            to_json(preview_merge_parity(cwd, source_branch))
+        }
+        "preview-rebase" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let onto = match must_str("onto") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            to_json(preview_rebase_parity(cwd, onto))
+        }
+        "preview-cherry-pick" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let commit = match must_str("commit") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            to_json(preview_cherry_pick_parity(cwd, commit))
+        }
+        "read-file" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let path = match must_str("path") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            to_json(read_file_parity(cwd, path))
+        }
+        "git-blame" => {
+            let cwd = match must_str("cwd") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let path = match must_str("path") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let algorithm = input
+                .get("algorithm")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            to_json(git_blame_parity(cwd, path, algorithm))
         }
         "git-remote-info" => {
             let cwd = match must_str("cwd") {

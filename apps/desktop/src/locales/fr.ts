@@ -51,6 +51,7 @@ const fr: Locale = {
     pull: "Pull",
     sync: "Sync",
     syncTooltip: "Récupérer les branches distantes et pull",
+    fetchProgress: "Récupération… {0} %",
     merge: "Merge",
     mergeTooltip: "Merger une branche dans la branche courante",
     mergeNoFf: "Toujours créer un commit de merge",
@@ -335,6 +336,16 @@ const fr: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Modifier ce hunk",
+    editBusy: "Terminez d'abord le hunk en cours d'\u00e9dition",
+    editStale: "Le fichier a chang\u00e9 depuis le calcul de ce diff. Rafra\u00eechissez et r\u00e9essayez.",
+    newFolder: "Nouveau dossier",
+    newFolderCount: "{0} fichier(s)",
+    nestedRepo: "D\u00e9p\u00f4t Git imbriqu\u00e9",
+    nestedRepoHint:
+      "Ce dossier poss\u00e8de son propre .git, Git ne suit donc pas son contenu depuis ici. Ajoutez-le en sous-module, ignorez-le, ou supprimez son .git pour suivre les fichiers.",
+    nestedRepoOpen: "Ouvrir dans un nouvel onglet",
+    nestedRepoIgnore: "Ajouter \u00e0 .gitignore",
     noDiff: "Pas de diff disponible pour ce fichier",
     noDiffHint: "Fichier nouveau ou binaire",
     selectFile: "S\u00e9lectionnez un fichier pour voir le diff",
@@ -512,6 +523,20 @@ const fr: Locale = {
 
   // ─── Merge Preview (Phase 8.1) ──────────────────────────
   mergePreview: {
+    applying: "Application\u2026",
+    applyAndMerge: "Fusionner et auto-r\u00e9soudre",
+    applyEstimate: "Estimation : {0} hunks sur {1} auto-r\u00e9solvables",
+    applyDone: "Termin\u00e9",
+    applyStopped: "Arr\u00eat sur les conflits qui vous attendent",
+    applyLoopBound: "Arr\u00eat apr\u00e8s trop d'\u00e9tapes de rebase",
+    applyFailed: "L'op\u00e9ration a \u00e9chou\u00e9",
+    applyCounts: "{0} appliqu\u00e9s, {1} restants \u00e0 r\u00e9soudre",
+    applyDrift: "L'aper\u00e7u estimait {0}. L'op\u00e9ration r\u00e9elle voit un merge diff\u00e9rent, les deux peuvent donc diverger.",
+    applyNoSnapshot: "Aucun snapshot n'a \u00e9t\u00e9 pris : pas de retour en un clic.",
+    hunkHeldBack: "retenu ({0} %)",
+    thresholdLabel: "Appliquer seulement au-dessus de",
+    thresholdOff: "Aucun",
+    thresholdSummary: "{0} auto-resolvables, {1} retenus par le seuil, {2} manuels",
     aiRisk: "Analyse des risques",
     aiRiskHint: "Demande \u00e0 l'IA un avis sur la s\u00e9curit\u00e9 de ce merge.",
     aiRiskAnalyzing: "Analyse des risques\u2026",
@@ -737,6 +762,7 @@ const fr: Locale = {
     resolveAutoSummaryBody: "{0} conflit(s) seront r\u00e9solus ainsi :",
     resolveAutoSummaryConfirm: "Confirmer",
     resolveAutoSummaryCancel: "Annuler",
+    resolveAutoSummaryToggle: "Appliquer le conflit {0}",
     bulkLabel: "Tout accepter :",
     bulkOurs: "Courante",
     bulkTheirs: "Entrante",
@@ -770,6 +796,12 @@ const fr: Locale = {
     markerlessExplanation: "Git enregistre un conflit pour ce fichier, mais la copie de travail n'a pas de marqueurs et ne correspond à aucun des deux côtés.",
     reconstructConflict: "Reconstruire le conflit",
     keepWorkingTree: "Garder ma version (stager tel quel)",
+    unreadableTitle: "Fichier illisible en tant que texte",
+    unreadableExplanation: "Git signale ce fichier comme étant en conflit, mais son contenu n'est pas du texte UTF-8 valide : il n'y a donc aucun bloc à afficher. C'est le plus souvent un artefact de build ou un binaire. Vous pouvez quand même le régler en prenant un côté en entier, ce qui travaille sur les octets bruts, ou l'ouvrir dans votre propre éditeur.",
+    unreadableKeepOurs: "Garder notre version",
+    unreadableKeepTheirs: "Garder leur version",
+    unreadableOpenExternally: "Ouvrir dans l'éditeur externe",
+    unreadableReasonLabel: "Raison signalée",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -1065,6 +1097,13 @@ const fr: Locale = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Confiance de resolution",
+      subtitle: "Un seuil sur la confiance par hunk du moteur, applique partout ou GitWand resout.",
+      minConfidenceScore: "Appliquer seulement au-dessus de",
+      minConfidenceScoreHint: "Les auto-resolutions sous ce score sont proposees au lieu d etre appliquees. Ne laisse jamais passer ce que le moteur a deja refuse.",
+      barOff: "Aucun",
+    },
     title: "Param\u00e8tres",
     tabGeneral: "G\u00e9n\u00e9ral",
     tabDock: "Dock",
@@ -1270,6 +1309,8 @@ const fr: Locale = {
     defaultBranch: "Branche par d\u00e9faut",
     commitSignature: "Ajouter \u00ab \u{1FA84} Commit via GitWand \u00bb dans la description",
     commitSignatureHint: "Un petit clin d\u2019\u0153il ajout\u00e9 automatiquement \u2014 supprimable \u00e0 tout moment",
+    liveRepoWatcher: "Mise \u00e0 jour live du d\u00e9p\u00f4t",
+    liveRepoWatcherHint: "Rafra\u00eechit instantan\u00e9ment \u00e0 partir des \u00e9v\u00e9nements du syst\u00e8me de fichiers au lieu d'interroger p\u00e9riodiquement. \u00c0 d\u00e9sactiver si le d\u00e9p\u00f4t est sur un disque r\u00e9seau.",
     blameAlgorithm: "Algorithme de diff pour le blame",
     blameAlgorithmHint: "Contrôle comment git blame détecte les lignes déplacées. histogram donne les meilleurs résultats.",
     secretsScannerEnabled: "Analyser les changements indexés à la recherche de secrets",
@@ -1686,7 +1727,6 @@ const fr: Locale = {
       resolve: "Résoudre",
       follow: "Suivre",
       nudge: "Relancer",
-      autoMerge: "Auto-merge",
       view: "Voir",
     },
     case: {
@@ -1755,6 +1795,23 @@ const fr: Locale = {
     reviewersShort: "Reviewers",
     refreshAll: "Tout rafraîchir",
     refreshAllTooltip: "Rafraîchir les 4 onglets en parallèle",
+    confirm: {
+      merge: {
+        title: "Merger cette pull request ?",
+        body: "{0} sera mergée dans {1}.",
+      },
+      nudge: {
+        title: "Envoyer une relance ?",
+        body: "Un commentaire sera posté sur {0}.",
+      },
+    },
+    nudge: {
+      comment: "Petite relance amicale : cette pull request est prête pour la review.",
+    },
+    toast: {
+      merged: "Pull request mergée.",
+      nudged: "Relance envoyée.",
+    },
     noWorkspace: {
       warning: "Créez d'abord un workspace pour utiliser Today",
     },
@@ -1858,6 +1915,7 @@ const fr: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Modifier le conflit {0}",
     aiButton: "IA",
     aiLoading: "IA\u2026",
     aiErrorPrefix: "IA",
