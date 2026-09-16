@@ -1573,6 +1573,12 @@ const en = {
     accountsAzureDevMock: "Azure sign-in is only available in the desktop app.",
     accountsAzureWaiting: "Waiting for authorization…",
     accountsAzureConnected: "Connected as",
+    accountsGiteaUrlLabel: "Server URL",
+    accountsGiteaTokenLabel: "Access token",
+    accountsGiteaTokenHint: "Gitea: Settings > Applications > Generate Token. Scopes: repository and issue read and write.",
+    accountsGiteaUrlInvalid: "Enter a valid server URL, for example https://git.acme.io",
+    accountsGiteaTokenRequired: "An access token is required.",
+    accountsGiteaHostTaken: "A Gitea account for {0} already exists. Remove it first to add another.",
     accountsDeleteConfirm: "Remove this account?",
     // v2.12 Git tab — branch + identity + templates
     git: {
@@ -1860,6 +1866,7 @@ const en = {
     bitbucket: "Bitbucket",
     azure: "Azure DevOps",
     cursor: "Cursor Origin",
+    gitea: "Gitea / Forgejo",
     action: "Open Settings",
   },
 

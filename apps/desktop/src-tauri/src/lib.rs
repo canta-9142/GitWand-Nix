@@ -302,11 +302,7 @@ pub fn git_stash_list_parity(cwd: String) -> Result<Vec<types::StashEntry>, Stri
 /// Parity entry point for `gh_enable_auto_merge`. Only a repo with no forge
 /// remote is checkable here (see the refusal test in `tests/parity/`): no
 /// test arms an auto-merge on a live PR.
-pub fn gh_enable_auto_merge_parity(
-    cwd: String,
-    number: i64,
-    method: String,
-) -> Result<(), String> {
+pub fn gh_enable_auto_merge_parity(cwd: String, number: i64, method: String) -> Result<(), String> {
     tauri::async_runtime::block_on(commands::gh::gh_enable_auto_merge(cwd, number, method))
 }
 
@@ -776,6 +772,26 @@ pub fn run() {
             commands::bitbucket::bb_pr_ci_checks,
             commands::bitbucket::bb_pr_annotations,
             commands::bitbucket::bb_convert_draft_to_ready,
+            commands::gitea::gitea_current_user,
+            commands::gitea::gitea_validate_token,
+            commands::gitea::gitea_list_prs,
+            commands::gitea::gitea_pr_count,
+            commands::gitea::gitea_get_pr,
+            commands::gitea::gitea_pr_diff,
+            commands::gitea::gitea_pr_status,
+            commands::gitea::gitea_pr_files,
+            commands::gitea::gitea_pr_comments,
+            commands::gitea::gitea_create_comment,
+            commands::gitea::gitea_update_comment,
+            commands::gitea::gitea_delete_comment,
+            commands::gitea::gitea_list_reviews,
+            commands::gitea::gitea_list_issues,
+            commands::gitea::gitea_reviewer_candidates,
+            commands::gitea::gitea_branches,
+            commands::gitea::gitea_create_pr,
+            commands::gitea::gitea_merge_pr,
+            commands::gitea::gitea_checkout_pr,
+            commands::gitea::gitea_convert_draft_to_ready,
             // ── MCP catalog ──
             commands::mcp_catalog::mcp_detect_configs,
             commands::mcp_catalog::mcp_read_config,

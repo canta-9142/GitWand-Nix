@@ -1543,6 +1543,12 @@ const es: Locale = {
     accountsAzureDevMock: "El inicio de sesión de Azure solo está disponible en la aplicación de escritorio.",
     accountsAzureWaiting: "Esperando autorización…",
     accountsAzureConnected: "Conectado como",
+    accountsGiteaUrlLabel: "URL del servidor",
+    accountsGiteaTokenLabel: "Token de acceso",
+    accountsGiteaTokenHint: "Gitea: Configuración > Aplicaciones > Generar token. Permisos: lectura y escritura de repositorios e incidencias.",
+    accountsGiteaUrlInvalid: "Introduce una URL de servidor válida, por ejemplo https://git.acme.io",
+    accountsGiteaTokenRequired: "Se requiere un token de acceso.",
+    accountsGiteaHostTaken: "Ya existe una cuenta de Gitea para {0}. Elimínala primero para añadir otra.",
     accountsDeleteConfirm: "¿Eliminar esta cuenta?",
     // v2.12
     git: {
@@ -1827,6 +1833,7 @@ const es: Locale = {
     bitbucket: "Bitbucket",
     azure: "Azure DevOps",
     cursor: "Cursor Origin",
+    gitea: "Gitea / Forgejo",
     action: "Abrir Ajustes",
   },
 
