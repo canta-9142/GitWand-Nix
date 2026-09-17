@@ -125,6 +125,12 @@ pub(crate) fn resolve_codex_binary() -> Option<String> {
 /// command (`claude_cli_prompt`) propagates as an error.
 #[tauri::command]
 pub(crate) async fn detect_claude_cli() -> Result<ClaudeCliInfo, String> {
+    tauri::async_runtime::spawn_blocking(detect_claude_cli_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn detect_claude_cli_inner() -> Result<ClaudeCliInfo, String> {
     let binary = match resolve_claude_binary() {
         Some(b) => b,
         None => {
@@ -166,6 +172,25 @@ pub(crate) async fn detect_claude_cli() -> Result<ClaudeCliInfo, String> {
 /// text in and get text back.
 #[tauri::command]
 pub(crate) async fn claude_cli_prompt(
+    prompt: String,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+    output_format: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    // The body spawns a process and blocks on `.output()`. Inside the async
+    // runtime that pins one of tokio's worker threads for the whole model
+    // call, which is seconds to minutes, and a batch of them starves every
+    // other IPC command. `spawn_blocking` puts it on the blocking pool
+    // instead, which is what `ops.rs` already does for git subprocesses.
+    tauri::async_runtime::spawn_blocking(move || {
+        claude_cli_prompt_inner(prompt, system_prompt, cwd, output_format, model)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn claude_cli_prompt_inner(
     prompt: String,
     system_prompt: Option<String>,
     cwd: Option<String>,
@@ -247,6 +272,12 @@ pub(crate) async fn claude_cli_prompt(
 /// first real prompt via `codex_cli_prompt`.
 #[tauri::command]
 pub(crate) async fn detect_codex_cli() -> Result<CodexCliInfo, String> {
+    tauri::async_runtime::spawn_blocking(detect_codex_cli_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn detect_codex_cli_inner() -> Result<CodexCliInfo, String> {
     let binary = match resolve_codex_binary() {
         Some(b) => b,
         None => {
@@ -281,6 +312,19 @@ pub(crate) async fn detect_codex_cli() -> Result<CodexCliInfo, String> {
 
 #[tauri::command]
 pub(crate) async fn codex_cli_prompt(
+    prompt: String,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_cli_prompt_inner(prompt, system_prompt, cwd, model)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn codex_cli_prompt_inner(
     prompt: String,
     system_prompt: Option<String>,
     cwd: Option<String>,
@@ -385,7 +429,13 @@ pub(crate) fn resolve_antigravity_binary() -> Option<String> {
 /// Claude / Codex / opencode / Copilot detectors: no prompt is sent to verify
 /// auth — that is confirmed implicitly on the first real `antigravity_cli_prompt`.
 #[tauri::command]
-pub(crate) fn detect_antigravity_cli() -> Result<AntigravityCliInfo, String> {
+pub(crate) async fn detect_antigravity_cli() -> Result<AntigravityCliInfo, String> {
+    tauri::async_runtime::spawn_blocking(detect_antigravity_cli_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn detect_antigravity_cli_inner() -> Result<AntigravityCliInfo, String> {
     let binary = match resolve_antigravity_binary() {
         Some(b) => b,
         None => {
@@ -423,7 +473,20 @@ pub(crate) fn detect_antigravity_cli() -> Result<AntigravityCliInfo, String> {
 /// prepended as a Markdown section — same portable shape as the Claude /
 /// Codex / opencode / Copilot flows. Auth is managed by Antigravity itself.
 #[tauri::command]
-pub(crate) fn antigravity_cli_prompt(
+pub(crate) async fn antigravity_cli_prompt(
+    prompt: String,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        antigravity_cli_prompt_inner(prompt, system_prompt, cwd, model)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn antigravity_cli_prompt_inner(
     prompt: String,
     system_prompt: Option<String>,
     cwd: Option<String>,
@@ -522,6 +585,12 @@ pub(crate) fn resolve_opencode_binary() -> Option<String> {
 /// confirmed implicitly on the first real `opencode_cli_prompt`.
 #[tauri::command]
 pub(crate) async fn detect_opencode_cli() -> Result<OpencodeCliInfo, String> {
+    tauri::async_runtime::spawn_blocking(detect_opencode_cli_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn detect_opencode_cli_inner() -> Result<OpencodeCliInfo, String> {
     let binary = match resolve_opencode_binary() {
         Some(b) => b,
         None => {
@@ -555,6 +624,19 @@ pub(crate) async fn detect_opencode_cli() -> Result<OpencodeCliInfo, String> {
 
 #[tauri::command]
 pub(crate) async fn opencode_cli_prompt(
+    prompt: String,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        opencode_cli_prompt_inner(prompt, system_prompt, cwd, model)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn opencode_cli_prompt_inner(
     prompt: String,
     system_prompt: Option<String>,
     cwd: Option<String>,
@@ -616,6 +698,12 @@ pub(crate) async fn opencode_cli_prompt(
 /// to free-text entry gracefully.
 #[tauri::command]
 pub(crate) async fn opencode_list_models() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(opencode_list_models_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn opencode_list_models_inner() -> Result<Vec<String>, String> {
     let binary = match resolve_opencode_binary() {
         Some(b) => b,
         None => return Ok(Vec::new()),
@@ -696,7 +784,13 @@ fn resolve_copilot_binary() -> Option<String> {
 /// Claude / Codex / opencode detectors: no prompt is sent to verify auth —
 /// that is confirmed implicitly on the first real `copilot_cli_prompt`.
 #[tauri::command]
-pub(crate) fn detect_copilot_cli() -> Result<CopilotCliInfo, String> {
+pub(crate) async fn detect_copilot_cli() -> Result<CopilotCliInfo, String> {
+    tauri::async_runtime::spawn_blocking(detect_copilot_cli_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn detect_copilot_cli_inner() -> Result<CopilotCliInfo, String> {
     let binary = match resolve_copilot_binary() {
         Some(b) => b,
         None => {
@@ -729,7 +823,20 @@ pub(crate) fn detect_copilot_cli() -> Result<CopilotCliInfo, String> {
 }
 
 #[tauri::command]
-pub(crate) fn copilot_cli_prompt(
+pub(crate) async fn copilot_cli_prompt(
+    prompt: String,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        copilot_cli_prompt_inner(prompt, system_prompt, cwd, model)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn copilot_cli_prompt_inner(
     prompt: String,
     system_prompt: Option<String>,
     cwd: Option<String>,
@@ -799,6 +906,12 @@ pub(crate) fn copilot_cli_prompt(
 /// in their browser and comes back to GitWand.
 #[tauri::command]
 pub(crate) async fn claude_cli_login() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(claude_cli_login_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn claude_cli_login_inner() -> Result<(), String> {
     let binary = resolve_claude_binary()
         .ok_or_else(|| "Binaire `claude` introuvable. Installez-le d'abord.".to_string())?;
 
@@ -861,4 +974,135 @@ pub(crate) async fn claude_cli_login() -> Result<(), String> {
 
     #[allow(unreachable_code)]
     Err("Plateforme non supportée".to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The name of the measurement test, as libtest addresses it. `module_path!`
+    /// carries the crate name in front, which the test filter does not use.
+    fn measurement_test_name() -> String {
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap();
+        format!("{module}::ai_call_does_not_occupy_the_calling_runtime")
+    }
+
+    /// Writes a deliberately slow stand-in for the `claude` binary and returns
+    /// its directory. The real CLI takes seconds to minutes per call, which is
+    /// the entire reason these commands must not run on a runtime worker; a
+    /// fake reproduces that without spending a model call, and keeps the test
+    /// meaningful on CI, where no provider CLI is installed.
+    fn write_fake_claude() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gitwand-ai-blocking-{}-{}-{}",
+            std::process::id(),
+            n,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 1\necho OK\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// Issue #196: clicking the AI action froze the whole app until the model
+    /// answered. The body of these commands spawns a process and blocks on
+    /// `.output()`, so running it on a runtime worker pins that worker for the
+    /// length of a model call, and a batch of them starves every other IPC
+    /// command the app makes.
+    ///
+    /// This is the parent half. It cannot put the fake binary on its own PATH:
+    /// `set_var` mutates process-wide state while the rest of this suite is
+    /// spawning `git` from other threads. So the measurement runs in a child
+    /// process that inherits a PATH built with `Command::env`, which touches
+    /// nothing outside that child.
+    #[test]
+    fn ai_call_does_not_block_other_ipc() {
+        let dir = write_fake_claude();
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &measurement_test_name(), "--nocapture"])
+            .env("GITWAND_AI_BLOCKING_CHILD", "1")
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "the measurement failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The child half, and the actual measurement. Inert unless the parent
+    /// above started it, so a plain `cargo test` run does not execute it twice
+    /// (and never without the fake binary on PATH).
+    ///
+    /// The runtime has ONE worker on purpose: that is the sharpest form of the
+    /// property. Three calls are put in flight, then a plain 50ms timer is
+    /// awaited on that same runtime. If the calls were running on the worker,
+    /// the timer could not fire until all three had finished, so the elapsed
+    /// time would be the three seconds they take, not the fifty milliseconds
+    /// it asks for.
+    #[test]
+    fn ai_call_does_not_occupy_the_calling_runtime() {
+        if std::env::var("GITWAND_AI_BLOCKING_CHILD").is_err() {
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (elapsed, answers) = rt.block_on(async {
+            let started = Instant::now();
+            let calls: Vec<_> = (0..3)
+                .map(|_| {
+                    tokio::spawn(claude_cli_prompt(
+                        "ping".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                })
+                .collect();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let elapsed = started.elapsed();
+            let mut answers = Vec::new();
+            for call in calls {
+                answers.push(call.await.unwrap());
+            }
+            (elapsed, answers)
+        });
+
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "a 50ms timer took {elapsed:?} to fire while three AI calls were in flight: \
+             the calls are holding the runtime worker instead of the blocking pool"
+        );
+        for answer in answers {
+            assert_eq!(answer.unwrap().trim(), "OK");
+        }
+    }
 }
