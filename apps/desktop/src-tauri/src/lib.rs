@@ -270,6 +270,18 @@ pub fn git_rebase_onto_parity(cwd: String, onto: String) -> Result<serde_json::V
         .map(|r| serde_json::json!({ "conflict": r.conflict }))
 }
 
+/// Parity entry point for `git_operation_action`. Destructive, so its parity
+/// test drives two independent fixture repos rather than comparing two runs
+/// against one working tree.
+pub fn git_operation_action_parity(
+    cwd: String,
+    operation: String,
+    action: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::block_on(commands::ops::git_operation_action(cwd, operation, action))
+        .map(|r| serde_json::json!({ "halted": r.halted }))
+}
+
 pub fn preview_merge_parity(
     cwd: String,
     source_branch: String,
@@ -549,10 +561,8 @@ pub fn run() {
             commands::ops::git_pull,
             commands::ops::git_fetch,
             commands::ops::git_merge,
-            commands::ops::git_merge_abort,
-            commands::ops::git_merge_continue,
+            commands::ops::git_operation_action,
             commands::read::git_repo_state,
-            commands::ops::git_rebase_action,
             commands::ops::git_interactive_rebase,
             commands::ops::git_rebase_onto,
             commands::ops::git_add_to_gitignore,
@@ -578,8 +588,6 @@ pub fn run() {
             commands::scratch::scratch_worktree_discard,
             commands::ops::git_conflict_check,
             commands::ops::git_cherry_pick,
-            commands::ops::git_cherry_pick_abort,
-            commands::ops::git_cherry_pick_continue,
             commands::ops::git_stash_list,
             commands::ops::git_stash_apply,
             commands::ops::git_stash_drop,
