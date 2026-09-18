@@ -79,6 +79,16 @@ export type ConfirmFn = (opts: {
   danger?: boolean;
 }) => Promise<boolean>;
 
+/** Options shared by the abort paths (design §3.1). */
+export interface AbortOptions {
+  /**
+   * True when a successful abort would discard resolution work the user has
+   * done, which is what makes the confirmation worth showing. App.vue passes
+   * `useGitWand`'s `canUndo`.
+   */
+  hasResolutionWork?: boolean;
+}
+
 export interface RepoFileEntry {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";
@@ -1138,15 +1148,42 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     }
   }
 
-  /** Abort an in-progress merge. */
-  async function abortMerge() {
-    if (!folderPath.value) return;
+  /**
+   * Abort an in-progress merge.
+   *
+   * @returns true only when git actually aborted. `git_merge_abort` returns
+   *   Ok with `success: false` when git refuses (e.g. "Entry not uptodate"),
+   *   so the field has to be read: a rejected promise is not the only failure.
+   *   The caller needs the boolean to decide whether to drop resolution state.
+   */
+  async function abortMerge(abortOpts: AbortOptions = {}): Promise<boolean> {
+    if (!folderPath.value) return false;
+    // Only worth a modal when there is something to lose (design §3.2). The
+    // signal is useGitWand's `canUndo`, handed down by App.vue.
+    if (abortOpts.hasResolutionWork && opts.confirm) {
+      const ok = await opts.confirm({
+        title: t("header.abortMergeConfirmTitle"),
+        message: t("header.abortMergeConfirmMessage"),
+        confirmLabel: t("header.abortConfirmLabel"),
+        danger: true,
+      });
+      if (!ok) return false;
+    }
     try {
-      await gitMergeAbort(folderPath.value);
-      successMessage.value = "merge-aborted";
+      const result = await gitMergeAbort(folderPath.value);
+      // refresh() first on every path: loadStatus() writes its own failure
+      // into `error`, so assigning `error` before it would let a status
+      // failure overwrite git's reason for refusing.
       await refresh();
+      if (!result.success) {
+        error.value = `abort merge: ${result.message || "unknown error"}`;
+        return false;
+      }
+      successMessage.value = "merge-aborted";
+      return true;
     } catch (err: any) {
       error.value = `abort merge: ${err?.message || String(err)}`;
+      return false;
     }
   }
 
@@ -1213,16 +1250,35 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     }
   }
 
-  async function cherryPickAbort() {
-    if (!folderPath.value) return;
+  /**
+   * Abort an in-progress cherry-pick.
+   *
+   * @returns true only when git actually aborted. `isCherryPicking` is cleared
+   *   on that branch alone — a failed abort leaves the sequencer on disk, and
+   *   dropping the flag would make the banner offer "Abort merge" for a
+   *   cherry-pick that is still in progress (design §3.4).
+   */
+  async function cherryPickAbort(abortOpts: AbortOptions = {}): Promise<boolean> {
+    if (!folderPath.value) return false;
+    if (abortOpts.hasResolutionWork && opts.confirm) {
+      const ok = await opts.confirm({
+        title: t("header.abortCherryPickConfirmTitle"),
+        message: t("header.abortCherryPickConfirmMessage"),
+        confirmLabel: t("header.abortConfirmLabel"),
+        danger: true,
+      });
+      if (!ok) return false;
+    }
     try {
       await gitCherryPickAbort(folderPath.value);
-      successMessage.value = "cherry-pick-aborted";
       await refresh();
-    } catch (err: any) {
-      error.value = `cherry-pick abort: ${err?.message ?? err}`;
-    } finally {
+      successMessage.value = "cherry-pick-aborted";
       isCherryPicking.value = false;
+      return true;
+    } catch (err: any) {
+      await refresh();
+      error.value = `cherry-pick abort: ${err?.message ?? err}`;
+      return false;
     }
   }
 
