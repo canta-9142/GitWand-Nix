@@ -51,6 +51,7 @@ const fr: Locale = {
     pull: "Pull",
     sync: "Sync",
     syncTooltip: "Récupérer les branches distantes et pull",
+    fetchProgress: "Récupération… {0} %",
     merge: "Merge",
     mergeTooltip: "Merger une branche dans la branche courante",
     mergeNoFf: "Toujours créer un commit de merge",
@@ -84,9 +85,19 @@ const fr: Locale = {
     stashDone: "Changements stashed",
     mergeDone: "Merge termin\u00e9",
     mergeAborted: "Merge annul\u00e9",
+    cherryPickDone: "Cherry-pick termin\u00e9",
+    cherryPickAborted: "Cherry-pick annul\u00e9",
     resolveConflicts: "r\u00e9solvez les conflits pour continuer",
     abortMerge: "Annuler le merge",
     abortCherryPick: "Annuler le cherry-pick",
+    pausedMerge: "Merge en pause",
+    pausedCherryPick: "Cherry-pick en pause",
+    pausedRevert: "Revert en pause",
+    operationContinue: "Continuer",
+    abortRevert: "Annuler le revert",
+    abortConfirmTitle: "Abandonner cette op\u00e9ration ?",
+    abortConfirmMessage: "Vos r\u00e9solutions seront perdues. Les fichiers reviennent \u00e0 leur \u00e9tat d'avant l'op\u00e9ration.",
+    abortConfirmLabel: "Abandonner",
     // Search trigger
     searchTooltip: "Rechercher (\u2318K)",
     searchAriaLabel: "Ouvrir la recherche",
@@ -335,6 +346,16 @@ const fr: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Modifier ce hunk",
+    editBusy: "Terminez d'abord le hunk en cours d'\u00e9dition",
+    editStale: "Le fichier a chang\u00e9 depuis le calcul de ce diff. Rafra\u00eechissez et r\u00e9essayez.",
+    newFolder: "Nouveau dossier",
+    newFolderCount: "{0} fichier(s)",
+    nestedRepo: "D\u00e9p\u00f4t Git imbriqu\u00e9",
+    nestedRepoHint:
+      "Ce dossier poss\u00e8de son propre .git, Git ne suit donc pas son contenu depuis ici. Ajoutez-le en sous-module, ignorez-le, ou supprimez son .git pour suivre les fichiers.",
+    nestedRepoOpen: "Ouvrir dans un nouvel onglet",
+    nestedRepoIgnore: "Ajouter \u00e0 .gitignore",
     noDiff: "Pas de diff disponible pour ce fichier",
     noDiffHint: "Fichier nouveau ou binaire",
     selectFile: "S\u00e9lectionnez un fichier pour voir le diff",
@@ -512,6 +533,20 @@ const fr: Locale = {
 
   // ─── Merge Preview (Phase 8.1) ──────────────────────────
   mergePreview: {
+    applying: "Application\u2026",
+    applyAndMerge: "Fusionner et auto-r\u00e9soudre",
+    applyEstimate: "Estimation : {0} hunks sur {1} auto-r\u00e9solvables",
+    applyDone: "Termin\u00e9",
+    applyStopped: "Arr\u00eat sur les conflits qui vous attendent",
+    applyLoopBound: "Arr\u00eat apr\u00e8s trop d'\u00e9tapes de rebase",
+    applyFailed: "L'op\u00e9ration a \u00e9chou\u00e9",
+    applyCounts: "{0} appliqu\u00e9s, {1} restants \u00e0 r\u00e9soudre",
+    applyDrift: "L'aper\u00e7u estimait {0}. L'op\u00e9ration r\u00e9elle voit un merge diff\u00e9rent, les deux peuvent donc diverger.",
+    applyNoSnapshot: "Aucun snapshot n'a \u00e9t\u00e9 pris : pas de retour en un clic.",
+    hunkHeldBack: "retenu ({0} %)",
+    thresholdLabel: "Appliquer seulement au-dessus de",
+    thresholdOff: "Aucun",
+    thresholdSummary: "{0} auto-resolvables, {1} retenus par le seuil, {2} manuels",
     aiRisk: "Analyse des risques",
     aiRiskHint: "Demande \u00e0 l'IA un avis sur la s\u00e9curit\u00e9 de ce merge.",
     aiRiskAnalyzing: "Analyse des risques\u2026",
@@ -737,10 +772,15 @@ const fr: Locale = {
     resolveAutoSummaryBody: "{0} conflit(s) seront r\u00e9solus ainsi :",
     resolveAutoSummaryConfirm: "Confirmer",
     resolveAutoSummaryCancel: "Annuler",
+    resolveAutoSummaryToggle: "Appliquer le conflit {0}",
     bulkLabel: "Tout accepter :",
     bulkOurs: "Courante",
     bulkTheirs: "Entrante",
     bulkBoth: "Les deux",
+    bulkAi: "IA",
+    bulkAiCancel: "Annuler",
+    bulkAiProgress: "{0} sur {1}",
+    bulkAiSummary: "{0} r\u00e9solus, {1} en \u00e9chec",
     bulkGeneratedWarning: "\u26a0 Concat\u00e9ner peut casser un fichier g\u00e9n\u00e9r\u00e9",
     recommended: "recommand\u00e9",
     autoResolved: "auto",
@@ -770,6 +810,12 @@ const fr: Locale = {
     markerlessExplanation: "Git enregistre un conflit pour ce fichier, mais la copie de travail n'a pas de marqueurs et ne correspond à aucun des deux côtés.",
     reconstructConflict: "Reconstruire le conflit",
     keepWorkingTree: "Garder ma version (stager tel quel)",
+    unreadableTitle: "Fichier illisible en tant que texte",
+    unreadableExplanation: "Git signale ce fichier comme étant en conflit, mais son contenu n'est pas du texte UTF-8 valide : il n'y a donc aucun bloc à afficher. C'est le plus souvent un artefact de build ou un binaire. Vous pouvez quand même le régler en prenant un côté en entier, ce qui travaille sur les octets bruts, ou l'ouvrir dans votre propre éditeur.",
+    unreadableKeepOurs: "Garder notre version",
+    unreadableKeepTheirs: "Garder leur version",
+    unreadableOpenExternally: "Ouvrir dans l'éditeur externe",
+    unreadableReasonLabel: "Raison signalée",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -864,6 +910,7 @@ const fr: Locale = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Merger la PR",
@@ -890,6 +937,10 @@ const fr: Locale = {
       mergeProblem: "Problème détecté",
       mergeUnknown: "Inconnu",
       mergeNoPermission: "Vous n'avez pas l'autorisation de fusionner cette pull request",
+      autoMergeArm: "Fusionner une fois les vérifications réussies",
+      autoMergeDisarm: "Annuler la fusion planifiée",
+      autoMergeArmed: "Sera fusionnée une fois les vérifications réussies",
+      autoMergeUnavailable: "Fusion planifiée indisponible",
       statFiles: "Fichiers",
       statDiff: "Diff",
       statComments: "Commentaires",
@@ -1065,6 +1116,13 @@ const fr: Locale = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Confiance de resolution",
+      subtitle: "Un seuil sur la confiance par hunk du moteur, applique partout ou GitWand resout.",
+      minConfidenceScore: "Appliquer seulement au-dessus de",
+      minConfidenceScoreHint: "Les auto-resolutions sous ce score sont proposees au lieu d etre appliquees. Ne laisse jamais passer ce que le moteur a deja refuse.",
+      barOff: "Aucun",
+    },
     title: "Param\u00e8tres",
     tabGeneral: "G\u00e9n\u00e9ral",
     tabDock: "Dock",
@@ -1270,6 +1328,8 @@ const fr: Locale = {
     defaultBranch: "Branche par d\u00e9faut",
     commitSignature: "Ajouter \u00ab \u{1FA84} Commit via GitWand \u00bb dans la description",
     commitSignatureHint: "Un petit clin d\u2019\u0153il ajout\u00e9 automatiquement \u2014 supprimable \u00e0 tout moment",
+    liveRepoWatcher: "Mise \u00e0 jour live du d\u00e9p\u00f4t",
+    liveRepoWatcherHint: "Rafra\u00eechit instantan\u00e9ment \u00e0 partir des \u00e9v\u00e9nements du syst\u00e8me de fichiers au lieu d'interroger p\u00e9riodiquement. \u00c0 d\u00e9sactiver si le d\u00e9p\u00f4t est sur un disque r\u00e9seau.",
     blameAlgorithm: "Algorithme de diff pour le blame",
     blameAlgorithmHint: "Contrôle comment git blame détecte les lignes déplacées. histogram donne les meilleurs résultats.",
     secretsScannerEnabled: "Analyser les changements indexés à la recherche de secrets",
@@ -1506,6 +1566,12 @@ const fr: Locale = {
     accountsAzureDevMock: "La connexion Azure n'est disponible que dans l'application desktop.",
     accountsAzureWaiting: "En attente d'autorisation…",
     accountsAzureConnected: "Connecté en tant que",
+    accountsGiteaUrlLabel: "URL du serveur",
+    accountsGiteaTokenLabel: "Jeton d'accès",
+    accountsGiteaTokenHint: "Gitea : Paramètres > Applications > Générer un jeton. Portées : lecture et écriture sur les dépôts et les tickets.",
+    accountsGiteaUrlInvalid: "Saisissez une URL de serveur valide, par exemple https://git.acme.io",
+    accountsGiteaTokenRequired: "Un jeton d'accès est requis.",
+    accountsGiteaHostTaken: "Un compte Gitea pour {0} existe déjà. Supprimez-le d'abord pour en ajouter un autre.",
     accountsDeleteConfirm: "Supprimer ce compte ?",
     // v2.12 Onglet Git
     git: {
@@ -1680,13 +1746,13 @@ const fr: Locale = {
     },
     action: {
       merge: "Merger",
+      "auto-merge": "Planifier la fusion",
       review: "Reviewer",
       seeFailure: "Voir l'échec",
       reply: "Répondre",
       resolve: "Résoudre",
       follow: "Suivre",
       nudge: "Relancer",
-      autoMerge: "Auto-merge",
       view: "Voir",
     },
     case: {
@@ -1755,6 +1821,28 @@ const fr: Locale = {
     reviewersShort: "Reviewers",
     refreshAll: "Tout rafraîchir",
     refreshAllTooltip: "Rafraîchir les 4 onglets en parallèle",
+    confirm: {
+      merge: {
+        title: "Merger cette pull request ?",
+        body: "{0} sera mergée dans {1}.",
+      },
+      autoMerge: {
+        title: "Planifier la fusion de cette pull request ?",
+        body: "{0} sera fusionnée dans {1} une fois les vérifications réussies.",
+      },
+      nudge: {
+        title: "Envoyer une relance ?",
+        body: "Un commentaire sera posté sur {0}.",
+      },
+    },
+    nudge: {
+      comment: "Petite relance amicale : cette pull request est prête pour la review.",
+    },
+    toast: {
+      merged: "Pull request mergée.",
+      autoMergeArmed: "Fusion planifiée.",
+      nudged: "Relance envoyée.",
+    },
     noWorkspace: {
       warning: "Créez d'abord un workspace pour utiliser Today",
     },
@@ -1768,6 +1856,7 @@ const fr: Locale = {
     bitbucket: "Bitbucket",
     azure: "Azure DevOps",
     cursor: "Cursor Origin",
+    gitea: "Gitea / Forgejo",
     action: "Ouvrir les Réglages",
   },
 
@@ -1858,10 +1947,15 @@ const fr: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Modifier le conflit {0}",
     aiButton: "IA",
     aiLoading: "IA\u2026",
     aiErrorPrefix: "IA",
     aiSuggestionLabel: "Suggestion IA \u2014 relis et ajuste",
+    aiStagedReady: "Suggestion IA prête",
+    aiStagedReview: "Relire",
+    aiStagedDiscard: "Écarter",
+    aiRetry: "Réessayer",
     explainTooltip: "Expliquer ce conflit en langage naturel",
     explain: "Expliquer",
     explainAnalyzing: "Analyse\u2026",

@@ -2,10 +2,14 @@
 // Extracted from backend.ts as part of the v2.11 backend split to keep module size manageable.
 // Consumers should import directly from this file instead of backend.ts for these symbols.
 
-import { isTauri, tauriInvoke } from "./backend-core";
+import { isTauri, tauriInvoke, devFetch, DEV_SERVER } from "./backend-core";
 import {
   PullRequest,
   PullRequestDetail,
+  AutoMergeState,
+  AutoMergeSupport,
+  CLOSED_AUTO_MERGE,
+  UNSUPPORTED_AUTO_MERGE,
   CICheck,
   CIAnnotation,
   CIAnnotationRaw,
@@ -21,6 +25,12 @@ import {
 // These mirror the gh* functions above but call the `glab` CLI via Rust.
 // All functions are Tauri-only for now — no dev-server fallback needed
 // since GitLab repos are only accessible in the native Tauri app context.
+//
+// Exception: `glEnableAutoMerge`/`glDisableAutoMerge` (v3.11.0) have a
+// dev-server fallback like the gh* functions above, so the auto-merge
+// parity suite (`tests/parity/auto-merge-refusal.test.mjs`) can exercise
+// both backends. This is the first GitLab write path with one; earlier
+// gl* commands are unaffected.
 //
 // Auth: managed by `glab auth login` — no token is ever passed via IPC.
 
@@ -40,14 +50,20 @@ interface RawGlPullRequest {
   additions: number; deletions: number; labels: string[]; assignees: string[];
   review_requested: string[]; review_decision: string; merge_state_status: string;
   checks_rollup: string; comment_count: number;
+  /** Explicitly renamed on the Rust side (`#[serde(rename = "autoMerge")]`),
+   *  unlike every other field on this struct, so it already arrives camelCase. */
+  autoMerge?: AutoMergeState;
 }
 
 /** Map a raw `gl_list_mrs`/`gl_create_mr` payload to the camelCase
  *  `PullRequest` shape the rest of the app expects — mirrors what `glGetMr`
  *  and every GitHub equivalent already do (#161: previously unmapped here,
  *  so e.g. `createdAt`/`updatedAt` reached the UI as `undefined` and
- *  `timeAgo()` rendered "NaNj" instead of an age). */
-function mapGlPullRequest(pr: RawGlPullRequest): PullRequest {
+ *  `timeAgo()` rendered "NaNj" instead of an age).
+ *
+ *  Exported (v3.11.0) so the auto-merge passthrough can be tested directly,
+ *  without going through the Tauri-invoking wrapper functions. */
+export function mapGlPullRequest(pr: RawGlPullRequest): PullRequest {
   return {
     number: pr.number, title: pr.title, state: pr.state, author: pr.author,
     branch: pr.branch, base: pr.base, draft: pr.draft,
@@ -57,6 +73,9 @@ function mapGlPullRequest(pr: RawGlPullRequest): PullRequest {
     reviewRequested: pr.review_requested, reviewDecision: pr.review_decision,
     mergeStateStatus: pr.merge_state_status, checksRollup: pr.checks_rollup,
     commentCount: pr.comment_count,
+    // Fails closed: an absent descriptor (older backend, unwired path) must
+    // never offer the auto-merge action, so default to CLOSED_AUTO_MERGE.
+    autoMerge: pr.autoMerge ?? CLOSED_AUTO_MERGE,
   };
 }
 
@@ -88,6 +107,8 @@ export async function glGetMr(cwd: string, iid: number): Promise<PullRequestDeta
     changed_files: number; comments: number; review_comments: number;
     labels: string[]; reviewers: string[]; mergeable: string; checks_status: string;
     can_merge: boolean | null; head_sha?: string;
+    autoMerge?: AutoMergeState;
+    autoMergeSupport?: AutoMergeSupport;
   }>("gl_get_mr", { cwd, iid });
   return {
     number: raw.number, title: raw.title, body: raw.body, state: raw.state,
@@ -98,6 +119,8 @@ export async function glGetMr(cwd: string, iid: number): Promise<PullRequestDeta
     reviewComments: raw.review_comments, labels: raw.labels, reviewers: raw.reviewers,
     mergeable: raw.mergeable, checksStatus: raw.checks_status,
     canMerge: raw.can_merge ?? null, headSha: raw.head_sha ?? "",
+    autoMerge: raw.autoMerge ?? CLOSED_AUTO_MERGE,
+    autoMergeSupport: raw.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
   } as unknown as PullRequestDetail;
 }
 
@@ -169,6 +192,40 @@ export async function glMergeMr(
 ): Promise<void> {
   if (!isTauri()) throw new Error("glMergeMr requires Tauri");
   return tauriInvoke<void>("gl_merge_mr", { cwd, iid, method });
+}
+
+/** Queue this MR to merge once its pipeline succeeds. */
+export async function glEnableAutoMerge(
+  cwd: string,
+  iid: number,
+  method: string = "merge",
+): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gl_enable_auto_merge", { cwd, iid, method });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gl-enable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, iid, method }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
+/** Cancel a queued auto-merge on a MR. */
+export async function glDisableAutoMerge(cwd: string, iid: number): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gl_disable_auto_merge", { cwd, iid });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gl-disable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, iid }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
 }
 
 /** Checkout a MR branch locally. */

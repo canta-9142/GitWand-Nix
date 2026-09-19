@@ -122,18 +122,86 @@
             v-for="(h, i) in f.hunks"
             :key="i"
             class="preview-hunk"
-            :class="h.autoResolved ? 'preview-hunk--auto' : 'preview-hunk--manual'"
+            :class="hunkClass(h)"
+            :title="`${h.confidenceScore}% (${h.confidenceLabel}) — ${h.reason}`"
           >
-            <span class="ph-icon">{{ h.autoResolved ? '✓' : '✕' }}</span>
+            <!-- A bar, not a number: the score is only actionable on the rows
+                 the bar is holding back, and those show it below. -->
+            <span
+              class="ph-confidence"
+              :class="`ph-confidence--${h.confidenceLabel}`"
+              aria-hidden="true"
+            ></span>
+            <span class="ph-icon">{{ hunkIcon(h) }}</span>
             <span class="ph-line">{{ t('mergePreview.hunkLine') }} {{ h.startLine }}</span>
             <span class="ph-type">{{ h.type }}</span>
             <span class="ph-status">
-              {{ h.autoResolved ? t('mergePreview.hunkAuto') : t('mergePreview.hunkManual') }}
+              <template v-if="isHeldBack(h)">
+                {{ t('mergePreview.hunkHeldBack', String(h.confidenceScore)) }}
+              </template>
+              <template v-else>
+                {{ h.autoResolved ? t('mergePreview.hunkAuto') : t('mergePreview.hunkManual') }}
+              </template>
             </span>
           </li>
         </ul>
       </div>
     </div>
+
+    <!-- ─── Confidence bar (v3.11.0) ─────────────────────── -->
+    <div v-if="summary.conflictingFiles > 0" class="preview-bar">
+      <div class="preview-bar__head">
+        <span class="preview-bar__label">{{ t('mergePreview.thresholdLabel') }}</span>
+        <!-- Five stops, not a free slider: scores cluster around a handful of
+             dimension combinations, so ~95 continuous positions would do
+             nothing and invite false precision. -->
+        <div class="preview-bar__stops" role="group" :aria-label="t('mergePreview.thresholdLabel')">
+          <button
+            v-for="stop in THRESHOLD_STOPS"
+            :key="stop"
+            type="button"
+            class="preview-bar__stop"
+            :class="{ 'preview-bar__stop--active': threshold === stop }"
+            :aria-pressed="threshold === stop"
+            @click="emit('update:threshold', stop)"
+          >{{ stop === 0 ? t('mergePreview.thresholdOff') : `${stop}%` }}</button>
+        </div>
+      </div>
+      <p class="preview-bar__summary">
+        {{ t('mergePreview.thresholdSummary',
+             String(estimatedAutoResolutions),
+             String(heldByThreshold),
+             String(manualHunks)) }}
+      </p>
+    </div>
+
+    <!-- ─── Apply from preview (v3.11.0) ─────────────────── -->
+    <div v-if="summary.conflictingFiles > 0" class="preview-apply">
+      <button
+        type="button"
+        class="btn btn--primary preview-apply__btn"
+        :disabled="props.applying"
+        @click="emit('apply')"
+      >
+        <span v-if="props.applying">… {{ t('mergePreview.applying') }}</span>
+        <span v-else>{{ t('mergePreview.applyAndMerge') }}</span>
+      </button>
+      <!-- "Estimated" is load-bearing: the simulation and the real operation
+           use different merge algorithms and can see a different file set, so
+           this number is a prediction, not a promise. -->
+      <span class="preview-apply__estimate">
+        {{ t('mergePreview.applyEstimate',
+              String(estimatedAutoResolutions),
+              String(estimatedAutoResolutions + heldByThreshold + manualHunks)) }}
+      </span>
+    </div>
+
+    <MergeApplyReport
+      v-if="props.applyOutcome"
+      :outcome="props.applyOutcome"
+      @dismiss="emit('dismiss-apply')"
+      @open-residual="(p) => emit('open-residual', p)"
+    />
 
     <!-- ─── Scratch worktree (v2.20.0) ───────────────────── -->
     <div v-if="summary.conflictingFiles > 0" class="preview-scratch">
@@ -183,11 +251,13 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "../composables/useI18n.js";
-import type { MergePreviewSummary, PreviewFileResult, PreviewFileStatus, PreviewOperation, RiskLevel } from "../composables/useMergePreview.js";
+import type { MergePreviewSummary, PreviewFileResult, PreviewFileStatus, PreviewHunk, PreviewOperation, RiskLevel } from "../composables/useMergePreview.js";
 import type { ScratchWorktree } from "../utils/backend.js";
 import { useAIProvider } from "../composables/useAIProvider.js";
 import { useMergeRisk } from "../composables/useMergeRisk.js";
 import AiSparkle from "./AiSparkle.vue";
+import MergeApplyReport from "./MergeApplyReport.vue";
+import type { ApplyOutcome } from "../composables/useApplyFromPreview.js";
 
 const props = defineProps<{
   loading: boolean;
@@ -206,6 +276,18 @@ const props = defineProps<{
   scratchLoading?: boolean;
   /** Error from the last scratch worktree op, surfaced inline. */
   scratchError?: string | null;
+  /** v3.11 — current numeric confidence bar, 0 disables it. */
+  threshold?: number;
+  /** Auto-resolutions surviving the bar. */
+  estimatedAutoResolutions?: number;
+  /** Auto-resolutions the bar alone is holding back. */
+  heldByThreshold?: number;
+  /** Hunks the engine refused outright; no bar can rescue these. */
+  manualHunks?: number;
+  /** v3.11 — an apply is running. */
+  applying?: boolean;
+  /** v3.11 — what the last apply did, if one has run. */
+  applyOutcome?: ApplyOutcome | null;
 }>();
 
 const emit = defineEmits<{
@@ -217,7 +299,37 @@ const emit = defineEmits<{
   "scratch-merge-back": [];
   /** Abandon the scratch worktree. */
   "scratch-discard": [];
+  /** v3.11 — user moved the confidence bar. */
+  "update:threshold": [value: number];
+  /** v3.11 — run the operation for real and apply the engine's resolutions. */
+  apply: [];
+  "dismiss-apply": [];
+  "open-residual": [path: string];
 }>();
+
+// ─── v3.11 — confidence bar ─────────────────────────────
+/** Discrete stops. See the template for why this is not a free slider. */
+const THRESHOLD_STOPS = [0, 60, 75, 90, 95] as const;
+
+const threshold = computed(() => props.threshold ?? 0);
+const estimatedAutoResolutions = computed(() => props.estimatedAutoResolutions ?? 0);
+const heldByThreshold = computed(() => props.heldByThreshold ?? 0);
+const manualHunks = computed(() => props.manualHunks ?? 0);
+
+/** Auto-resolvable, but below the current bar. */
+function isHeldBack(h: PreviewHunk): boolean {
+  return h.autoResolved && h.confidenceScore < threshold.value;
+}
+
+function hunkClass(h: PreviewHunk): string {
+  if (isHeldBack(h)) return "preview-hunk--held";
+  return h.autoResolved ? "preview-hunk--auto" : "preview-hunk--manual";
+}
+
+function hunkIcon(h: PreviewHunk): string {
+  if (isHeldBack(h)) return "◌";
+  return h.autoResolved ? "✓" : "✕";
+}
 
 const OPERATIONS: PreviewOperation[] = ["merge", "rebase", "cherry-pick"];
 
@@ -298,15 +410,98 @@ function basename(path: string): string {
 </script>
 
 <style scoped>
+.preview-apply {
+  border-top: 1px solid var(--color-border);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.preview-apply__btn { flex: 0 0 auto; }
+.preview-apply__estimate {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+/* ─── v3.11 confidence bar ───────────────────────────── */
+.ph-confidence {
+  display: inline-block;
+  width: 3px;
+  align-self: stretch;
+  min-height: 12px;
+  border-radius: 2px;
+  background: var(--color-border);
+  flex: 0 0 auto;
+}
+.ph-confidence--certain,
+.ph-confidence--high { background: var(--color-success); }
+.ph-confidence--medium { background: var(--color-warning); }
+.ph-confidence--low { background: var(--color-danger); }
+
+.preview-hunk--held { opacity: 0.7; }
+.preview-hunk--held .ph-status { color: var(--color-warning); }
+
+.preview-bar {
+  border-top: 1px solid var(--color-border);
+  padding: 10px 12px;
+}
+.preview-bar__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.preview-bar__label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.preview-bar__stops {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+.preview-bar__stop {
+  border: 1px solid var(--color-border);
+  background: transparent;
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+.preview-bar__stop--active {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-accent-text);
+}
+.preview-bar__summary {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+/* Design tokens only, with no colour fallback.
+   `--color-surface-1` / `--color-surface-2` were never defined by either
+   theme, so every one of these rules silently fell through to its hard-coded
+   Catppuccin fallback: a dark panel, while `--color-text` *is* defined and
+   resolves to near-black in light mode. The result was #1e1e2e behind #15151f
+   text, so the file names in this panel were invisible in light mode.
+   Nothing caught it because the panel had no dev-server route until v3.11 and
+   therefore never rendered at all under `pnpm dev:web`. */
 .preview-panel {
-  background: var(--color-surface-2, #1e1e2e);
-  border: 1px solid var(--color-border, #313244);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 12px;
-  color: var(--color-text, #cdd6f4);
-  min-width: 240px;
-  max-width: 340px;
+  color: var(--color-text);
+  /* v3.11: 340px was sized for a stats row and a file list. The confidence
+     bar adds five stops on one line, and the apply row a button plus its
+     estimate, both of which wrapped into ragged two- and three-line blocks at
+     the old cap. */
+  min-width: 320px;
+  max-width: 460px;
 }
 
 .preview-panel--loading,
@@ -332,6 +527,10 @@ function basename(path: string): string {
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+  /* Wrap rather than squeeze: the row holds two badges, the source branch and
+     the AI button, and the branch name is the only flexible item, so without
+     this it was the one thing that got ellipsized away to "← …". */
+  flex-wrap: wrap;
 }
 
 .preview-badge {
@@ -345,11 +544,13 @@ function basename(path: string): string {
 .preview-badge--warn   { background: var(--color-warning-soft); color: var(--color-warning); }
 
 .preview-branch {
-  flex: 1;
+  /* Keep enough room for a realistic branch name before ellipsizing. */
+  flex: 1 1 140px;
+  min-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--color-subtext, #6c7086);
+  color: var(--color-text-muted);
   font-size: 11px;
 }
 
@@ -357,12 +558,12 @@ function basename(path: string): string {
   background: none;
   border: none;
   cursor: pointer;
-  color: var(--color-subtext, #6c7086);
+  color: var(--color-text-muted);
   padding: 0 2px;
   font-size: 12px;
   line-height: 1;
 }
-.preview-close:hover { color: var(--color-text, #cdd6f4); }
+.preview-close:hover { color: var(--color-text); }
 
 /* Tight-packing override so the global .btn--ai fits the compact
    preview header (the default 32px min-height is too tall here). */
@@ -404,7 +605,7 @@ function basename(path: string): string {
   background: none;
   border: none;
   cursor: pointer;
-  color: var(--color-subtext);
+  color: var(--color-text-muted);
   font-size: 12px;
   line-height: 1;
   padding: 0 2px;
@@ -446,7 +647,7 @@ function basename(path: string): string {
   gap: 6px;
   padding: 3px 6px;
   border-radius: 4px;
-  background: var(--color-surface-1, #181825);
+  background: var(--color-bg-tertiary);
 }
 
 .pf-icon {
@@ -481,7 +682,7 @@ function basename(path: string): string {
   gap: 2px;
   margin-bottom: 8px;
   padding: 2px;
-  background: var(--color-surface-1, #181825);
+  background: var(--color-bg-tertiary);
   border-radius: var(--radius-sm, 6px);
 }
 .preview-op {
@@ -491,14 +692,14 @@ function basename(path: string): string {
   cursor: pointer;
   padding: 3px 6px;
   font-size: var(--text-xs);
-  color: var(--color-subtext, #6c7086);
+  color: var(--color-text-muted);
   border-radius: var(--radius-xs, 4px);
   text-transform: capitalize;
 }
-.preview-op:hover { color: var(--color-text, #cdd6f4); }
+.preview-op:hover { color: var(--color-text); }
 .preview-op--active {
-  background: var(--color-surface-2, #1e1e2e);
-  color: var(--color-text, #cdd6f4);
+  background: var(--color-bg-secondary);
+  color: var(--color-text);
   font-weight: var(--font-semibold);
 }
 
@@ -531,7 +732,7 @@ function basename(path: string): string {
   font-size: 9px;
   width: 10px;
   flex-shrink: 0;
-  color: var(--color-subtext, #6c7086);
+  color: var(--color-text-muted);
 }
 
 /* Hunk-by-hunk list */
@@ -549,13 +750,13 @@ function basename(path: string): string {
   gap: 6px;
   padding: 2px 6px;
   border-radius: 4px;
-  background: var(--color-surface-2, #1e1e2e);
+  background: var(--color-bg-secondary);
   font-size: var(--text-xs);
 }
 .preview-hunk--auto .ph-icon   { color: var(--color-success); }
 .preview-hunk--manual .ph-icon { color: var(--color-danger); }
 .ph-icon { width: 12px; text-align: center; flex-shrink: 0; }
-.ph-line { color: var(--color-subtext, #6c7086); white-space: nowrap; }
+.ph-line { color: var(--color-text-muted); white-space: nowrap; }
 .ph-type {
   flex: 1;
   font-family: var(--font-mono, monospace);
@@ -569,7 +770,7 @@ function basename(path: string): string {
 .preview-scratch {
   margin-top: 8px;
   padding-top: 8px;
-  border-top: 1px solid var(--color-border, #313244);
+  border-top: 1px solid var(--color-border);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -592,7 +793,7 @@ function basename(path: string): string {
 .preview-scratch-path {
   font-family: var(--font-mono, monospace);
   font-size: var(--text-xs);
-  color: var(--color-subtext, #6c7086);
+  color: var(--color-text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

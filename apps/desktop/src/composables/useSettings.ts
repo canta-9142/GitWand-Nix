@@ -251,6 +251,20 @@ export interface AppSettings {
    */
   dockOrder: DockEntryId[];
 
+  /**
+   * v3.11 — resolution policy shared by every apply path.
+   *
+   * `minConfidenceScore` is a numeric bar, 0-100, on the engine's per-hunk
+   * confidence. 0 disables it. It sits here rather than under
+   * `automations.autoResolve` on purpose: it governs the merge editor's
+   * "Resolve auto", the Conflict Predictor's apply and the MERGE_HEAD
+   * automation alike. One bar everywhere, or "apply only above 90%" would mean
+   * three different things in three places.
+   */
+  resolution: {
+    minConfidenceScore: number;
+  };
+
   /** Automation settings (v2.8). */
   automations: {
     /** Auto-resolve conflicts the moment MERGE_HEAD appears. */
@@ -417,6 +431,12 @@ export interface AppSettings {
   snapshotMaxCount: number;
   /** Opt-in: one-line AI summaries for snapshots in the timeline. */
   snapshotAiLabels: boolean;
+  /**
+   * Live Repo (v3.10.0): subscribe to filesystem events instead of relying on
+   * the 2 s status poll. Off falls back to the pre-v3.10 polling behavior,
+   * which is what network mounts and FUSE filesystems need.
+   */
+  liveRepoWatcher: boolean;
 }
 
 export type TerminalMode = "floating" | "fullscreen" | "bottom";
@@ -474,6 +494,7 @@ export const defaultAppSettings: AppSettings = {
   dockUnlocked: false,
   dockPosition: null,
   dockOrder: [...DEFAULT_DOCK_ORDER],
+  resolution: { minConfidenceScore: 0 },
   automations: {
     autoResolve:    { enabled: false },
     nightlyPull:    { enabled: false, hour: 8, minute: 0 },
@@ -515,6 +536,7 @@ export const defaultAppSettings: AppSettings = {
   snapshotRetentionDays:             14,
   snapshotMaxCount:                  200,
   snapshotAiLabels:                  false,
+  liveRepoWatcher:                   true,
 };
 
 const SETTINGS_KEY = "gitwand-settings";
