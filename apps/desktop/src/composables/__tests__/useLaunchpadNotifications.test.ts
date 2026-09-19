@@ -5,6 +5,7 @@ import {
   _resetLaunchpadSnapshot,
 } from "../useLaunchpadNotifications";
 import type { PrWithRepo } from "../useLaunchpadPrs";
+import { CLOSED_AUTO_MERGE } from "../../utils/backend";
 
 /** Build a PrWithRepo with sensible defaults; override what each test needs. */
 function mk(overrides: Partial<PrWithRepo> & { url: string }): PrWithRepo {
@@ -27,6 +28,7 @@ function mk(overrides: Partial<PrWithRepo> & { url: string }): PrWithRepo {
     mergeStateStatus: "",
     checksRollup: "",
     commentCount: 0,
+    autoMerge: CLOSED_AUTO_MERGE,
     repoName: "alpha",
     repoPath: "/repo/a",
     ...overrides,

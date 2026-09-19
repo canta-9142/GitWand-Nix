@@ -1,6 +1,6 @@
 [package]
 name = "gitwand-desktop"
-version = "3.9.1"
+version = "3.10.1"
 description = "GitWand Desktop — standalone merge conflict resolution"
 authors = ["Laurent Guitton <lb.guitton@gmail.com>"]
 license = "MIT"
@@ -70,6 +70,12 @@ rayon = "1"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 portable-pty = "0.9"
 
+# Live Repo FS watcher (v3.10.0). Backs `commands/watcher.rs`: one recommended
+# (platform-native: FSEvents / inotify / ReadDirectoryChangesW) watcher per open
+# repo, coalesced in-process. Deliberately without `notify-debouncer-full`: we
+# need our own classification pass anyway, and one dependency is enough.
+notify = "8.2.0"
+
 # libgit2 bindings for in-process git operations (P3.3). Used in the
 # workspace_*_all hot paths to read branch + ahead/behind + file statuses
 # without spawning git subprocesses (5-15ms each on macOS). Vendored to
@@ -108,6 +114,13 @@ uuid = { version = "1", features = ["v4"] }
 # patterns from `.gitwandrc`. Mirrored by a pure-RegExp TS engine in
 # @gitwand/core; see commands/secrets.rs.
 regex = "1"
+
+[dev-dependencies]
+# tokio is already in the tree (tauri depends on it) — this entry only makes
+# it nameable from `#[cfg(test)]` code, so a test can build a runtime with a
+# known worker count and prove the AI commands never occupy it (issue #196).
+# Dev-only: nothing here reaches the shipped binary or the release profile.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time"] }
 
 # ─── Release profile (P2.4) ──────────────────────────────────
 #

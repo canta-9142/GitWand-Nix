@@ -337,6 +337,28 @@ fn jlogins(v: &serde_json::Value, arr_key: &str, field: &str) -> Vec<String> {
 
 // ─── Mapping ────────────────────────────────────────────────────────────────
 
+/// Translate the REST pull-request object's `auto_merge` field (an object
+/// when a merge is queued, `null` otherwise) into the shape
+/// `gh_auto_merge_state` expects and is tested against, so both the `gh` CLI
+/// path (`git/parse.rs`) and this tokenless REST path funnel through the same
+/// mapping function rather than duplicating its logic under a second name.
+fn rest_pr_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeState {
+    crate::commands::gh::gh_auto_merge_state(&serde_json::json!({
+        "autoMergeRequest": pr.get("auto_merge")
+    }))
+}
+
+/// Same translation as `rest_pr_auto_merge_state`, for the repository-level
+/// setting: REST's `allow_auto_merge` is `autoMergeAllowed` on GitHub's
+/// GraphQL `Repository` type, reachable via `gh api graphql` (NOT `gh repo
+/// view --json autoMergeAllowed`, which `gh repo view` rejects with "Unknown
+/// JSON field").
+fn rest_repo_auto_merge_support(repo: &serde_json::Value) -> crate::types::AutoMergeSupport {
+    crate::commands::gh::gh_auto_merge_support(&serde_json::json!({
+        "autoMergeAllowed": repo.get("allow_auto_merge")
+    }))
+}
+
 /// Map a GitHub REST pull-request object to `PullRequest`.
 fn json_to_pr(pr: &serde_json::Value) -> PullRequest {
     let merged = pr.get("merged_at").map(|m| !m.is_null()).unwrap_or(false);
@@ -375,6 +397,7 @@ fn json_to_pr(pr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(pr, "mergeable_state").to_uppercase(),
         checks_rollup: String::new(),
         comment_count: ji(pr, "comments"),
+        auto_merge: rest_pr_auto_merge_state(pr),
     }
 }
 
@@ -423,6 +446,10 @@ fn json_to_detail(pr: &serde_json::Value) -> PullRequestDetail {
         // response does not embed `permissions` on the nested base repo.
         can_merge: None,
         head_sha: jnested(pr, "head", "sha"),
+        auto_merge: rest_pr_auto_merge_state(pr),
+        // Populated by the caller (rest_pr_detail): needs the base repo's own
+        // JSON object, which this per-PR payload doesn't embed.
+        auto_merge_support: Default::default(),
     }
 }
 
@@ -771,24 +798,38 @@ pub(crate) fn rest_pr_detail(
     // check-runs so the CI tab can colour itself (red / yellow / green).
     let sha = jnested(&v, "head", "sha");
     detail.checks_status = rest_rollup_for_sha(&repo, &sha, token);
-    // The nested `base.repo` in a pulls response omits the `permissions` block —
-    // only the top-level repo endpoint returns it. `repo` is the *base* repo
-    // (upstream for a fork), so this checks merge rights on the right side.
-    if let Some(cm) = rest_repo_can_push(&repo, token) {
+    // The nested `base.repo` in a pulls response omits the `permissions` block
+    // (and `allow_auto_merge`): only the top-level repo endpoint returns
+    // them. `repo` is the *base* repo (upstream for a fork), so this checks
+    // merge rights and the auto-merge setting on the right side.
+    let (can_push, auto_merge_support) = rest_repo_can_push_and_auto_merge_support(&repo, token);
+    if let Some(cm) = can_push {
         detail.can_merge = Some(cm);
     }
+    detail.auto_merge_support = auto_merge_support;
     Ok(detail)
 }
 
 /// Whether the authenticated user has push (= merge) access to `repo`
-/// (`owner/name`), via `GET /repos/{repo}`'s `permissions.push`. Returns `None`
-/// on any failure so the UI falls back to error-only gating.
-fn rest_repo_can_push(repo: &str, token: &str) -> Option<bool> {
+/// (`owner/name`), and whether the repo allows forge-side auto-merge, both
+/// read off the single `GET /repos/{repo}` response so the auto-merge check
+/// doesn't cost a second round trip per PR detail open. `can_merge` is `None`
+/// on any failure so the UI falls back to error-only gating; auto-merge
+/// support fails closed to "unsupported" on the same failure.
+fn rest_repo_can_push_and_auto_merge_support(
+    repo: &str,
+    token: &str,
+) -> (Option<bool>, crate::types::AutoMergeSupport) {
     let url = format!("{}/repos/{}", API_BASE, repo);
-    let v = api_json("GET", &url, token, None).ok()?;
-    v.get("permissions")
+    let v = match api_json("GET", &url, token, None) {
+        Ok(v) => v,
+        Err(_) => return (None, rest_repo_auto_merge_support(&serde_json::Value::Null)),
+    };
+    let can_push = v
+        .get("permissions")
         .and_then(|p| p.get("push"))
-        .and_then(|b| b.as_bool())
+        .and_then(|b| b.as_bool());
+    (can_push, rest_repo_auto_merge_support(&v))
 }
 
 pub(crate) fn rest_pr_diff(cwd: &str, number: i64, token: &str) -> Result<String, String> {
@@ -1445,6 +1486,64 @@ pub(crate) fn rest_pr_ready(cwd: &str, number: i64, token: &str) -> Result<(), S
     // query string, so a value with quotes/backslashes can never break out of
     // the mutation (node IDs are opaque API-supplied values — treat as untrusted).
     let query = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }";
+    graphql(token, query, serde_json::json!({ "id": node_id }))?;
+    Ok(())
+}
+
+/// GraphQL equivalent of `gh pr merge --auto`, for the configured-token path.
+///
+/// `enablePullRequestAutoMerge` takes the PR's node id, resolved the same way
+/// `rest_pr_ready` resolves it above: fetch the PR through the existing REST
+/// path (origin or upstream), read its `node_id`, and error out explicitly if
+/// it is missing rather than sending an empty id to GraphQL.
+///
+/// Known limitation, not fixed here: `gh_enable_auto_merge_inner`'s CLI path
+/// passes `--delete-branch` when arming. `enablePullRequestAutoMerge` has no
+/// branch-deletion parameter, so this mutation cannot request one; a token
+/// user and a `gh`-CLI user may see different branch cleanup after the same
+/// button. There is nothing to delete yet at the time this command runs
+/// either way (the merge itself hasn't happened), so a best-effort delete
+/// here would be premature, not just missing.
+///
+/// Also unverified, and not something this comment can settle: whether
+/// `gh pr merge --auto --delete-branch` actually deletes the branch once the
+/// deferred merge later fires, or whether `gh` only honours `--delete-branch`
+/// on an immediate merge. If it turns out `gh` doesn't honour it either, the
+/// two paths don't actually diverge and this note is the record of why we
+/// checked. Manual verification against a real armed PR should confirm this.
+pub(crate) fn rest_enable_auto_merge(
+    cwd: &str,
+    number: i64,
+    method: &str,
+    token: &str,
+) -> Result<(), String> {
+    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let node_id = js(&pr, "node_id");
+    if node_id.is_empty() {
+        return Err("Could not resolve PR node_id for auto-merge.".to_string());
+    }
+    let merge_method = match method {
+        "squash" => "SQUASH",
+        "rebase" => "REBASE",
+        _ => "MERGE",
+    };
+    let query = "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId } }";
+    graphql(
+        token,
+        query,
+        serde_json::json!({ "id": node_id, "method": merge_method }),
+    )?;
+    Ok(())
+}
+
+/// GraphQL equivalent of `gh pr merge --disable-auto`.
+pub(crate) fn rest_disable_auto_merge(cwd: &str, number: i64, token: &str) -> Result<(), String> {
+    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let node_id = js(&pr, "node_id");
+    if node_id.is_empty() {
+        return Err("Could not resolve PR node_id for auto-merge.".to_string());
+    }
+    let query = "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }";
     graphql(token, query, serde_json::json!({ "id": node_id }))?;
     Ok(())
 }

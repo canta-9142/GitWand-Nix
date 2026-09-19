@@ -57,6 +57,7 @@ const es: Locale = {
     pull: "Pull",
     sync: "Sincronizar",
     syncTooltip: "Recuperar ramas remotas y hacer pull",
+    fetchProgress: "Obteniendo… {0} %",
     merge: "Merge",
     mergeTooltip: "Hacer merge de una rama en la rama actual",
     mergeNoFf: "Crear siempre un commit de fusión",
@@ -90,9 +91,19 @@ const es: Locale = {
     stashDone: "Cambios guardados en stash",
     mergeDone: "Merge completado",
     mergeAborted: "Merge abortado",
+    cherryPickDone: "Cherry-pick completado",
+    cherryPickAborted: "Cherry-pick abortado",
     resolveConflicts: "resuelve los conflictos para continuar",
     abortMerge: "Abortar merge",
     abortCherryPick: "Abortar cherry-pick",
+    pausedMerge: "Merge en pausa",
+    pausedCherryPick: "Cherry-pick en pausa",
+    pausedRevert: "Revert en pausa",
+    operationContinue: "Continuar",
+    abortRevert: "Abortar revert",
+    abortConfirmTitle: "\u00bfAbortar esta operaci\u00f3n?",
+    abortConfirmMessage: "Se descartar\u00e1n tus resoluciones. Los archivos vuelven al estado anterior a la operaci\u00f3n.",
+    abortConfirmLabel: "Abortar",
     // Search trigger
     searchTooltip: "Buscar (\u2318K)",
     searchAriaLabel: "Abrir b\u00fasqueda",
@@ -330,6 +341,16 @@ const es: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Editar este hunk",
+    editBusy: "Termina primero el hunk que est\u00e1s editando",
+    editStale: "El archivo cambi\u00f3 desde que se calcul\u00f3 este diff. Actualiza e int\u00e9ntalo de nuevo.",
+    newFolder: "Carpeta nueva",
+    newFolderCount: "{0} archivo(s)",
+    nestedRepo: "Repositorio Git anidado",
+    nestedRepoHint:
+      "Esta carpeta tiene su propio .git, por lo que Git no rastrea su contenido desde aqu\u00ed. A\u00f1\u00e1dela como subm\u00f3dulo, ign\u00f3rala, o elimina su .git para rastrear los archivos.",
+    nestedRepoOpen: "Abrir en una pesta\u00f1a nueva",
+    nestedRepoIgnore: "A\u00f1adir a .gitignore",
     noDiff: "No hay diff disponible para este archivo",
     noDiffHint: "Archivo nuevo o binario",
     selectFile: "Selecciona un archivo para ver el diff",
@@ -507,6 +528,20 @@ const es: Locale = {
 
   // ─── Merge Preview ──────────────────────────────────────
   mergePreview: {
+    applying: "Aplicando\u2026",
+    applyAndMerge: "Fusionar y auto-resolver",
+    applyEstimate: "Estimado: {0} de {1} hunks auto-resolubles",
+    applyDone: "Listo",
+    applyStopped: "Detenido en los conflictos que te necesitan",
+    applyLoopBound: "Detenido tras demasiados pasos de rebase",
+    applyFailed: "La operaci\u00f3n fall\u00f3",
+    applyCounts: "{0} aplicados, {1} por resolver",
+    applyDrift: "La vista previa estim\u00f3 {0}. La operaci\u00f3n real ve otra fusi\u00f3n, as\u00ed que pueden diferir.",
+    applyNoSnapshot: "No se captur\u00f3 ninguna instant\u00e1nea, no hay vuelta atr\u00e1s en un clic.",
+    hunkHeldBack: "retenido ({0} %)",
+    thresholdLabel: "Aplicar solo por encima de",
+    thresholdOff: "Ninguno",
+    thresholdSummary: "{0} auto-resolubles, {1} retenidos por el umbral, {2} manuales",
     aiRisk: "Evaluación de riesgo",
     aiRiskHint: "Pregunta a la IA si este merge parece seguro.",
     aiRiskAnalyzing: "Analizando riesgos…",
@@ -732,10 +767,15 @@ const es: Locale = {
     resolveAutoSummaryBody: "Se resolverán {0} conflicto(s) así:",
     resolveAutoSummaryConfirm: "Confirmar",
     resolveAutoSummaryCancel: "Cancelar",
+    resolveAutoSummaryToggle: "Aplicar el conflicto {0}",
     bulkLabel: "Aceptar todo:",
     bulkOurs: "Actual",
     bulkTheirs: "Entrante",
     bulkBoth: "Ambos",
+    bulkAi: "IA",
+    bulkAiCancel: "Cancelar",
+    bulkAiProgress: "{0} de {1}",
+    bulkAiSummary: "{0} resueltos, {1} con error",
     bulkGeneratedWarning: "⚠ Concatenar puede dañar un archivo generado",
     recommended: "recomendado",
     autoResolved: "auto",
@@ -765,6 +805,12 @@ const es: Locale = {
     markerlessExplanation: "Git registra un conflicto para este archivo, pero la copia de trabajo no tiene marcadores y no coincide con ningún lado.",
     reconstructConflict: "Reconstruir conflicto",
     keepWorkingTree: "Mantener mi versión (preparar tal cual)",
+    unreadableTitle: "El archivo no se puede leer como texto",
+    unreadableExplanation: "Git informa de un conflicto en este archivo, pero su contenido no es texto UTF-8 válido, así que no hay bloques que mostrar. Suele ser un artefacto de compilación o un binario. Aun así puedes resolverlo tomando un lado completo, lo que opera sobre los bytes en bruto, o abrirlo en tu propio editor.",
+    unreadableKeepOurs: "Mantener nuestra versión",
+    unreadableKeepTheirs: "Mantener su versión",
+    unreadableOpenExternally: "Abrir en un editor externo",
+    unreadableReasonLabel: "Motivo informado",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -855,6 +901,7 @@ const es: Locale = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Fusionar la PR",
@@ -881,6 +928,10 @@ const es: Locale = {
       mergeProblem: "Problema detectado",
       mergeUnknown: "Desconocido",
       mergeNoPermission: "No tienes permiso para fusionar esta pull request",
+      autoMergeArm: "Fusionar cuando pasen las verificaciones",
+      autoMergeDisarm: "Cancelar fusión programada",
+      autoMergeArmed: "Se fusionará cuando pasen las verificaciones",
+      autoMergeUnavailable: "Fusión programada no disponible",
       statFiles: "Archivos",
       statDiff: "Diff",
       statComments: "Comentarios",
@@ -1056,6 +1107,13 @@ const es: Locale = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Confianza de resolucion",
+      subtitle: "Un umbral sobre la confianza por hunk del motor, aplicado dondequiera que GitWand resuelva.",
+      minConfidenceScore: "Aplicar solo por encima de",
+      minConfidenceScoreHint: "Las auto-resoluciones por debajo de este valor se proponen en lugar de aplicarse. Nunca deja pasar lo que el motor ya rechazo.",
+      barOff: "Ninguno",
+    },
     title: "Ajustes",
     tabGeneral: "General",
     tabDock: "Dock",
@@ -1261,6 +1319,8 @@ const es: Locale = {
     defaultBranch: "Rama por defecto",
     commitSignature: "Añadir «🪄 Commit vía GitWand» a la descripción",
     commitSignatureHint: "Una pequeña firma añadida automáticamente — se puede quitar en cualquier momento",
+    liveRepoWatcher: "Actualización en vivo del repositorio",
+    liveRepoWatcherHint: "Actualiza al instante a partir de eventos del sistema de archivos en lugar de sondear. Desactívalo si el repositorio está en una unidad de red.",
     blameAlgorithm: "Algoritmo de diff para blame",
     blameAlgorithmHint: "Controla cómo git blame detecta líneas movidas. histogram da los mejores resultados.",
     secretsScannerEnabled: "Escanear cambios en stage en busca de secretos",
@@ -1497,6 +1557,12 @@ const es: Locale = {
     accountsAzureDevMock: "El inicio de sesión de Azure solo está disponible en la aplicación de escritorio.",
     accountsAzureWaiting: "Esperando autorización…",
     accountsAzureConnected: "Conectado como",
+    accountsGiteaUrlLabel: "URL del servidor",
+    accountsGiteaTokenLabel: "Token de acceso",
+    accountsGiteaTokenHint: "Gitea: Configuración > Aplicaciones > Generar token. Permisos: lectura y escritura de repositorios e incidencias.",
+    accountsGiteaUrlInvalid: "Introduce una URL de servidor válida, por ejemplo https://git.acme.io",
+    accountsGiteaTokenRequired: "Se requiere un token de acceso.",
+    accountsGiteaHostTaken: "Ya existe una cuenta de Gitea para {0}. Elimínala primero para añadir otra.",
     accountsDeleteConfirm: "¿Eliminar esta cuenta?",
     // v2.12
     git: {
@@ -1671,13 +1737,13 @@ const es: Locale = {
     },
     action: {
       merge: "Fusionar",
+      "auto-merge": "Programar fusión",
       review: "Revisar",
       seeFailure: "Ver fallo",
       reply: "Responder",
       resolve: "Resolver",
       follow: "Seguir",
       nudge: "Recordar",
-      autoMerge: "Auto-merge",
       view: "Ver",
     },
     case: {
@@ -1746,6 +1812,28 @@ const es: Locale = {
     reviewersShort: "Revisores",
     refreshAll: "Actualizar todo",
     refreshAllTooltip: "Actualizar las 4 pestañas en paralelo",
+    confirm: {
+      merge: {
+        title: "¿Fusionar esta pull request?",
+        body: "{0} se fusionará en {1}.",
+      },
+      autoMerge: {
+        title: "¿Programar la fusión de esta pull request?",
+        body: "{0} se fusionará en {1} una vez que pasen las verificaciones.",
+      },
+      nudge: {
+        title: "¿Enviar un recordatorio?",
+        body: "Se publicará un comentario en {0}.",
+      },
+    },
+    nudge: {
+      comment: "Recordatorio amistoso: esta pull request está lista para revisión.",
+    },
+    toast: {
+      merged: "Pull request fusionada.",
+      autoMergeArmed: "Fusión programada.",
+      nudged: "Recordatorio publicado.",
+    },
     noWorkspace: {
       warning: "Crea un workspace primero para usar Today",
     },
@@ -1759,6 +1847,7 @@ const es: Locale = {
     bitbucket: "Bitbucket",
     azure: "Azure DevOps",
     cursor: "Cursor Origin",
+    gitea: "Gitea / Forgejo",
     action: "Abrir Ajustes",
   },
 
@@ -1848,10 +1937,15 @@ const es: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Editar el conflicto {0}",
     aiButton: "IA",
     aiLoading: "IA…",
     aiErrorPrefix: "IA",
     aiSuggestionLabel: "Sugerencia IA — revisa y ajusta",
+    aiStagedReady: "Sugerencia IA lista",
+    aiStagedReview: "Revisar",
+    aiStagedDiscard: "Descartar",
+    aiRetry: "Reintentar",
     explainTooltip: "Explicar este conflicto en lenguaje natural",
     explain: "Explicar",
     explainAnalyzing: "Analizando…",

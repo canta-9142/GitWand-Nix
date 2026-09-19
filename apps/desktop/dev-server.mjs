@@ -10,11 +10,12 @@
 
 import { createServer } from "node:http";
 import { execSync, execFileSync, spawnSync, spawn } from "node:child_process";
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, unlinkSync, realpathSync, renameSync, mkdirSync, mkdtempSync, rmSync, copyFileSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, unlinkSync, realpathSync, renameSync, mkdirSync, mkdtempSync, rmSync, copyFileSync, watch } from "node:fs";
 import { resolve, join, dirname, basename, sep, isAbsolute } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Socket } from "node:net";
 import { createRequire } from "node:module";
+import { StringDecoder } from "node:string_decoder";
 const _require = createRequire(import.meta.url);
 // node-pty provides a real PTY in dev mode — proper echo, backspace, unbuffered
 // output, resize, and control sequences without any manual workarounds.
@@ -90,7 +91,51 @@ function resolveBin(name) {
 }
 
 const GH = resolveBin("gh");
+const GLAB = resolveBin("glab");
 const GIT = resolveBin("git");
+
+/**
+ * Extract a percentage from a git progress line, e.g.
+ * "Receiving objects:  56% (456/812), 1.2 MiB | 3.4 MiB/s". Mirrors the Rust
+ * `extract_percent` helper in `commands/ops.rs` — keep the two in sync.
+ */
+function devExtractPercent(line) {
+  const pctPos = line.indexOf("%");
+  if (pctPos === -1) return 0;
+  const before = line.slice(0, pctPos).trimEnd();
+  const m = before.match(/(\d+(?:\.\d+)?)\s*$/);
+  if (!m) return 0;
+  return Math.min(100, Math.max(0, parseFloat(m[1])));
+}
+
+/**
+ * Classify one line of `git clone --progress` / `git fetch --progress`
+ * stderr into a `{stage,percent,message}` update. Mirrors the Rust
+ * `parse_clone_progress` helper in `commands/ops.rs` — keep the two in sync.
+ */
+function devParseCloneProgress(line) {
+  const l = line.trim();
+  if (!l) return null;
+  if (l.startsWith("Cloning into")) {
+    return { stage: "init", percent: 0, message: l };
+  }
+  if (l.startsWith("remote: Counting") || l.startsWith("remote: Enumerating")) {
+    return { stage: "counting", percent: devExtractPercent(l), message: l };
+  }
+  if (l.startsWith("remote: Compressing")) {
+    return { stage: "compressing", percent: devExtractPercent(l), message: l };
+  }
+  if (l.startsWith("Receiving objects:")) {
+    return { stage: "receiving", percent: devExtractPercent(l), message: l };
+  }
+  if (l.startsWith("Resolving deltas:")) {
+    return { stage: "resolving", percent: devExtractPercent(l), message: l };
+  }
+  if (l.includes("done") || l.includes("complete")) {
+    return { stage: "done", percent: 100, message: l };
+  }
+  return { stage: "info", percent: 0, message: l };
+}
 
 /**
  * Guess a MIME type from a file extension. Mirrors the Rust `guess_mime_from_ext`
@@ -218,6 +263,99 @@ let _mockGithubPolls = 0;
 // ── Terminal PTY state (dev:web only) ────────────────────────────────────────
 const devPtys = new Map(); // id -> { proc }
 let devPtyNextId = 1;
+
+// ── Live Repo watcher state (dev:web only, v3.10.0) ──────────────────────────
+const devWatchers = new Map();
+let devWatchNextId = 1;
+
+/**
+ * Mirror of `classify_path` in apps/desktop/src-tauri/src/commands/watcher.rs.
+ * This classifier (which change kind a path maps to) is the canonical part
+ * kept in sync between the two implementations: the frontend switches on
+ * `kinds` identically in Tauri and dev:web mode. The debounce/flush *timing*
+ * below mirrors `spawn_coalescer` in watcher.rs (DEBOUNCE quiet window +
+ * MAX_WAIT ceiling + MAX_RAW_BATCH cap) on a best-effort basis — Rust's
+ * version is canonical for exact timing; this one only needs to produce
+ * "roughly as fresh, never starved" events for dev:web testing.
+ */
+/**
+ * Metadata directories of `cwd` that a recursive watch on `cwd` does not
+ * already cover. Mirrors `external_git_dirs` in
+ * src-tauri/src/commands/watcher.rs: in a linked `git worktree` (or a
+ * `--separate-git-dir` repo) `.git` is a *file*, HEAD/index/merge state live
+ * in `<main>/.git/worktrees/<name>/` and refs/config in `<main>/.git/`, so
+ * without watching those the dev watcher never emits a single
+ * head/index/refs/mergeState event while still reporting itself healthy.
+ */
+function devExternalGitDirs(cwd) {
+  const base = resolve(cwd);
+  const out = [];
+  const readDir = (args) => {
+    try {
+      const raw = execFileSync(GIT, args, { cwd: base, encoding: "utf-8" }).trim();
+      return raw ? resolve(base, raw) : null;
+    } catch {
+      return null;
+    }
+  };
+  // The worktree's own git dir first: it is nested inside the common dir, and
+  // its HEAD/index must win over the common dir's `worktrees/<name>/…` view of
+  // the same path (see the ordering note in watcher.rs).
+  for (const dir of [readDir(["rev-parse", "--git-dir"]), readDir(["rev-parse", "--git-common-dir"])]) {
+    if (!dir) continue;
+    if (dir === base || dir.startsWith(base + sep)) continue;
+    if (!out.includes(dir)) out.push(dir);
+  }
+  return out;
+}
+
+function devClassifyPath(rel) {
+  const p = rel.replace(/^\.\//, "");
+  if (p.startsWith(".git/")) {
+    const inner = p.slice(5);
+    if (inner.startsWith("objects/") || inner.startsWith("lfs/") || inner.endsWith(".lock")) return null;
+    if (inner === "refs/stash" || inner === "logs/refs/stash") return "stash";
+    if (inner.startsWith("logs/")) return null;
+    if (inner === "HEAD") return "head";
+    if (inner === "index") return "index";
+    if (inner === "config") return "config";
+    if (inner.startsWith("refs/") || inner === "packed-refs") return "refs";
+    if (["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG"].includes(inner)
+      || inner.startsWith("rebase-merge/") || inner.startsWith("rebase-apply/")) return "mergeState";
+    return null;
+  }
+  const ignored = new Set(["node_modules", "target", "dist", ".venv", "__pycache__"]);
+  if (p.split("/").some((seg) => ignored.has(seg))) return null;
+  if (!p) return null;
+  return "worktree";
+}
+
+const DEV_EVENT_PATH_CAP = 512;
+
+// Mirrors watcher.rs's DEBOUNCE / MAX_WAIT / MAX_RAW_BATCH (Finding 1): a
+// fixed 150ms-since-first-event timer alone (the old behavior here) is
+// naturally bounded but always waits the full 150ms even for a single
+// isolated change. Matching Rust's two-trigger model gives the same
+// snappy-burst-then-quiet behavior while staying bounded under continuous churn.
+const DEV_WATCH_DEBOUNCE_MS = 150;
+const DEV_WATCH_MAX_WAIT_MS = 500;
+const DEV_WATCH_MAX_RAW_BATCH = 4096;
+
+function devCoalesceRepoPaths(batch) {
+  const kinds = new Set();
+  const paths = new Set();
+  for (const p of batch) {
+    const kind = devClassifyPath(p);
+    if (kind) { kinds.add(kind); paths.add(p); }
+  }
+  if (kinds.size === 0) return null;
+  const all = [...paths].sort();
+  return {
+    kinds: [...kinds].sort(),
+    paths: all.slice(0, DEV_EVENT_PATH_CAP),
+    truncated: all.length > DEV_EVENT_PATH_CAP,
+  };
+}
 
 /**
  * Get a GitHub OAuth token — tries in order:
@@ -353,7 +491,169 @@ function corsHeaders(req) {
   };
 }
 
+/**
+ * Reject a side-effecting request that a foreign page triggered. Returns true
+ * when the request was refused (the caller must stop).
+ *
+ * `corsHeaders` above only *echoes* an allow-listed origin, it never refuses
+ * a request, so the browser blocks the attacker's view of the *response*
+ * while this server still executes it. For the JSON `POST` routes that is
+ * enough: `Content-Type: application/json` forces a preflight no foreign page
+ * can satisfy. The SSE routes are plain `GET`s with real side effects (clone,
+ * fetch, PTY spawn, watcher), and a `GET` needs no preflight: any page the
+ * developer visits while `pnpm dev:web` runs could otherwise fire
+ * `<img src="http://localhost:PORT/api/git-clone-stream?url=...&dest=...">`
+ * and have it run, response-blocked but executed.
+ *
+ * The rule:
+ *   - `Origin` present  → must be allow-listed. Covers `EventSource` (which
+ *     always sends one) and any fetch/XHR.
+ *   - `Origin` absent   → only allowed when `Sec-Fetch-Site` is absent too,
+ *     i.e. the caller is not a browser at all (curl, the parity harness).
+ *     Browsers send `Sec-Fetch-Site` on every request, including the
+ *     sub-resource loads that carry no `Origin` (`<img>`, `<script>`,
+ *     `<iframe>`, navigations), which is exactly the attack shape above.
+ */
+function rejectCrossOrigin(req, res) {
+  const origin = req.headers.origin;
+  if (origin ? ALLOWED_ORIGINS.has(origin) : !req.headers["sec-fetch-site"]) {
+    return false;
+  }
+  res.writeHead(403, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Cross-origin request refused" }));
+  return true;
+}
+
+/**
+ * Validate a clone URL before it reaches `git clone`'s argv.
+ *
+ * Two distinct problems, both closed here:
+ *  - Option injection: a URL starting with `-` lands in an argv slot git
+ *    parses as an option (`--upload-pack=<cmd>` runs a command for the
+ *    local/ssh transports). The callers also pass `--` before the positional
+ *    arguments; this is the second lock on that door.
+ *  - Scheme confusion: anything that is not a recognizable git URL has no
+ *    business being spawned at all.
+ */
+function isValidCloneUrl(u) {
+  if (u.startsWith("-")) return false; // never let git parse the URL as an option
+  return (
+    /^[a-z][a-z0-9+.-]*:\/\//i.test(u) || // https:// ssh:// git:// file://
+    /^[^@\s]+@[^:\s]+:/.test(u) || // scp-like: git@host:owner/repo.git
+    u.startsWith("/") ||
+    u.startsWith("./") ||
+    u.startsWith("~/")
+  );
+}
+
 /** Parse `git log --format="%H\n%h\n%an\n%aI\n%s\n%b\n---END---"` output into FileLogEntry objects. */
+// ─── Conflict Predictor: 3-way merge simulation (v2.20.0 / v3.11.0) ────────
+//
+// Mirrors `commands/read.rs`: `rev_parse_verify`, `git_changed_files`,
+// `merge_file_preview` and `build_3way_preview`. The Rust side is the
+// reference implementation; these routes exist so `pnpm dev:web` behaves the
+// same, and `tests/parity/preview-*.test.mjs` compares the two byte for byte,
+// on failures as well as on successes.
+
+/** Resolve a ref to a commit sha, or throw the same message Rust throws. */
+function devRevParseVerify(cwd, rev) {
+  const r = spawnSync(GIT, ["rev-parse", "--verify", "--quiet", `${rev}^{commit}`], {
+    cwd, encoding: "utf-8",
+  });
+  const sha = (r.stdout || "").trim();
+  if (r.status !== 0 || !sha) throw new Error(`Unknown or invalid ref: ${rev}`);
+  return sha;
+}
+
+/** `git diff --name-only <base> <rev>`, dropping blank lines. */
+function devChangedFiles(cwd, base, rev) {
+  const r = spawnSync(GIT, ["diff", "--name-only", base, rev], { cwd, encoding: "utf-8" });
+  return (r.stdout || "").split("\n").map((l) => l).filter((l) => l.trim() !== "");
+}
+
+/** Contents of `path` at `rev`, or null when the file does not exist there. */
+function devShowFile(cwd, rev, path) {
+  const r = spawnSync(GIT, ["show", `${rev}:${path}`], { cwd, encoding: "buffer" });
+  return r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * Simulate a 3-way merge of one file. `dir` is a scratch directory owned by
+ * the caller; `seq` keeps the three scratch names unique within it, since a
+ * path-derived name collapsed `a/b.ts` and `a.b.ts` onto the same prefix.
+ */
+function devMergeFilePreview(cwd, baseRef, oursRef, theirsRef, filePath, dir, seq) {
+  const baseBytes = devShowFile(cwd, baseRef, filePath);
+  const oursBytes = devShowFile(cwd, oursRef, filePath);
+  const theirsBytes = devShowFile(cwd, theirsRef, filePath);
+
+  // One side lacks the file entirely → add/delete conflict.
+  if (oursBytes === null || theirsBytes === null) {
+    return { file_path: filePath, conflict_content: "", has_conflicts: true, is_add_delete: true };
+  }
+
+  const baseP = join(dir, `${seq}.base`);
+  const oursP = join(dir, `${seq}.ours`);
+  const theirsP = join(dir, `${seq}.theirs`);
+  try {
+    writeFileSync(baseP, baseBytes ?? Buffer.alloc(0));
+    writeFileSync(oursP, oursBytes);
+    writeFileSync(theirsP, theirsBytes);
+  } catch {
+    return { file_path: filePath, conflict_content: "", has_conflicts: true, is_add_delete: false };
+  }
+
+  // `-L` is mandatory: without it git labels each side with the scratch file's
+  // absolute path, which then leaks into the markers the user reads.
+  const r = spawnSync(
+    GIT,
+    ["merge-file", "-p", "--diff3", "-L", "ours", "-L", "base", "-L", "theirs", oursP, baseP, theirsP],
+    { cwd, encoding: "utf-8" },
+  );
+  for (const f of [baseP, oursP, theirsP]) { try { unlinkSync(f); } catch { /* best effort */ } }
+
+  if (r.error) {
+    return { file_path: filePath, conflict_content: "", has_conflicts: true, is_add_delete: false };
+  }
+  const content = r.stdout || "";
+  // git merge-file exits 1 on conflict, 0 on a clean merge.
+  const hasConflicts = r.status !== 0 || content.includes("<<<<<<<");
+  return { file_path: filePath, conflict_content: content, has_conflicts: hasConflicts, is_add_delete: false };
+}
+
+/** Per-file 3-way preview over the intersection, then the unilateral changes. */
+function devBuild3WayPreview(cwd, ancestor, oursRef, theirsRef) {
+  const oursFiles = devChangedFiles(cwd, ancestor, oursRef);
+  const theirsFiles = devChangedFiles(cwd, ancestor, theirsRef);
+  const oursSet = new Set(oursFiles);
+  const theirsSet = new Set(theirsFiles);
+
+  const bothModified = theirsFiles.filter((f) => oursSet.has(f));
+  const onlyOurs = oursFiles.filter((f) => !theirsSet.has(f));
+  const onlyTheirs = theirsFiles.filter((f) => !oursSet.has(f));
+
+  const dir = mkdtempSync(join(tmpdir(), "gitwand-preview-"));
+  const results = [];
+  try {
+    let seq = 0;
+    for (const filePath of bothModified) {
+      results.push(devMergeFilePreview(cwd, ancestor, oursRef, theirsRef, filePath, dir, seq++));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  for (const filePath of onlyOurs) {
+    results.push({ file_path: filePath, conflict_content: "", has_conflicts: false, is_add_delete: false });
+  }
+  for (const filePath of onlyTheirs) {
+    results.push({ file_path: filePath, conflict_content: "", has_conflicts: false, is_add_delete: false });
+  }
+
+  // Conflicts first, then path. Must match the Rust sort exactly.
+  results.sort((a, b) => (Number(b.has_conflicts) - Number(a.has_conflicts)) || (a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0));
+  return results;
+}
+
 function parseFileLog(raw) {
   const entries = [];
   for (const block of raw.split("---END---")) {
@@ -569,6 +869,22 @@ function snapshotBefore(cwd, enabled, kind, label) {
   }
 }
 
+/**
+ * Why a spawned CLI failed, in the words of whatever actually failed.
+ *
+ * `spawnSync` reports a failure to START the process on `result.error`
+ * (status is null, stderr undefined), which the auto-merge routes used to
+ * drop on the floor in favour of a generic "<cmd> failed". That hid the one
+ * case CI actually hits, a CLI that is not installed at all, and made the
+ * dev-server disagree with the Rust backend, which does surface its io error.
+ * Parity here is not cosmetic: `tests/parity/auto-merge-refusal.test.mjs`
+ * compares the CLASS of failure across the two backends.
+ */
+function spawnFailureDetail(result, generic) {
+  if (result.error) return String(result.error.message || result.error);
+  return (result.stderr || result.stdout || "").trim() || generic;
+}
+
 function jsonResponse(req, res, data, status = 200) {
   res.writeHead(status, corsHeaders(req));
   res.end(JSON.stringify(data));
@@ -580,6 +896,277 @@ function readBody(req) {
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => resolve(body ? JSON.parse(body) : {}));
   });
+}
+
+// ─── Gitea / Forgejo dev-server helpers ────────────────────────────────────
+//
+// The functions below deliberately duplicate the response mapping owned by
+// `commands/gitea.rs` (`map_pr`, `map_pr_detail`, `map_status`, `map_comment`,
+// `map_issue`) and the paging helpers next to them (`gitea_page_all`,
+// `select_window`, `needs_another_page`, `GITEA_PAGE_SIZE`,
+// `GITEA_LIST_CEILING`), so this dev-server path returns the same mapped
+// shape the Rust commands return, not the raw Gitea API payload. This is a
+// duplicate on purpose (see the route block below) and must move with the
+// Rust one whenever it changes.
+
+const GITEA_PAGE_SIZE = 50;
+const GITEA_LIST_CEILING = 300;
+
+/** Gitea states: `open`, `closed`, `all`. Anything else reads as `open`. */
+function giteaState(state) {
+  const s = (state || "open").toLowerCase();
+  if (s === "closed" || s === "merged") return "closed";
+  if (s === "all") return "all";
+  return "open";
+}
+
+/** Whether a paging loop should fetch one more page. An empty page is the
+ *  only reliable end-of-results signal: a short but non-empty page means a
+ *  lowered server `MAX_RESPONSE_ITEMS`, not the end. */
+function giteaNeedsAnotherPage(collected, want, lastPageLen) {
+  if (lastPageLen === 0) return false;
+  return collected < want;
+}
+
+/** Slice a client-side accumulated result set down to the caller's window. */
+function giteaSelectWindow(items, offset, perPage) {
+  if (perPage <= 0) return [];
+  const off = Math.max(offset, 0);
+  return items.slice(off, off + perPage);
+}
+
+/** Page through a Gitea list endpoint in fixed `GITEA_PAGE_SIZE` steps,
+ *  accumulating up to `want` items. `urlForPage` builds the request URL for
+ *  a given 1-based page number. */
+/** Mirrors `item_key` in commands/gitea.rs: an item's `id` when it has one,
+ *  the whole value otherwise (branches carry `name`, not `id`). */
+function giteaItemKey(v) {
+  return v && v.id !== undefined && v.id !== null ? `id:${JSON.stringify(v.id)}` : JSON.stringify(v);
+}
+
+async function giteaPageAll(urlForPage, headers, want) {
+  const collected = [];
+  const seen = new Set();
+  let page = 1;
+  for (;;) {
+    const r = await fetch(urlForPage(page), { headers });
+    if (!r.ok) throw new Error(`Gitea API error: HTTP ${r.status}`);
+    const arr = await r.json();
+    const pageItems = Array.isArray(arr) ? arr : [];
+    // Count only what this page ADDS. An empty page is not the only end of a
+    // collection: `/issues/{index}/comments` ignores the `page` parameter and
+    // serves the same items forever (Gitea 1.27.3, verified against a live
+    // server), so stopping only on an empty page spins to the ceiling and
+    // returns the same comment hundreds of times. Mirrors `gitea_page_all`.
+    let added = 0;
+    for (const item of pageItems) {
+      const key = giteaItemKey(item);
+      if (!seen.has(key)) {
+        seen.add(key);
+        collected.push(item);
+        added += 1;
+      }
+    }
+    if (added === 0 || !giteaNeedsAnotherPage(collected.length, want, pageItems.length)) break;
+    page += 1;
+  }
+  return collected;
+}
+
+/** `head.ref` / `base.ref`-style lookup. */
+function giteaRef(v, side, leaf) {
+  return v?.[side]?.[leaf] ?? "";
+}
+
+function giteaLogin(v, key) {
+  return v?.[key]?.login ?? "";
+}
+
+/** Collect `login` from an array of users, or `name` from an array of labels. */
+function giteaNames(v, key, field) {
+  return (v?.[key] ?? []).map((e) => e?.[field]).filter(Boolean);
+}
+
+/** Gitea's `mergeable` is a boolean; the shared contract is a string, with
+ *  "" for unknown so the UI never disables merge on a missing field. */
+function giteaMergeableStr(v) {
+  if (v?.mergeable === true) return "MERGEABLE";
+  if (v?.mergeable === false) return "CONFLICTING";
+  return "";
+}
+
+/** Mirrors `map_pr`. */
+function giteaMapPr(v) {
+  return {
+    // `number` is the per-repo index. `id` is a global database id and
+    // addressing a PR by it hits the wrong resource.
+    number: v.number ?? 0,
+    title: v.title ?? "",
+    state: v.state ?? "",
+    author: giteaLogin(v, "user"),
+    branch: giteaRef(v, "head", "ref"),
+    base: giteaRef(v, "base", "ref"),
+    draft: v.draft ?? false,
+    created_at: v.created_at ?? "",
+    updated_at: v.updated_at ?? "",
+    url: v.html_url ?? "",
+    additions: v.additions ?? 0,
+    deletions: v.deletions ?? 0,
+    labels: giteaNames(v, "labels", "name"),
+    assignees: giteaNames(v, "assignees", "login"),
+    review_requested: giteaNames(v, "requested_reviewers", "login"),
+    review_decision: "",
+    merge_state_status: "",
+    checks_rollup: "",
+    autoMerge: { armed: false, available: false, reason: null },
+    comment_count: v.comments ?? 0,
+  };
+}
+
+/** Mirrors `map_pr_detail`. */
+function giteaMapPrDetail(v) {
+  return {
+    number: v.number ?? 0,
+    title: v.title ?? "",
+    body: v.body ?? "",
+    state: v.state ?? "",
+    author: giteaLogin(v, "user"),
+    branch: giteaRef(v, "head", "ref"),
+    base: giteaRef(v, "base", "ref"),
+    draft: v.draft ?? false,
+    created_at: v.created_at ?? "",
+    updated_at: v.updated_at ?? "",
+    merged_at: v.merged_at ?? "",
+    url: v.html_url ?? "",
+    additions: v.additions ?? 0,
+    deletions: v.deletions ?? 0,
+    changed_files: v.changed_files ?? 0,
+    comments: v.comments ?? 0,
+    review_comments: 0,
+    labels: giteaNames(v, "labels", "name"),
+    reviewers: giteaNames(v, "requested_reviewers", "login"),
+    mergeable: giteaMergeableStr(v),
+    checks_status: "",
+    // Gitea exposes no cheap per-viewer merge permission here. `null` means
+    // unknown, which the UI must read as "allowed, gate on errors".
+    can_merge: null,
+    head_sha: giteaRef(v, "head", "sha"),
+    autoMerge: { armed: false, available: false, reason: null },
+    // Gitea does support `merge_when_checks_succeed`, but wiring it is a
+    // follow-up. Report it unsupported and say what still works.
+    autoMergeSupport: {
+      supported: false,
+      reason: "GitWand does not queue auto-merge on Gitea yet. Merging immediately still works.",
+    },
+  };
+}
+
+/** Mirrors `map_status`. */
+function giteaMapStatus(v) {
+  return (v?.statuses ?? []).map((s) => ({
+    name: s.context ?? "",
+    state: s.status ?? "",
+    conclusion: s.status ?? "",
+    details_url: s.target_url ?? "",
+  }));
+}
+
+/** Mirrors `map_comment`. Gitea's issue-comment endpoint carries no diff
+ *  anchor, so `path` is empty and `line` is null: the PR panel reads that
+ *  as "conversation comment" and keeps inline-comment affordances hidden. */
+function giteaMapComment(v) {
+  return {
+    id: v.id ?? 0,
+    body: v.body ?? "",
+    author: giteaLogin(v, "user"),
+    created_at: v.created_at ?? "",
+    updated_at: v.updated_at ?? "",
+    path: "",
+    line: null,
+    original_line: null,
+    side: "RIGHT",
+    start_line: null,
+    start_side: null,
+    in_reply_to_id: null,
+    diff_hunk: "",
+    url: v.html_url ?? "",
+  };
+}
+
+/** Mirrors `map_issue`. Unlike the PR shapes above, the Rust `Issue` struct
+ *  serializes camelCase (`#[serde(rename_all = "camelCase")]`). */
+function giteaMapIssue(v) {
+  return {
+    number: v.number ?? 0,
+    title: v.title ?? "",
+    state: v.state ?? "",
+    author: giteaLogin(v, "user"),
+    assignees: giteaNames(v, "assignees", "login"),
+    labels: giteaNames(v, "labels", "name"),
+    url: v.html_url ?? "",
+    createdAt: v.created_at ?? "",
+    updatedAt: v.updated_at ?? "",
+    milestone: v.milestone?.title ?? "",
+  };
+}
+
+/** Mirrors the Rust `normalize_base_url` in `commands/gitea.rs`: strips a
+ *  trailing slash and a trailing `/api/v1`, both pasted surprisingly often.
+ *  Used to normalize `GITWAND_GITEA_BASE` the same way the packaged app
+ *  normalizes the account's stored base URL. */
+function normalizeGiteaBase(raw) {
+  const trimmed = raw.trim();
+  // Same scheme injection as the Rust side. Without it, GITWAND_GITEA_BASE
+  // set to a bare `localhost:3000` produces a relative string that `fetch`
+  // rejects, where the Rust command would have read it as https. The point of
+  // this function is to agree with `normalize_base_url`, so it agrees here
+  // too, including on preferring https for a scheme-less value.
+  const withScheme =
+    trimmed.startsWith("http://") || trimmed.startsWith("https://") ? trimmed : `https://${trimmed}`;
+  let out = withScheme.replace(/\/+$/, "");
+  if (out.endsWith("/api/v1")) out = out.slice(0, -"/api/v1".length).replace(/\/+$/, "");
+  return out;
+}
+
+/** Mirrors the Rust `remote_host_port`: keeps an explicit port (self-hosted
+ *  Gitea commonly runs on one, e.g. the stock Docker image's `:3000`) rather
+ *  than assuming a default. The SCP-like form never carries a port. */
+function giteaHostPort(remoteUrl) {
+  if (remoteUrl.startsWith("git@")) {
+    const host = remoteUrl.slice(4).split(":")[0];
+    return host || null;
+  }
+  const schemeIdx = remoteUrl.indexOf("://");
+  if (schemeIdx < 0) return null;
+  let rest = remoteUrl.slice(schemeIdx + 3);
+  const at = rest.lastIndexOf("@");
+  if (at >= 0) rest = rest.slice(at + 1);
+  const hostPort = rest.split("/")[0];
+  return hostPort || null;
+}
+
+/** Mirrors the Rust `parse_remote_owner_repo`. */
+function giteaOwnerRepo(remoteUrl) {
+  const stripGit = (s) => (s.endsWith(".git") ? s.slice(0, -4) : s);
+  if (remoteUrl.startsWith("git@")) {
+    const colon = remoteUrl.indexOf(":");
+    if (colon >= 0) {
+      const clean = stripGit(remoteUrl.slice(colon + 1));
+      const slash = clean.indexOf("/");
+      if (slash > 0) return { owner: clean.slice(0, slash), repo: clean.slice(slash + 1) };
+    }
+  }
+  const schemeIdx = remoteUrl.indexOf("://");
+  if (schemeIdx >= 0) {
+    const path = remoteUrl.slice(schemeIdx + 3);
+    const slashPos = path.indexOf("/");
+    if (slashPos >= 0) {
+      const clean = stripGit(path.slice(slashPos + 1));
+      const slash2 = clean.indexOf("/");
+      if (slash2 > 0) return { owner: clean.slice(0, slash2), repo: clean.slice(slash2 + 1) };
+    }
+  }
+  return null;
 }
 
 /**
@@ -1063,13 +1650,120 @@ async function handleRequest(req, res) {
       return jsonResponse(req, res, { content, wtMatchesSide });
     }
 
+    // POST /api/preview-merge  { cwd, sourceBranch }  → FileMergePreview[]
+    if (url.pathname === "/api/preview-merge" && req.method === "POST") {
+      const { cwd, sourceBranch } = await readBody(req);
+      if (!cwd || !sourceBranch) return jsonResponse(req, res, { error: "Missing cwd or sourceBranch" }, 400);
+      const resolvedCwd = resolve(cwd);
+      const mb = spawnSync(GIT, ["merge-base", "HEAD", sourceBranch], { cwd: resolvedCwd, encoding: "utf-8" });
+      if (mb.status !== 0) {
+        return jsonResponse(req, res, { error: `Cannot find merge-base: ${mb.stderr || ""}` }, 400);
+      }
+      const base = (mb.stdout || "").trim();
+      try {
+        return jsonResponse(req, res, devBuild3WayPreview(resolvedCwd, base, "HEAD", sourceBranch));
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
+    // POST /api/preview-rebase  { cwd, onto }  → FileMergePreview[]
+    if (url.pathname === "/api/preview-rebase" && req.method === "POST") {
+      const { cwd, onto } = await readBody(req);
+      if (!cwd || !onto) return jsonResponse(req, res, { error: "Missing cwd or onto" }, 400);
+      const resolvedCwd = resolve(cwd);
+      try {
+        const ontoSha = devRevParseVerify(resolvedCwd, onto);
+        const headSha = devRevParseVerify(resolvedCwd, "HEAD");
+
+        const mb = spawnSync(GIT, ["merge-base", headSha, ontoSha], { cwd: resolvedCwd, encoding: "utf-8" });
+        if (mb.status !== 0) {
+          return jsonResponse(req, res, {
+            error: `Cannot find merge-base between HEAD and ${onto}: ${(mb.stderr || "").trim()}`,
+          }, 400);
+        }
+        const mergeBase = (mb.stdout || "").trim();
+        if (!mergeBase) {
+          return jsonResponse(req, res, { error: `No common ancestor between HEAD and ${onto}` }, 400);
+        }
+
+        const rl = spawnSync(GIT, ["rev-list", "--reverse", `${mergeBase}..${headSha}`], { cwd: resolvedCwd, encoding: "utf-8" });
+        if (rl.status !== 0) {
+          return jsonResponse(req, res, { error: `rev-list failed: ${(rl.stderr || "").trim()}` }, 400);
+        }
+        const commits = (rl.stdout || "").split("\n").map((l) => l.trim()).filter(Boolean);
+
+        // Replay each commit: ours = onto, theirs = commit. Root commits have
+        // no parent to diff against and are skipped, as in Rust.
+        const all = [];
+        for (const commit of commits) {
+          let parent;
+          try { parent = devRevParseVerify(resolvedCwd, `${commit}^`); } catch { continue; }
+          all.push(...devBuild3WayPreview(resolvedCwd, parent, ontoSha, commit));
+        }
+
+        // Deduplicate per file, keeping the strongest conflict signal:
+        // is_add_delete (2) > has_conflicts (1) > clean (0).
+        const score = (p) => (p.is_add_delete ? 2 : p.has_conflicts ? 1 : 0);
+        const byFile = new Map();
+        for (const p of all) {
+          const existing = byFile.get(p.file_path);
+          if (!existing || score(p) > score(existing)) byFile.set(p.file_path, p);
+        }
+        const results = [...byFile.values()];
+        results.sort((a, b) => (Number(b.has_conflicts) - Number(a.has_conflicts)) || (a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0));
+        return jsonResponse(req, res, results);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
+    // POST /api/preview-cherry-pick  { cwd, commit }  → FileMergePreview[]
+    if (url.pathname === "/api/preview-cherry-pick" && req.method === "POST") {
+      const { cwd, commit } = await readBody(req);
+      if (!cwd || !commit) return jsonResponse(req, res, { error: "Missing cwd or commit" }, 400);
+      const resolvedCwd = resolve(cwd);
+      try {
+        const commitSha = devRevParseVerify(resolvedCwd, commit);
+        devRevParseVerify(resolvedCwd, "HEAD");
+        let parent;
+        try {
+          parent = devRevParseVerify(resolvedCwd, `${commitSha}^`);
+        } catch {
+          return jsonResponse(req, res, {
+            error: `Cannot preview cherry-pick of root commit ${commit} (no parent to diff against)`,
+          }, 400);
+        }
+        return jsonResponse(req, res, devBuild3WayPreview(resolvedCwd, parent, "HEAD", commitSha));
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
     // POST /api/read-file  { cwd, path }
     if (url.pathname === "/api/read-file" && req.method === "POST") {
       const { cwd, path } = await readBody(req);
       let fullPath;
       try { fullPath = safeRepoPath(cwd, path); }
       catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
-      const content = readFileSync(fullPath, "utf-8");
+      // Read bytes and decode strictly, mirroring the Rust `read_file`, which is
+      // `std::fs::read_to_string` and rejects anything that is not valid UTF-8.
+      // `readFileSync(..., "utf-8")` instead substitutes U+FFFD and succeeds, and
+      // that divergence is not cosmetic: a non-UTF-8 conflicted file made every
+      // conflict in a repo unresolvable in the packaged app while loading fine
+      // under `pnpm dev:web`, so manual QA could not reproduce it (issue #188).
+      // The error string matches Rust's `format!("Failed to read {}: {}", …)`
+      // so both backends fail identically, not just succeed identically.
+      let content;
+      try {
+        const bytes = readFileSync(fullPath);
+        content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch (e) {
+        const reason = e instanceof TypeError
+          ? "stream did not contain valid UTF-8"
+          : e.message;
+        return jsonResponse(req, res, { error: `Failed to read ${path}: ${reason}` }, 400);
+      }
       return jsonResponse(req, res, { path, content });
     }
 
@@ -1413,7 +2107,21 @@ async function handleRequest(req, res) {
         const resolvedCwd = resolve(cwd);
         // Discrete args so the optional pathspec can be passed after `--`
         // without string interpolation (v2.21.0 monorepo scope).
-        const statusArgs = ["status", "--porcelain=v2", "--branch"];
+        // `--no-optional-locks` mirrors `git_status_cli` in
+        // src-tauri/src/commands/read.rs (parity reference): a read-only
+        // status must not rewrite `.git/index`, which the v3.10.0 watcher
+        // would classify as an `index` change and refresh on.
+        // `--untracked-files=all` mirrors the same function and the libgit2
+        // fast path (issue #181): git's default collapses a never-staged
+        // directory into a single `newfolder/` entry the sidebar cannot
+        // expand. Keep both flags, and their order, in sync with read.rs.
+        const statusArgs = [
+          "--no-optional-locks",
+          "status",
+          "--porcelain=v2",
+          "--branch",
+          "--untracked-files=all",
+        ];
         if (pathspec) statusArgs.push("--", pathspec);
         const stdout = execFileSync(GIT, statusArgs, {
           cwd: resolvedCwd,
@@ -1622,14 +2330,26 @@ async function handleRequest(req, res) {
         // ── Directory: list new files inside instead of diffing ──────────
         if (path.endsWith("/")) {
           const absDir = join(resolvedCwd, path);
-          let newFiles = [];
+          let raw = [];
           try {
-            const r = spawnSync("git", ["ls-files", "--others", "--exclude-standard", absDir], {
+            const r = spawnSync(GIT, ["ls-files", "--others", "--exclude-standard", "--", absDir], {
               cwd: resolvedCwd, encoding: "utf-8",
             });
-            newFiles = (r.stdout || "").trim().split("\n").filter(Boolean);
+            raw = (r.stdout || "").trim().split("\n").filter(Boolean);
           } catch { /* ignore */ }
-          return jsonResponse(req, res, { path, hunks: [], isDirectory: true, newFiles });
+          // Two independent signals, either is enough: an own `.git` (a
+          // directory for a plain clone, a file for a worktree or an absorbed
+          // submodule), or git answering with the directory instead of its
+          // contents. Mirrors `git_diff_directory` in read.rs (issue #183);
+          // `nestedRepo` is omitted when false, as the Rust side skips None.
+          const nested = existsSync(join(absDir, ".git")) || (raw.length === 1 && raw[0] === path);
+          return jsonResponse(req, res, {
+            path,
+            hunks: [],
+            isDirectory: true,
+            newFiles: nested ? [] : raw,
+            ...(nested ? { nestedRepo: true } : {}),
+          });
         }
 
         const args = staged ? ["diff", "--cached", "--", path] : ["diff", "--", path];
@@ -1641,9 +2361,20 @@ async function handleRequest(req, res) {
         } catch { stdout = ""; }
 
         // ── New untracked file: fall back to --no-index diff (all lines green) ──
+        //
+        // Guard: only for genuinely UNTRACKED files, mirroring the Rust
+        // `git_diff`. A tracked file whose change is already staged also
+        // yields an empty unstaged `git diff`; without the check the fallback
+        // renders the entire file as an addition instead of showing no
+        // unstaged change. Drift found by tests/parity/git-diff (issue #183).
         if (!stdout.trim() && !staged) {
           const absFile = join(resolvedCwd, path);
-          if (existsSync(absFile) && !statSync(absFile).isDirectory()) {
+          const tracked =
+            spawnSync(GIT, ["ls-files", "--error-unmatch", "--", path], {
+              cwd: resolvedCwd,
+              encoding: "utf-8",
+            }).status === 0;
+          if (!tracked && existsSync(absFile) && !statSync(absFile).isDirectory()) {
             const r = spawnSync("git", ["diff", "--no-index", "--", "/dev/null", absFile], {
               cwd: resolvedCwd, encoding: "utf-8",
             });
@@ -1655,10 +2386,16 @@ async function handleRequest(req, res) {
         let currentHunk = null;
         let oldLineNo = 0;
         let newLineNo = 0;
+        // Mirrors Rust's parse_diff_hunks: a "new file mode" line marks the
+        // diff as an addition. Matches the Rust GitDiff shape, which omits
+        // `status` entirely when not detected (skip_serializing_if).
+        let status;
 
         const lines = stdout.split("\n");
         for (const line of lines) {
-          if (line.startsWith("@@")) {
+          if (line.startsWith("new file mode")) {
+            status = "added";
+          } else if (line.startsWith("@@")) {
             if (currentHunk) hunks.push(currentHunk);
 
             const header = line;
@@ -1689,11 +2426,17 @@ async function handleRequest(req, res) {
                 newLineNo: null,
               });
               oldLineNo++;
-            } else if (!line.startsWith("\\")) {
-              const content = line.length > 0 ? line.substring(1) : "";
+              // Context lines start with a single space. Testing
+              // `!startsWith("\\")` instead lets the empty string that
+              // `split("\n")` leaves after the trailing newline through, which
+              // appended a phantom context line to every diff, and the Rust
+              // parser (`strip_prefix(' ')`) never did. This is the gotcha
+              // AGENTS.md documents; drift found by tests/parity/git-diff
+              // (issue #183).
+            } else if (line.startsWith(" ")) {
               currentHunk.lines.push({
                 type: "context",
-                content,
+                content: line.substring(1),
                 oldLineNo,
                 newLineNo,
               });
@@ -1705,7 +2448,7 @@ async function handleRequest(req, res) {
 
         if (currentHunk) hunks.push(currentHunk);
 
-        return jsonResponse(req, res, { path, hunks });
+        return jsonResponse(req, res, { path, hunks, ...(status ? { status } : {}) });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -2223,6 +2966,65 @@ async function handleRequest(req, res) {
       }
     }
 
+    // GET /api/git-fetch-stream?cwd=..
+    // Dev-mode SSE equivalent of the Tauri `git_fetch` Channel (v3.10.0):
+    // streams `{stage,percent,message}` progress, then a final
+    // `{result: GitPushPullResult}`. Reuses the clone parser — `git fetch
+    // --progress` emits the same vocabulary.
+    if (url.pathname === "/api/git-fetch-stream" && req.method === "GET") {
+      // Side-effecting GET: refuse anything a foreign page triggered.
+      if (rejectCrossOrigin(req, res)) return;
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const resolvedCwd = resolve(cwd);
+      const sseOrigin = req.headers.origin;
+      const sseAllowOrigin = sseOrigin && ALLOWED_ORIGINS.has(sseOrigin) ? sseOrigin : "";
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...(sseAllowOrigin ? { "Access-Control-Allow-Origin": sseAllowOrigin, Vary: "Origin" } : {}),
+      });
+      const proc = spawn(GIT, ["fetch", "--prune", "--progress"], {
+        cwd: resolvedCwd,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let allStderr = "";
+      let carry = "";
+      // Decode via a StringDecoder rather than `chunk.toString()` per chunk:
+      // a multi-byte UTF-8 character (a non-ASCII branch/remote/user name in
+      // git's --progress output) can land on a chunk boundary, and decoding
+      // each raw chunk independently would corrupt both halves into
+      // replacement characters even though the full byte sequence is valid
+      // once assembled. StringDecoder buffers an incomplete trailing
+      // sequence internally and only emits it once complete.
+      const decoder = new StringDecoder("utf8");
+      proc.stderr.on("data", (chunk) => {
+        const text = decoder.write(chunk);
+        allStderr += text;
+        const combined = carry + text;
+        const parts = combined.split(/[\r\n]/);
+        carry = parts.pop() ?? "";
+        for (const part of parts) {
+          const prog = devParseCloneProgress(part);
+          if (prog && !res.writableEnded) res.write(`data: ${JSON.stringify(prog)}\n\n`);
+        }
+      });
+      proc.on("close", (code) => {
+        allStderr += decoder.end();
+        if (res.writableEnded) return;
+        const prog = devParseCloneProgress(carry);
+        if (prog) res.write(`data: ${JSON.stringify(prog)}\n\n`);
+        const success = code === 0;
+        if (success) res.write(`data: ${JSON.stringify({ stage: "done", percent: 100, message: "Fetch complete" })}\n\n`);
+        const result = { success, message: success ? "" : allStderr.trim() };
+        res.write(`data: ${JSON.stringify({ result })}\n\n`);
+        res.end();
+      });
+      req.on("close", () => { try { proc.kill(); } catch (_) {} });
+      return;
+    }
+
     // POST /api/git-merge  { cwd, branch, noFf? }
     if (url.pathname === "/api/git-merge" && req.method === "POST") {
       const { cwd, branch, noFf } = await readBody(req);
@@ -2252,39 +3054,8 @@ async function handleRequest(req, res) {
     }
 
     // POST /api/git-merge-continue  { cwd }
-    if (url.pathname === "/api/git-merge-continue" && req.method === "POST") {
-      const { cwd } = await readBody(req);
-      if (!cwd) return jsonResponse(req, res, { success: false, message: "Missing cwd" }, 400);
-      try {
-        const resolvedCwd = resolve(cwd);
-        const stdout = execSync('git -c core.editor=true merge --continue 2>&1', {
-          cwd: resolvedCwd,
-          encoding: "utf-8",
-          shell: true,
-          env: { ...process.env, GIT_MERGE_AUTOEDIT: "no", GIT_EDITOR: "true" },
-        });
-        return jsonResponse(req, res, { success: true, message: stdout.trim() || "Merge completed" });
-      } catch (err) {
-        return jsonResponse(req, res, { success: false, message: (err.stderr || err.stdout || err.message || "").toString().trim() });
-      }
-    }
 
     // POST /api/git-merge-abort  { cwd }
-    if (url.pathname === "/api/git-merge-abort" && req.method === "POST") {
-      const { cwd } = await readBody(req);
-      if (!cwd) return jsonResponse(req, res, { success: false, message: "Missing cwd" }, 400);
-      try {
-        const resolvedCwd = resolve(cwd);
-        execSync("git merge --abort 2>&1", {
-          cwd: resolvedCwd,
-          encoding: "utf-8",
-          shell: true,
-        });
-        return jsonResponse(req, res, { success: true, message: "Merge aborted" });
-      } catch (err) {
-        return jsonResponse(req, res, { success: false, message: ((err.stdout || "") + (err.stderr || "")).toString().trim() || err.message });
-      }
-    }
 
     // POST /api/git-cherry-pick  { cwd, hashes }
     if (url.pathname === "/api/git-cherry-pick" && req.method === "POST") {
@@ -2314,42 +3085,8 @@ async function handleRequest(req, res) {
     }
 
     // POST /api/git-cherry-pick-abort  { cwd }
-    if (url.pathname === "/api/git-cherry-pick-abort" && req.method === "POST") {
-      const { cwd } = await readBody(req);
-      if (!cwd) return jsonResponse(req, res, { success: false, message: "Missing cwd" }, 400);
-      try {
-        const resolvedCwd = resolve(cwd);
-        execSync("git cherry-pick --abort 2>&1", { cwd: resolvedCwd, encoding: "utf-8", shell: true });
-        return jsonResponse(req, res, { success: true, message: "Cherry-pick aborted" });
-      } catch (err) {
-        return jsonResponse(req, res, { success: false, message: ((err.stdout || "") + (err.stderr || "")).toString().trim() || err.message });
-      }
-    }
 
     // POST /api/git-cherry-pick-continue  { cwd }
-    if (url.pathname === "/api/git-cherry-pick-continue" && req.method === "POST") {
-      const { cwd } = await readBody(req);
-      if (!cwd) return jsonResponse(req, res, { success: false, message: "Missing cwd" }, 400);
-      try {
-        const resolvedCwd = resolve(cwd);
-        const stdout = execSync("git cherry-pick --continue 2>&1", {
-          cwd: resolvedCwd,
-          encoding: "utf-8",
-          shell: true,
-          env: { ...process.env, GIT_EDITOR: "true" },
-        });
-        const hasConflicts = stdout.includes("CONFLICT") || stdout.includes("conflict");
-        return jsonResponse(req, res, { success: !hasConflicts, conflicts: hasConflicts, message: stdout.trim() });
-      } catch (err) {
-        const combined = ((err.stderr || "") + (err.stdout || "")).toString();
-        const hasConflicts = combined.includes("CONFLICT") || combined.includes("conflict");
-        return jsonResponse(req, res, {
-          success: false,
-          conflicts: hasConflicts,
-          message: (err.stderr || err.stdout || err.message || "").toString().trim(),
-        });
-      }
-    }
 
     // POST /api/git-pull  { cwd, strategy?, autostash? }  strategy: "merge" | "rebase" | "ff-only"
     if (url.pathname === "/api/git-pull" && req.method === "POST") {
@@ -2431,18 +3168,70 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/git-rebase-action  { cwd, action: "continue"|"abort"|"skip" }
-    if (url.pathname === "/api/git-rebase-action" && req.method === "POST") {
-      const { cwd, action } = await readBody(req);
-      if (!cwd || !["continue","abort","skip"].includes(action))
-        return jsonResponse(req, res, { error: "Missing cwd or invalid action" }, 400);
-      try {
-        const resolvedCwd = resolve(cwd);
-        execSync(`git rebase --${action}`, { cwd: resolvedCwd, encoding: "utf-8", shell: true, env: { ...process.env, GIT_EDITOR: "true", GIT_TERMINAL_PROMPT: "0" } });
-        return jsonResponse(req, res, { ok: true });
-      } catch (err) {
-        return jsonResponse(req, res, { error: err.stderr || err.message }, 500);
+    // POST /api/git-rebase-onto  { cwd, onto }  -> { conflict }
+    if (url.pathname === "/api/git-rebase-onto" && req.method === "POST") {
+      const { cwd, onto } = await readBody(req);
+      if (!cwd || !onto) return jsonResponse(req, res, { error: "Missing cwd or onto" }, 400);
+      const target = String(onto).trim();
+      if (!target) return jsonResponse(req, res, { error: "rebase target must not be empty" }, 400);
+      // A ref starting with "-" would be read by git as an option. Mirrors the
+      // Rust guard; every other argument is positional, never interpolated.
+      if (target.startsWith("-")) {
+        return jsonResponse(req, res, { error: `invalid rebase target: ${target}` }, 400);
       }
+      const r = spawnSync(GIT, ["rebase", target], {
+        cwd: resolve(cwd),
+        encoding: "utf-8",
+        env: { ...process.env, GIT_EDITOR: "true", EDITOR: "true", GIT_TERMINAL_PROMPT: "0" },
+      });
+      if (r.status === 0) return jsonResponse(req, res, { conflict: false });
+      const stderr = (r.stderr || "").trim();
+      const stdout = (r.stdout || "").trim();
+      const halted = /CONFLICT|could not apply/.test(stderr) || /CONFLICT|could not apply/.test(stdout);
+      if (halted) return jsonResponse(req, res, { conflict: true });
+      return jsonResponse(req, res, { error: `git rebase failed: ${stderr || stdout}` }, 400);
+    }
+
+    // POST /api/git-rebase-action  { cwd, action: "continue"|"abort"|"skip" }
+
+    // POST /api/git-operation-action  { cwd, operation, action } -> { halted }
+    // Mirrors the Rust git_operation_action: three outcomes, not two. Replaces
+    // the five per-operation routes, which each ran a shell string (forbidden
+    // by AGENTS.md) and disagreed on how failure was reported.
+    if (url.pathname === "/api/git-operation-action" && req.method === "POST") {
+      const { cwd, operation, action } = await readBody(req);
+      const OPS = { merge: "merge", cherry_pick: "cherry-pick", revert: "revert", rebase: "rebase" };
+      const ACTIONS = { continue: "--continue", abort: "--abort", skip: "--skip" };
+      const op = OPS[operation];
+      const act = ACTIONS[action];
+      if (!cwd || !op || !act) {
+        return jsonResponse(req, res, { error: "Missing cwd or invalid operation/action" }, 400);
+      }
+      if (op === "merge" && act === "--skip") {
+        return jsonResponse(req, res, { error: "git merge has no --skip" }, 400);
+      }
+      const r = spawnSync(GIT, [op, act], {
+        cwd: resolve(cwd),
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          GIT_EDITOR: "true",
+          EDITOR: "true",
+          GIT_MERGE_AUTOEDIT: "no",
+          GIT_TERMINAL_PROMPT: "0",
+          // The halted check below matches git's own words; pin the locale so
+          // it does not depend on how git was built (design §3).
+          LC_ALL: "C",
+          LANGUAGE: "",
+        },
+      });
+      if (r.status === 0) return jsonResponse(req, res, { halted: false });
+      const stderr = (r.stderr || "").trim();
+      const stdout = (r.stdout || "").trim();
+      if (/CONFLICT|could not apply/.test(stderr) || /CONFLICT|could not apply/.test(stdout)) {
+        return jsonResponse(req, res, { halted: true });
+      }
+      return jsonResponse(req, res, { error: `git ${op} ${act} failed: ${stderr || stdout}` }, 500);
     }
 
     // GET /api/git-file-diff?cwd=<path>&path=<file>&from=<hash>&to=<hash>
@@ -2576,6 +3365,12 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/git-gitignore" && req.method === "POST") {
       const { cwd, path: filePath } = await readBody(req);
       if (!cwd || !filePath) return jsonResponse(req, res, { error: "Missing cwd or path" }, 400);
+      // Mirrors the guard in the Rust `git_add_to_gitignore` (issue #183): the
+      // entry becomes one line of a config file, so a newline inside it would
+      // silently add rules the user never asked for.
+      if (/[\r\n]/.test(filePath)) {
+        return jsonResponse(req, res, { error: "gitignore entry must be a single line" }, 400);
+      }
       try {
         const resolvedCwd = resolve(cwd);
         const gitignorePath = join(resolvedCwd, ".gitignore");
@@ -3034,6 +3829,13 @@ async function handleRequest(req, res) {
         const raw = out.stdout || "";
         const lines = raw.split("\n");
         const blameLines = [];
+        // Porcelain compaction: the metadata block (author/author-time/summary)
+        // is only emitted the FIRST time a commit is seen in the output; later
+        // hunks for the same commit carry just the header + content line. Carry
+        // the metadata forward from the first sighting so it matches the Rust
+        // backend (both the CLI parser in commands/read.rs and the libgit2 fast
+        // path in git/libgit2.rs, which always resolves full commit metadata).
+        const metaCache = new Map();
         let i = 0;
         while (i < lines.length) {
           const headerMatch = lines[i].match(/^([0-9a-f]{40})\s+(\d+)\s+(\d+)/);
@@ -3053,7 +3855,16 @@ async function handleRequest(req, res) {
           }
           const content = i < lines.length ? lines[i].slice(1) : "";
           i++;
-          blameLines.push({ hash: hash.slice(0, 8), hashFull: hash, finalLine, origLine, author, authorDate, summary, content });
+
+          if (!author && !authorDate && !summary) {
+            const cached = metaCache.get(hash);
+            if (cached) ({ author, authorDate, summary } = cached);
+          } else {
+            metaCache.set(hash, { author, authorDate, summary });
+          }
+          // 7 chars, matching the Rust backend (commands/read.rs: hash_full[..7]),
+          // which is the path the shipped app actually uses.
+          blameLines.push({ hash: hash.slice(0, 7), hashFull: hash, finalLine, origLine, author, authorDate, summary, content });
         }
         return jsonResponse(req, res, blameLines);
       } catch (err) {
@@ -4747,6 +5558,97 @@ async function handleRequest(req, res) {
       }
     }
 
+    // POST /api/gh-enable-auto-merge  { cwd, number, method }
+    if (url.pathname === "/api/gh-enable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, number, method } = await readBody(req);
+        if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const mergeFlag = method === "squash" ? "--squash"
+          : method === "rebase" ? "--rebase"
+          : "--merge";
+        const r = spawnSync(
+          GH,
+          ["pr", "merge", String(number), "--auto", mergeFlag, "--delete-branch"],
+          { cwd: resolve(cwd), encoding: "utf-8" },
+        );
+        if (r.status !== 0) {
+          const detail = spawnFailureDetail(r, "gh pr merge --auto failed");
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/gh-disable-auto-merge  { cwd, number }
+    if (url.pathname === "/api/gh-disable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, number } = await readBody(req);
+        if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const r = spawnSync(GH, ["pr", "merge", String(number), "--disable-auto"], {
+          cwd: resolve(cwd),
+          encoding: "utf-8",
+        });
+        if (r.status !== 0) {
+          const detail = spawnFailureDetail(r, "gh pr merge --disable-auto failed");
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/gl-enable-auto-merge  { cwd, iid, method }
+    // Queue a MR to merge when its pipeline succeeds, via `glab mr merge
+    // --when-pipeline-succeeds`. Mirrors `gl_enable_auto_merge_inner`
+    // (src-tauri/src/commands/gitlab.rs): no token path, `glab`-only.
+    if (url.pathname === "/api/gl-enable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, iid, method } = await readBody(req);
+        if (!cwd || !iid) return jsonResponse(req, res, { error: "Missing cwd or iid" }, 400);
+        const args = ["mr", "merge", String(iid), "--when-pipeline-succeeds"];
+        if (method === "squash") args.push("--squash");
+        else if (method === "rebase") args.push("--rebase");
+        args.push("--yes", "--remove-source-branch");
+        const r = spawnSync(GLAB, args, { cwd: resolve(cwd), encoding: "utf-8" });
+        if (r.status !== 0) {
+          const detail = spawnFailureDetail(r, "glab mr merge --when-pipeline-succeeds failed");
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/gl-disable-auto-merge  { cwd, iid }
+    // Cancel a queued merge-when-pipeline-succeeds. `glab mr update` has no
+    // unset-auto-merge flag, and `merge_when_pipeline_succeeds` is not an
+    // attribute of the merge request update endpoint either, so this goes
+    // through GitLab's dedicated cancel route, mirroring
+    // `gl_disable_auto_merge_inner`. No request body, so no `-f` flag.
+    if (url.pathname === "/api/gl-disable-auto-merge" && req.method === "POST") {
+      try {
+        const { cwd, iid } = await readBody(req);
+        if (!cwd || !iid) return jsonResponse(req, res, { error: "Missing cwd or iid" }, 400);
+        const endpoint = `projects/:fullpath/merge_requests/${Number(iid)}/cancel_merge_when_pipeline_succeeds`;
+        const r = spawnSync(
+          GLAB,
+          ["api", "-X", "POST", endpoint],
+          { cwd: resolve(cwd), encoding: "utf-8" },
+        );
+        if (r.status !== 0) {
+          const detail = spawnFailureDetail(r, "glab api cancel_merge_when_pipeline_succeeds failed");
+          return jsonResponse(req, res, { error: detail }, 500);
+        }
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
     // POST /api/gh-dismiss-review  { cwd, number, reviewId, message } (B4, v3.6.0)
     if (url.pathname === "/api/gh-dismiss-review" && req.method === "POST") {
       try {
@@ -5894,15 +6796,20 @@ async function handleRequest(req, res) {
           return jsonResponse(req, res, { error: "No remote found" }, 404);
         }
         // Mirrors `detect_provider()` in src-tauri/src/git/parse.rs — keep the
-        // branch order identical. Locked by tests/parity/git-remote-info.test.mjs.
-        // Cursor Origin matches on `origin.cursor.com` (its git host) and NOT on
-        // a bare `cursor.com`, which is the web UI.
+        // branch order identical. Locked by tests/parity/git-remote-info.test.mjs
+        // and tests/parity/gitea-remote-info.test.mjs. The gitea arm matches the
+        // bare substrings "gitea"/"forgejo" anywhere in the URL, including the
+        // repo name, so it must come after azure: an Azure DevOps repo merely
+        // named `forgejo-mirror` would otherwise misdetect as gitea. Cursor
+        // Origin matches on `origin.cursor.com` (its git host) and NOT on a
+        // bare `cursor.com`, which is the web UI.
         let provider = "unknown";
         if (remoteUrl.includes("github.com")) provider = "github";
         else if (remoteUrl.includes("origin.cursor.com")) provider = "cursor";
         else if (remoteUrl.includes("gitlab")) provider = "gitlab";
         else if (remoteUrl.includes("bitbucket")) provider = "bitbucket";
         else if (remoteUrl.includes("dev.azure.com") || remoteUrl.includes("visualstudio.com")) provider = "azure";
+        else if (remoteUrl.includes("codeberg.org") || remoteUrl.includes("gitea") || remoteUrl.includes("forgejo")) provider = "gitea";
         // NOTE: the Rust command additionally falls back to a `glab`/`gh auth
         // status --hostname <host>` CLI probe when the substring chain above
         // still lands on "unknown" (self-hosted forge on a hostname that
@@ -6294,12 +7201,74 @@ async function handleRequest(req, res) {
       const d = (dest || "").trim();
       if (!u) return jsonResponse(req, res, { error: "Empty URL" }, 400);
       if (!d) return jsonResponse(req, res, { error: "Empty destination" }, 400);
-      const r = spawnSync(GIT, ["clone", u, d], { encoding: "utf-8" });
+      if (!isValidCloneUrl(u)) return jsonResponse(req, res, { error: "Unsupported clone URL" }, 400);
+      // `--`: see the git-clone-stream route below.
+      const r = spawnSync(GIT, ["clone", "--", u, d], { encoding: "utf-8" });
       if (r.status !== 0) {
         const detail = (r.stderr || r.stdout || "").trim() || "git clone failed";
         return jsonResponse(req, res, { error: detail }, 500);
       }
       return jsonResponse(req, res, { dest: d });
+    }
+
+    // GET /api/git-clone-stream?url=..&dest=..
+    // Dev-mode SSE equivalent of the Tauri `git_clone` Channel (v3.10.0):
+    // streams `{stage,percent,message}` progress, then `{done: dest}` or
+    // `{error}`.
+    if (url.pathname === "/api/git-clone-stream" && req.method === "GET") {
+      // Side-effecting GET: refuse anything a foreign page triggered.
+      if (rejectCrossOrigin(req, res)) return;
+      const u = (url.searchParams.get("url") || "").trim();
+      const d = (url.searchParams.get("dest") || "").trim();
+      if (!u || !d) {
+        return jsonResponse(req, res, { error: "Empty URL or destination" }, 400);
+      }
+      if (!isValidCloneUrl(u)) {
+        return jsonResponse(req, res, { error: "Unsupported clone URL" }, 400);
+      }
+      const sseOrigin = req.headers.origin;
+      const sseAllowOrigin = sseOrigin && ALLOWED_ORIGINS.has(sseOrigin) ? sseOrigin : "";
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...(sseAllowOrigin ? { "Access-Control-Allow-Origin": sseAllowOrigin, Vary: "Origin" } : {}),
+      });
+      // `--` before the positionals: without it a URL like
+      // `--upload-pack=<cmd>` is parsed as an option, not as a repository.
+      const proc = spawn(GIT, ["clone", "--progress", "--", u, d], { stdio: ["ignore", "ignore", "pipe"] });
+      let allStderr = "";
+      let carry = "";
+      // See the git-fetch-stream route above for why this uses StringDecoder
+      // rather than `chunk.toString()` per chunk (multi-byte UTF-8 chars can
+      // land on a chunk boundary).
+      const decoder = new StringDecoder("utf8");
+      proc.stderr.on("data", (chunk) => {
+        const text = decoder.write(chunk);
+        allStderr += text;
+        const combined = carry + text;
+        const parts = combined.split(/[\r\n]/);
+        carry = parts.pop() ?? "";
+        for (const part of parts) {
+          const prog = devParseCloneProgress(part);
+          if (prog && !res.writableEnded) res.write(`data: ${JSON.stringify(prog)}\n\n`);
+        }
+      });
+      proc.on("close", (code) => {
+        allStderr += decoder.end();
+        if (res.writableEnded) return;
+        const prog = devParseCloneProgress(carry);
+        if (prog) res.write(`data: ${JSON.stringify(prog)}\n\n`);
+        if (code === 0) {
+          res.write(`data: ${JSON.stringify({ done: d })}\n\n`);
+        } else {
+          const detail = allStderr.trim() || "git clone failed";
+          res.write(`data: ${JSON.stringify({ error: detail })}\n\n`);
+        }
+        res.end();
+      });
+      req.on("close", () => { try { proc.kill(); } catch (_) {} });
+      return;
     }
 
     // POST /api/gh-fork  { url, parentDir }
@@ -6558,6 +7527,9 @@ async function handleRequest(req, res) {
 
     // ── Terminal PTY (dev echo) ───────────────────────────────────────────────
     if (url.pathname === "/api/terminal-open" && req.method === "GET") {
+      // Side-effecting GET (spawns a shell): refuse anything a foreign page
+      // triggered. Predates the v3.10.0 stream routes but is the same hole.
+      if (rejectCrossOrigin(req, res)) return;
       const cwd = url.searchParams.get("cwd") || process.cwd();
       const shell = url.searchParams.get("shell") || process.env.SHELL || "/bin/zsh";
       // First-class agent: launch the named CLI directly rather than smuggling
@@ -6627,6 +7599,93 @@ async function handleRequest(req, res) {
       return jsonResponse(req, res, { ok: true });
     }
 
+    // ── Live Repo watcher (dev equivalent of the Tauri Channel) ───────────────
+    if (url.pathname === "/api/watch-repo" && req.method === "GET") {
+      // Side-effecting GET (opens a recursive fs watch): refuse anything a
+      // foreign page triggered.
+      if (rejectCrossOrigin(req, res)) return;
+      const cwd = resolve(url.searchParams.get("cwd") || process.cwd());
+      const id = devWatchNextId++;
+      const sseOrigin = req.headers.origin;
+      const sseAllowOrigin = sseOrigin && ALLOWED_ORIGINS.has(sseOrigin) ? sseOrigin : "";
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...(sseAllowOrigin ? { "Access-Control-Allow-Origin": sseAllowOrigin, Vary: "Origin" } : {}),
+      });
+      res.write(`data: ${JSON.stringify({ id })}\n\n`);
+
+      let batch = [];
+      let quietTimer = null;
+      let maxWaitTimer = null;
+      const clearWatchTimers = () => {
+        if (quietTimer) { clearTimeout(quietTimer); quietTimer = null; }
+        if (maxWaitTimer) { clearTimeout(maxWaitTimer); maxWaitTimer = null; }
+      };
+      const flush = (forceTruncated) => {
+        clearWatchTimers();
+        if (batch.length === 0) return;
+        const ev = devCoalesceRepoPaths(batch);
+        batch = [];
+        if (ev) {
+          if (forceTruncated) ev.truncated = true;
+          if (!res.writableEnded) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+        }
+      };
+      const push = (rel) => {
+        // Classify at push time so noise never enters the batch (mirrors
+        // watcher.rs's spawn_coalescer, Finding 1).
+        if (!devClassifyPath(rel)) return;
+        if (batch.length === 0) {
+          maxWaitTimer = setTimeout(() => flush(false), DEV_WATCH_MAX_WAIT_MS);
+        }
+        batch.push(rel);
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => flush(false), DEV_WATCH_DEBOUNCE_MS);
+        if (batch.length >= DEV_WATCH_MAX_RAW_BATCH) flush(true);
+      };
+      const watchers = [];
+      try {
+        watchers.push(
+          watch(cwd, { recursive: true }, (_type, filename) => {
+            if (!filename) return;
+            push(String(filename).split(sep).join("/"));
+          }),
+        );
+        // Linked worktrees keep their metadata outside the worktree, watch it
+        // too, renamed to the `.git/<…>` form devClassifyPath understands.
+        for (const dir of devExternalGitDirs(cwd)) {
+          watchers.push(
+            watch(dir, { recursive: true }, (_type, filename) => {
+              if (!filename) return;
+              push(`.git/${String(filename).split(sep).join("/")}`);
+            }),
+          );
+        }
+      } catch (err) {
+        for (const w of watchers) { try { w.close(); } catch (_) {} }
+        res.write(`data: ${JSON.stringify({ error: String(err) })}\n\n`);
+        res.end();
+        return;
+      }
+      const close = () => {
+        for (const w of watchers) { try { w.close(); } catch (_) {} }
+        clearWatchTimers();
+        devWatchers.delete(id);
+        if (!res.writableEnded) res.end();
+      };
+      devWatchers.set(id, { close });
+      req.on("close", close);
+      return;
+    }
+    if (url.pathname === "/api/watch-repo-stop" && req.method === "POST") {
+      const { id } = await readBody(req);
+      const entry = devWatchers.get(id);
+      if (entry) entry.close();
+      return jsonResponse(req, res, { ok: true });
+    }
+
     // POST /api/scratch-worktree-create  { cwd, sourceBranch?, name? }
     if (url.pathname === "/api/scratch-worktree-create" && req.method === "POST") {
       const { cwd, sourceBranch, name } = await readBody(req);
@@ -6656,6 +7715,150 @@ async function handleRequest(req, res) {
         });
       } catch (e) {
         return jsonResponse(req, res, { error: e.message }, 500);
+      }
+    }
+
+    // ── Gitea / Forgejo read routes ──────────────────────────────────────────
+    //
+    // Two real, deliberate differences from the packaged app, not oversights:
+    //
+    // 1. Auth: the Rust commands read the token from the OS keychain, which
+    //    this Node process cannot reach. These routes read GITWAND_GITEA_TOKEN
+    //    from the environment instead: export it before `pnpm dev:web` to
+    //    exercise Gitea routes.
+    // 2. API base: the Rust commands take the base URL (scheme, host, port,
+    //    subpath) from the account's validated keychain entry, which this
+    //    process also cannot reach, since it only sees the git remote, which
+    //    carries no scheme. Guessing `https://` from the remote alone breaks
+    //    a stock local Gitea (plain http, e.g. Docker on :3000) and any
+    //    subpath install. GITWAND_GITEA_BASE overrides that guess when set;
+    //    export it alongside the token (e.g. `http://localhost:3000`) to
+    //    exercise a non-https or subpath server.
+    //
+    // Everything after auth and the base URL (path shape, response mapping)
+    // is the same as the packaged app.
+    if (url.pathname.startsWith("/api/gitea-") && req.method === "GET") {
+      const token = process.env.GITWAND_GITEA_TOKEN;
+      if (!token) {
+        return jsonResponse(req, res, {
+          error: "GITWAND_GITEA_TOKEN is not set. Export it before `pnpm dev:web` to exercise Gitea routes.",
+        }, 400);
+      }
+      const cwd = url.searchParams.get("cwd") || "";
+      let remote = "";
+      try {
+        remote = execFileSync(GIT, ["remote", "get-url", "origin"], { cwd, encoding: "utf-8" }).trim();
+      } catch {
+        return jsonResponse(req, res, { error: "No 'origin' remote found in this repo." }, 400);
+      }
+      const hostPort = giteaHostPort(remote);
+      const ownerRepo = giteaOwnerRepo(remote);
+      if (!hostPort || !ownerRepo) {
+        return jsonResponse(req, res, { error: `Could not read owner/repo from the remote URL: ${remote}` }, 400);
+      }
+      const apiBase = process.env.GITWAND_GITEA_BASE
+        ? normalizeGiteaBase(process.env.GITWAND_GITEA_BASE)
+        : `https://${hostPort}`;
+      const repoApi = `${apiBase}/api/v1/repos/${ownerRepo.owner}/${ownerRepo.repo}`;
+      const headers = { Authorization: `token ${token}`, Accept: "application/json" };
+      const index = url.searchParams.get("index");
+
+      const call = async (suffix, asText = false) => {
+        const r = await fetch(`${repoApi}${suffix}`, { headers });
+        if (!r.ok) throw new Error(`Gitea API error: HTTP ${r.status}`);
+        return asText ? r.text() : r.json();
+      };
+
+      try {
+        switch (url.pathname) {
+          case "/api/gitea-current-user": {
+            const r = await fetch(`${apiBase}/api/v1/user`, { headers });
+            if (!r.ok) throw new Error(`Gitea API error: HTTP ${r.status}`);
+            const u = await r.json();
+            return jsonResponse(req, res, u.login ?? "");
+          }
+          case "/api/gitea-list-prs": {
+            const state = giteaState(url.searchParams.get("state"));
+            const perPage = Math.max(Number(url.searchParams.get("limit") ?? "10"), 1);
+            const offset = Math.max(Number(url.searchParams.get("offset") ?? "0"), 0);
+            const want = offset + perPage;
+            // Page from the start in fixed server pages, accumulating
+            // results, and window the accumulated list client-side. Gitea
+            // caps the `limit` query param at MAX_RESPONSE_ITEMS (50 by
+            // default, admin-lowerable), so inflating the requested limit
+            // to reach the offset in one request risks silent truncation.
+            const collected = await giteaPageAll(
+              (page) => `${repoApi}/pulls?state=${state}&limit=${GITEA_PAGE_SIZE}&page=${page}`,
+              headers,
+              want,
+            );
+            const windowed = giteaSelectWindow(collected, offset, perPage);
+            return jsonResponse(req, res, windowed.map(giteaMapPr));
+          }
+          case "/api/gitea-pr-count": {
+            const state = giteaState(url.searchParams.get("state"));
+            const want = GITEA_LIST_CEILING;
+            const collected = await giteaPageAll(
+              (page) => `${repoApi}/pulls?state=${state}&limit=${GITEA_PAGE_SIZE}&page=${page}`,
+              headers,
+              want,
+            );
+            return jsonResponse(req, res, Math.min(collected.length, want));
+          }
+          case "/api/gitea-get-pr": {
+            const pr = await call(`/pulls/${index}`);
+            const detail = giteaMapPrDetail(pr);
+            if (detail.head_sha) {
+              try {
+                const s = await call(`/commits/${detail.head_sha}/status`);
+                detail.checks_status = s?.state ?? "";
+              } catch { /* best-effort, mirrors the Rust `if let Ok` */ }
+            }
+            return jsonResponse(req, res, detail);
+          }
+          case "/api/gitea-pr-diff": {
+            // `/pulls/{index}.diff` is the documented suffix form and the
+            // only one that serves a unified diff. The fallback that used to
+            // sit here, `/pulls/{index}/patch`, is a 404 on a real server
+            // (verified on Gitea 1.27.3); the route that does exist,
+            // `/pulls/{index}.patch`, returns mbox with commit headers rather
+            // than a diff. Mirrors `gitea_pr_diff` in commands/gitea.rs.
+            const r = await fetch(`${repoApi}/pulls/${index}.diff`, { headers });
+            if (!r.ok) throw new Error(`Gitea diff failed (HTTP ${r.status})`);
+            return jsonResponse(req, res, await r.text());
+          }
+          case "/api/gitea-pr-status": {
+            const pr = await call(`/pulls/${index}`);
+            const sha = giteaRef(pr, "head", "sha");
+            if (!sha) return jsonResponse(req, res, []);
+            const status = await call(`/commits/${sha}/status`);
+            return jsonResponse(req, res, giteaMapStatus(status));
+          }
+          case "/api/gitea-pr-comments": {
+            const collected = await giteaPageAll(
+              (page) => `${repoApi}/issues/${index}/comments?limit=${GITEA_PAGE_SIZE}&page=${page}`,
+              headers,
+              GITEA_LIST_CEILING,
+            );
+            const windowed = giteaSelectWindow(collected, 0, GITEA_LIST_CEILING);
+            return jsonResponse(req, res, windowed.map(giteaMapComment));
+          }
+          case "/api/gitea-list-issues": {
+            const want = Math.max(Number(url.searchParams.get("limit") ?? "30"), 1);
+            // `type=issues` keeps PRs out: Gitea's issue endpoint returns both.
+            const collected = await giteaPageAll(
+              (page) => `${repoApi}/issues?state=open&type=issues&limit=${GITEA_PAGE_SIZE}&page=${page}`,
+              headers,
+              want,
+            );
+            const windowed = giteaSelectWindow(collected, 0, want);
+            return jsonResponse(req, res, windowed.map(giteaMapIssue));
+          }
+          default:
+            return jsonResponse(req, res, { error: "Unknown Gitea route" }, 404);
+        }
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 502);
       }
     }
 

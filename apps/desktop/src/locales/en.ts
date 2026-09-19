@@ -57,6 +57,7 @@ const en = {
     pull: "Pull",
     sync: "Sync",
     syncTooltip: "Fetch remote branches and pull",
+    fetchProgress: "Fetching… {0}%",
     merge: "Merge",
     mergeTooltip: "Merge a branch into the current branch",
     mergeFilterPlaceholder: "Branch to merge\u2026",
@@ -90,9 +91,19 @@ const en = {
     stashDone: "Changes stashed",
     mergeDone: "Merge completed",
     mergeAborted: "Merge aborted",
+    cherryPickDone: "Cherry-pick completed",
+    cherryPickAborted: "Cherry-pick aborted",
     resolveConflicts: "resolve conflicts to continue",
     abortMerge: "Abort merge",
     abortCherryPick: "Abort cherry-pick",
+    pausedMerge: "Merge paused",
+    pausedCherryPick: "Cherry-pick paused",
+    pausedRevert: "Revert paused",
+    operationContinue: "Continue",
+    abortRevert: "Abort revert",
+    abortConfirmTitle: "Abort this operation?",
+    abortConfirmMessage: "Your resolutions will be discarded. The files go back to how they were before the operation started.",
+    abortConfirmLabel: "Abort",
     // Search trigger
     searchTooltip: "Search (\u2318K)",
     searchAriaLabel: "Open search",
@@ -342,6 +353,16 @@ const en = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Edit this hunk",
+    editBusy: "Finish the hunk you are editing first",
+    editStale: "The file changed since this diff was computed. Refresh and try again.",
+    newFolder: "New folder",
+    newFolderCount: "{0} file(s)",
+    nestedRepo: "Nested Git repository",
+    nestedRepoHint:
+      "This folder has its own .git, so Git does not track its contents from here. Add it as a submodule, ignore it, or remove its .git to track the files.",
+    nestedRepoOpen: "Open in a new tab",
+    nestedRepoIgnore: "Add to .gitignore",
     noDiff: "No diff available for this file",
     noDiffHint: "New or binary file",
     selectFile: "Select a file to view the diff",
@@ -519,6 +540,20 @@ const en = {
 
   // ─── Merge Preview (Phase 8.1) ──────────────────────────
   mergePreview: {
+    applying: "Applying\u2026",
+    applyAndMerge: "Merge & auto-resolve",
+    applyEstimate: "Estimated {0} of {1} hunks auto-resolvable",
+    applyDone: "Done",
+    applyStopped: "Stopped on the conflicts that need you",
+    applyLoopBound: "Stopped after too many rebase steps",
+    applyFailed: "The operation failed",
+    applyCounts: "{0} applied, {1} left to resolve",
+    applyDrift: "The preview estimated {0}. The real operation sees a different merge, so the two can differ.",
+    applyNoSnapshot: "No snapshot was captured, so there is no one-click way back.",
+    hunkHeldBack: "held back ({0}%)",
+    thresholdLabel: "Apply only above",
+    thresholdOff: "Off",
+    thresholdSummary: "{0} auto-resolvable, {1} held back by the bar, {2} manual",
     aiRisk: "Risk assessment",
     aiRiskHint: "Ask the AI whether this merge looks safe.",
     aiRiskAnalyzing: "Analysing risks\u2026",
@@ -744,10 +779,15 @@ const en = {
     resolveAutoSummaryBody: "{0} conflict(s) will be resolved as follows:",
     resolveAutoSummaryConfirm: "Confirm",
     resolveAutoSummaryCancel: "Cancel",
+    resolveAutoSummaryToggle: "Apply conflict {0}",
     bulkLabel: "Accept all:",
     bulkOurs: "Current",
     bulkTheirs: "Incoming",
     bulkBoth: "Both",
+    bulkAi: "AI",
+    bulkAiCancel: "Cancel",
+    bulkAiProgress: "{0} of {1}",
+    bulkAiSummary: "{0} resolved, {1} failed",
     bulkGeneratedWarning: "⚠ Concatenating may break a generated file",
     recommended: "recommended",
     autoResolved: "auto",
@@ -777,6 +817,12 @@ const en = {
     markerlessExplanation: "Git records a conflict for this file, but the working copy has no conflict markers and matches neither side.",
     reconstructConflict: "Reconstruct conflict",
     keepWorkingTree: "Keep my version (stage as-is)",
+    unreadableTitle: "File cannot be read as text",
+    unreadableExplanation: "Git reports this file as conflicted, but its contents are not valid UTF-8 text, so there are no hunks to show. It is usually a build artifact or a binary. You can still settle it by taking one side wholesale, which operates on the raw bytes, or open it in your own editor.",
+    unreadableKeepOurs: "Keep our version",
+    unreadableKeepTheirs: "Keep their version",
+    unreadableOpenExternally: "Open in external editor",
+    unreadableReasonLabel: "Reason reported",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -871,6 +917,7 @@ const en = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Merge PR",
@@ -897,6 +944,10 @@ const en = {
       mergeProblem: "Problem detected",
       mergeUnknown: "Unknown",
       mergeNoPermission: "You don't have permission to merge this pull request",
+      autoMergeArm: "Merge when checks pass",
+      autoMergeDisarm: "Cancel scheduled merge",
+      autoMergeArmed: "Will merge when checks pass",
+      autoMergeUnavailable: "Scheduled merge unavailable",
       statFiles: "Files",
       statDiff: "Diff",
       statComments: "Comments",
@@ -1072,6 +1123,13 @@ const en = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Resolution confidence",
+      subtitle: "A bar on the engine per-hunk confidence, applied everywhere GitWand resolves.",
+      minConfidenceScore: "Apply only above",
+      minConfidenceScoreHint: "Auto-resolutions scoring below this are proposed instead of applied. Never lets through what the engine already refused.",
+      barOff: "Off",
+    },
     title: "Settings",
     // Tab titles
     tabGeneral: "General",
@@ -1286,6 +1344,8 @@ const en = {
     defaultBranch: "Default branch",
     commitSignature: "Add \u201c\u{1FA84} Commit via GitWand\u201d to description",
     commitSignatureHint: "A small signature added automatically \u2014 removable anytime",
+    liveRepoWatcher: "Live repo updates",
+    liveRepoWatcherHint: "Refresh instantly from filesystem events instead of polling. Turn off if your repository lives on a network drive.",
     blameAlgorithm: "Blame diff algorithm",
     blameAlgorithmHint: "Controls how git blame detects moved or copied lines. histogram gives the best results for most repos.",
     secretsScannerEnabled: "Scan staged changes for secrets",
@@ -1527,6 +1587,12 @@ const en = {
     accountsAzureDevMock: "Azure sign-in is only available in the desktop app.",
     accountsAzureWaiting: "Waiting for authorization…",
     accountsAzureConnected: "Connected as",
+    accountsGiteaUrlLabel: "Server URL",
+    accountsGiteaTokenLabel: "Access token",
+    accountsGiteaTokenHint: "Gitea: Settings > Applications > Generate Token. Scopes: repository and issue read and write.",
+    accountsGiteaUrlInvalid: "Enter a valid server URL, for example https://git.acme.io",
+    accountsGiteaTokenRequired: "An access token is required.",
+    accountsGiteaHostTaken: "A Gitea account for {0} already exists. Remove it first to add another.",
     accountsDeleteConfirm: "Remove this account?",
     // v2.12 Git tab — branch + identity + templates
     git: {
@@ -1704,13 +1770,13 @@ const en = {
     },
     action: {
       merge: "Merge",
+      "auto-merge": "Schedule merge",
       review: "Review",
       seeFailure: "See failure",
       reply: "Reply",
       resolve: "Resolve",
       follow: "Follow",
       nudge: "Nudge",
-      autoMerge: "Auto-merge",
       view: "View",
     },
     case: {
@@ -1779,6 +1845,28 @@ const en = {
     reviewersShort: "Reviewers",
     refreshAll: "Refresh all",
     refreshAllTooltip: "Refresh all tabs in parallel",
+    confirm: {
+      merge: {
+        title: "Merge this pull request?",
+        body: "{0} will be merged into {1}.",
+      },
+      autoMerge: {
+        title: "Schedule this pull request to merge?",
+        body: "{0} will be merged into {1} once checks pass.",
+      },
+      nudge: {
+        title: "Send a reminder?",
+        body: "A comment will be posted on {0}.",
+      },
+    },
+    nudge: {
+      comment: "Friendly ping: this pull request is ready for review.",
+    },
+    toast: {
+      merged: "Pull request merged.",
+      autoMergeArmed: "Merge scheduled.",
+      nudged: "Reminder posted.",
+    },
     noWorkspace: {
       warning: "Create a workspace first to use Today",
     },
@@ -1792,6 +1880,7 @@ const en = {
     bitbucket: "Bitbucket",
     azure: "Azure DevOps",
     cursor: "Cursor Origin",
+    gitea: "Gitea / Forgejo",
     action: "Open Settings",
   },
 
@@ -1882,10 +1971,15 @@ const en = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Edit conflict {0}",
     aiButton: "AI",
     aiLoading: "AI\u2026",
     aiErrorPrefix: "AI",
     aiSuggestionLabel: "AI suggestion \u2014 review and adjust",
+    aiStagedReady: "AI suggestion ready",
+    aiStagedReview: "Review",
+    aiStagedDiscard: "Discard",
+    aiRetry: "Retry",
     explainTooltip: "Explain this conflict in plain language",
     explain: "Explain",
     explainAnalyzing: "Analysing\u2026",
