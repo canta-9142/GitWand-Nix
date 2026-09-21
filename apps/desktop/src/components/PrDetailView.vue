@@ -99,6 +99,17 @@ const mergeStatus = computed<{ icon: string; label: string }>(() => {
 });
 
 /**
+ * `autoMergeOffer.value` is a discriminated union, so pulling `.reason` out
+ * here (plain TS, narrowed) rather than in the template avoids relying on
+ * the template compiler to narrow a `v-if`/`v-else-if` chain on `.kind`.
+ * Raw forge text, never translated, see AGENTS.md's i18n rule.
+ */
+const autoMergeExplainReason = computed(() => {
+  const offer = p.autoMergeOffer.value;
+  return offer.kind === "explain" ? offer.reason : "";
+});
+
+/**
  * Review + issue-level comments, sorted oldest-first for display under the
  * description. `bodyHtml` is rendered once here (markdown parse + sanitize is
  * expensive) instead of in the `v-html` binding, which would re-run on every
@@ -456,6 +467,34 @@ function submitRequestReviewers() {
               </svg>
               <span>{{ t('pr.detail.merge') }}</span>
             </button>
+            <button
+              v-if="isOpenPr && p.autoMergeOffer.value.kind === 'arm'"
+              class="pdv-btn"
+              @click="p.armAutoMerge()"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="6" />
+                <path d="M8 4.5V8l2.6 1.6" />
+              </svg>
+              <span>{{ t('pr.detail.autoMergeArm') }}</span>
+            </button>
+            <span v-else-if="isOpenPr && p.autoMergeOffer.value.kind === 'disarm'" class="pdv-automerge-armed">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="6" />
+                <path d="M8 4.5V8l2.6 1.6" />
+              </svg>
+              <span>{{ t('pr.detail.autoMergeArmed') }}</span>
+              <button class="pdv-btn pdv-btn--sm pdv-btn--ghost" @click="p.disarmAutoMerge()">
+                {{ t('pr.detail.autoMergeDisarm') }}
+              </button>
+            </span>
+            <span
+              v-else-if="isOpenPr && p.autoMergeOffer.value.kind === 'explain'"
+              class="pdv-automerge-unavailable"
+              :title="autoMergeExplainReason || undefined"
+            >
+              {{ t('pr.detail.autoMergeUnavailable') }}<template v-if="autoMergeExplainReason">: {{ autoMergeExplainReason }}</template>
+            </span>
           </div>
         </div>
 
@@ -1272,6 +1311,30 @@ function submitRequestReviewers() {
   gap: var(--space-3);
   flex-shrink: 0;
   align-items: center;
+}
+
+/* Forge-side auto-merge (v3.11.0): armed status + inline cancel. */
+.pdv-automerge-armed {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  border-radius: var(--radius-sm);
+  background: var(--color-success-soft);
+  color: var(--color-success);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
+}
+
+/* Disabled explanation row: the forge's own reason text is rendered as-is
+   next to the label (never translated, see AGENTS.md's i18n rule). */
+.pdv-automerge-unavailable {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  white-space: nowrap;
 }
 
 .pdv-hero-meta {
@@ -2410,7 +2473,12 @@ function submitRequestReviewers() {
 }
 .pdv-check-annotations:hover {
   background: var(--color-warning);
-  color: var(--color-bg-primary);
+  /* `--color-bg-primary` is not defined by either theme, so this declaration
+     was invalid and the colour stayed the base rule's `--color-warning`: on
+     hover the badge became orange text on an orange fill, which is unreadable.
+     `--color-bg` is the page background this knockout was reaching for, and it
+     flips with the theme. */
+  color: var(--color-bg);
 }
 
 /* ─── Intelligence tab ───────────────────────────────────── */

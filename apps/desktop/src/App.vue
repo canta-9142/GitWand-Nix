@@ -85,7 +85,11 @@ import { useSplitCommit } from "./composables/useSplitCommit";
 import type { GitLogEntry } from "./utils/backend";
 import { getPersistedDiffMode, persistDiffMode, type DiffMode } from "./utils/diffMode";
 import { isImagePath } from "./utils/imagePath";
-import { useGitWand } from "./composables/useGitWand";
+import { useGitWand, type ApplyPredicate } from "./composables/useGitWand";
+import { useResolutionSelection, contentStamp } from "./composables/useResolutionSelection";
+import { getPendingSplitForHash, resolvePendingSplit } from "./composables/useInteractiveRebase";
+import { spliceHunk } from "./composables/useDiffEdit";
+import { useApplyFromPreview, assertOperationSucceeded, type ApplyOutcome } from "./composables/useApplyFromPreview";
 import { useResolutionMemory, type ResolutionMemoryEntry, type ResolutionStrategy } from "./composables/useResolutionMemory";
 import { useRepoTabs } from "./composables/useRepoTabs";
 import { useAiTasks } from "./composables/useAiTasks";
@@ -100,6 +104,8 @@ import { useNetworkStatus } from "./composables/useNetworkStatus";
 import { useConnectivity } from "./composables/useConnectivity";
 import { useScheduler } from "./composables/useScheduler";
 import { useRepoPoller } from "./composables/useRepoPoller";
+import { useRepoWatcher } from "./composables/useRepoWatcher";
+import { useWatcherRefreshQueue } from "./composables/useWatcherRefreshQueue";
 import { useLaunchpadPoller } from "./composables/useLaunchpadPoller";
 import { useSecretsScanner } from "./composables/useSecretsScanner";
 import { useCommitReview } from "./composables/useCommitReview";
@@ -169,11 +175,13 @@ let pendingCommitReviewTrailers = "";
 const { isOffline: navIsOffline } = useNetworkStatus();
 const { isOnline: probedOnline, probeConnectivity } = useConnectivity();
 const isOffline = computed(() => navIsOffline.value || !probedOnline.value);
-import { isTauri, registerBrowserFolderPicker, pickFolder, checkForUpdates, fetchBetaUpdate, installUpdate, gitRepoState, openExternalUrl } from "./utils/backend";
+import { isTauri, registerBrowserFolderPicker, pickFolder, checkForUpdates, fetchBetaUpdate, installUpdate, gitRepoState, openExternalUrl, ghIssueAddComment } from "./utils/backend";
 import type { UpdateInfo, RepoOperationState, WorkspaceRepo, PullRequest } from "./utils/backend";
+import type { ForgeName } from "./composables/forge/types";
 import { onMarkdownLinkClick } from "./composables/useSafeHtml";
 import { resolveDirtySwitchAction, type DirtyFile } from "./utils/branchSwitchDecision";
 import { resolveDirtyPullAction } from "./utils/pullDirtyDecision";
+import { requireOnline } from "./utils/networkGuard";
 // UpdateModal moved above (lazy-loaded) — type imported as UpdateModalType for the template ref
 
 const { theme, toggle: toggleTheme } = useTheme();
@@ -202,9 +210,14 @@ const {
   saveAllFiles,
   undo,
   redo,
+  reset: mergeReset,
   selectFile: mergeSelectFile,
   refreshLlmFallbackConfig: mergeRefreshLlmFallbackConfig,
 } = useGitWand();
+
+// v3.11 — shared per-hunk opt-out + confidence bar. Module-level singleton, so
+// the merge editor, the summary modal and the apply paths all read one set.
+const resolutionSelection = useResolutionSelection();
 
 // ─── Repo mode (useGitRepo) — single shared instance ────
 const {
@@ -248,6 +261,7 @@ const {
   isPushing,
   isPulling,
   isFetching,
+  fetchPercent,
   openRepo,
   closeRepo,
   refresh: repoRefresh,
@@ -268,12 +282,8 @@ const {
   pull: doPull,
   fetch: doFetch,
   mergeBranch: doMergeRaw,
-  mergeContinue: doMergeContinue,
-  abortMerge: doAbortMerge,
+  runOperationAction,
   cherryPick: doCherryPick,
-  cherryPickAbort: doCherryPickAbort,
-  cherryPickContinue: doCherryPickContinue,
-  isCherryPicking,
   discardFiles,
   addToGitignore,
   branches,
@@ -442,7 +452,21 @@ const prPanel = usePrPanel(prCwd, {
   // instead of standing up a second listener. Without this, starting a
   // review then hiding the tab would leave the queue paused on
   // document.hidden forever.
-  onVisibilityResume: () => commitReview.resume(),
+  //
+  // v3.10.0 Live Repo: also fire a catch-up watcher refresh here, for the
+  // changes no watcher event covers (anything that happened before the watch
+  // existed, or that the OS watcher missed). Events that arrive while the tab
+  // is hidden need no help: watcherRefreshQueue queues them and drains itself
+  // on this same visibility edge, for every kind. Shares the "worktree-index"
+  // key with that handler below (same job, repoRefresh + conditional
+  // loadLog) so the two collapse to a single refresh if they race.
+  onVisibilityResume: () => {
+    commitReview.resume();
+    watcherRefreshQueue.schedule("worktree-index", async () => {
+      await repoRefresh();
+      if (viewMode.value === "history" || showGitTree.value) await loadLog();
+    });
+  },
 });
 provide(PR_PANEL_KEY, prPanel);
 const issuePanel = useIssuePanel(prCwd);
@@ -706,6 +730,16 @@ function dismissToast() {
   }, 200);
 }
 
+/** Transient toast for Launchpad mutating actions (merge/nudge) — reuses the
+ *  existing toast affordance rather than inventing a second one. */
+function showLaunchpadToast(title: string) {
+  if (successTimer != null) { window.clearTimeout(successTimer); successTimer = null; }
+  successToastLeaving.value = false;
+  successToast.value = title;
+  successToastDetail.value = null;
+  successTimer = window.setTimeout(dismissToast, 3000);
+}
+
 watch(repoSuccess, (val) => {
   if (!val) return;
   // Consume the success signal regardless (so it doesn't pile up)
@@ -725,6 +759,8 @@ watch(repoSuccess, (val) => {
     "stash-done": { key: "header.stashDone" },
     "merge-done": { key: "header.mergeDone" },
     "merge-aborted": { key: "header.mergeAborted" },
+    "cherry-pick-done": { key: "header.cherryPickDone" },
+    "cherry-pick-aborted": { key: "header.cherryPickAborted" },
     "autostash-parked": { key: "header.pullAutostashParked" },
   };
   const info = meta[val];
@@ -770,19 +806,12 @@ async function advanceToNextConflictOrFinalize() {
   await refreshRepoState();
   if (repoStatus.value && repoStatus.value.conflicted.length > 0) {
     await repoSelectFile(repoStatus.value.conflicted[0], false);
-  } else if (isCherryPicking.value) {
-    await doCherryPickContinue();
-  } else if (
-    repoOperationState.value?.state === "rebase" ||
-    repoOperationState.value?.state === "rebase_interactive"
-  ) {
-    // `git merge --continue` errors during a rebase ("no merge in progress").
-    // The rebase banner's own Continue button (RebaseProgressBanner.vue) is the
-    // correct control surface to finalize — leave it to the user (issue #128).
-  } else {
-    await doMergeContinue();
-    showMergeSuccess.value = true;
   }
+  // Nothing continues by itself. Resolving the last conflict used to run
+  // `merge --continue` / `cherry-pick --continue` straight away, which is how
+  // a success could be announced without checking, and it disagreed with the
+  // rebase policy already settled in #128. One rule now: the operation banner's
+  // Continue button is the only way forward, for every operation (design §6).
 }
 
 async function checkAndSaveIfResolved(filePath: string) {
@@ -810,9 +839,136 @@ async function handleResolveHunk(path: string, hunkIndex: number, choice: "ours"
   await checkAndSaveIfResolved(path);
 }
 
+/**
+ * v3.11 — the predicate the apply paths consult, built from the shared
+ * selection store. App.vue owns both sides (the `useGitWand` instance and the
+ * singleton), so this is where they meet: `useGitWand` stays a pure function
+ * of its arguments and never reaches for hidden state.
+ *
+ * Returning `undefined` when nothing is filtered matters. It is what lets
+ * `buildResolvedContent` keep using the engine's `mergedContent` shortcut on
+ * the common path, instead of rebuilding content marker by marker every time.
+ */
+function applyPredicateFor(path: string): ApplyPredicate | undefined {
+  const file = mergeFiles.value.find((f) => f.path === path);
+  if (!file) return undefined;
+  const stamp = contentStamp(file.content);
+  const selection = resolutionSelection;
+  const anythingFiltered =
+    selection.minScore.value > 0 || selection.excludedCount(path) > 0;
+  if (!anythingFiltered) return undefined;
+  return (index, resolution) =>
+    selection.shouldApply(path, index, resolution as never, stamp);
+}
+
+/** Which hunk indices a filtered apply consumed, so the selection can remap. */
+function appliedIndicesFor(path: string, predicate: ApplyPredicate | undefined): number[] {
+  const file = mergeFiles.value.find((f) => f.path === path);
+  if (!file) return [];
+  const out: number[] = [];
+  file.result.resolutions.forEach((r, i) => {
+    const engineApplied = r.autoResolved && r.resolvedLines !== null;
+    if (engineApplied && (!predicate || predicate(i, r))) out.push(i);
+  });
+  return out;
+}
+
 async function handleResolveFile(path: string) {
-  await resolveFile(path);
+  const predicate = applyPredicateFor(path);
+  const consumed = appliedIndicesFor(path, predicate);
+  await resolveFile(path, { shouldApply: predicate });
+  // Indices renumber once blocks are removed; remap before anything reads the
+  // selection again, or a stale index would point at the wrong hunk.
+  const after = mergeFiles.value.find((f) => f.path === path);
+  if (after) resolutionSelection.remapAfterApply(path, consumed, contentStamp(after.content));
   await checkAndSaveIfResolved(path);
+}
+
+// ─── Apply from preview (v3.11.0) ─────────────────────────
+//
+// The predictor simulates; applying runs the real operation and re-resolves
+// what git actually produced. The composable takes its dependencies
+// explicitly, so this is the one place that knows how to satisfy them.
+const applyingFromPreview = ref(false);
+const applyOutcome = ref<ApplyOutcome | null>(null);
+
+const { apply: runApplyFromPreview } = useApplyFromPreview({
+  cwd: () => repoFolderPath.value ?? "",
+  repoState: async () => {
+    const { gitRepoState } = await import("./utils/backend");
+    return gitRepoState(repoFolderPath.value ?? "");
+  },
+  snapshot: (cwd, kind, label) => snapshots.capture(cwd, kind, label) as never,
+  // Straight to the backend, NOT through useGitRepo's UI wrappers: those catch
+  // into `error.value` and never throw, so a refused merge would reach the
+  // orchestrator looking like a clean success. See assertOperationSucceeded.
+  runMerge: async (ref_) => {
+    const { gitMerge } = await import("./utils/backend");
+    const result = await gitMerge(repoFolderPath.value ?? "", ref_, false);
+    assertOperationSucceeded(result, `merge ${ref_}`);
+  },
+  runCherryPick: async (sha) => {
+    const { gitCherryPick } = await import("./utils/backend");
+    const result = await gitCherryPick(repoFolderPath.value ?? "", [sha]);
+    assertOperationSucceeded(result, `cherry-pick ${sha}`);
+  },
+  runRebaseOnto: async (onto) => {
+    const { gitRebaseOnto } = await import("./utils/backend");
+    return gitRebaseOnto(repoFolderPath.value ?? "", onto);
+  },
+  refresh: async () => { await repoRefresh(); await refreshRepoState(); },
+  // git's own conflicted set, not our in-memory list: it is the only thing
+  // that knows whether staging actually landed.
+  conflictedPaths: () => repoStatus.value?.conflicted ?? [],
+  openConflicts: async (cwd) => { await mergeOpenPath(cwd); },
+  resolveAll: (opts) => resolveAll(opts),
+  saveAll: () => saveAllFiles(),
+  stage: (paths) => stageFiles(paths),
+  files: () => mergeFiles.value as never,
+  finalize: async (operation) => {
+    const { gitOperationAction } = await import("./utils/backend");
+    const cwd = repoFolderPath.value ?? "";
+    // Same reasoning as the runners above: doMergeContinue and
+    // doCherryPickContinue swallow failure into `error.value`, so a refused
+    // --continue would be reported as a finished merge.
+    if (operation === "rebase") {
+      await gitOperationAction(cwd, "rebase", "continue");
+      return;
+    }
+    // One command for every operation; it throws when git refused, and
+    // resolves with { halted } when git merely stopped on a further conflict,
+    // which is progress and not something to assert against.
+    await gitOperationAction(
+      cwd,
+      operation === "cherry-pick" ? "cherry_pick" : "merge",
+      "continue",
+    );
+  },
+  applyPredicateFor,
+});
+
+async function handleApplyFromPreview(operation: string, ref_: string, estimatedHunks: number) {
+  if (!repoFolderPath.value || applyingFromPreview.value) return;
+  applyingFromPreview.value = true;
+  applyOutcome.value = null;
+  try {
+    const out = await runApplyFromPreview(operation as never, ref_, estimatedHunks);
+    applyOutcome.value = out;
+    // Land the user on the first file that still needs them, if any.
+    if (out.residualFiles.length > 0) {
+      viewMode.value = "changes";
+      await repoSelectFile(out.residualFiles[0], false);
+    }
+  } catch (err: unknown) {
+    repoError.value = `apply: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    applyingFromPreview.value = false;
+  }
+}
+
+async function handleOpenResidual(path: string) {
+  viewMode.value = "changes";
+  await repoSelectFile(path, false);
 }
 
 async function handleResolveHunkCustom(path: string, hunkIndex: number, content: string) {
@@ -912,6 +1068,85 @@ async function handleSplitCommitRequest(entry: GitLogEntry) {
     message: entry.message,
     body: entry.body,
     parents: entry.parents,
+  });
+}
+
+/**
+ * v3.11 — write an inline diff edit back to the working tree.
+ *
+ * DiffViewer hands up the hunk and the replacement text; the read, the splice
+ * and the write happen here because they are repo I/O and the component only
+ * renders. The file is re-read rather than spliced against whatever the diff
+ * was built from: it may have moved since (an external edit, the watcher, a
+ * branch switch), and `spliceHunk` refuses rather than writing one line off.
+ *
+ * The result is a plain working-tree change. It is not staged, and it is not
+ * turned into a patch: an edit is something you stage afterwards like any
+ * other, and synthesizing a unified patch from arbitrary text would mean
+ * re-diffing the hunk and surfacing apply failures as opaque backend errors.
+ */
+async function handleEditHunk(path: string, hunkIdx: number, replacement: string) {
+  const cwd = repoFolderPath.value;
+  const hunk = repoDiff.value?.hunks[hunkIdx];
+  if (!cwd || !hunk) return;
+
+  try {
+    const { readFile, writeFile } = await import("./utils/backend");
+    const current = await readFile(cwd, path);
+    const result = spliceHunk(current, hunk, replacement);
+    if (!result.ok) {
+      repoError.value = t("diff.editStale");
+      return;
+    }
+    await writeFile(cwd, path, result.text);
+    await repoRefresh();
+  } catch (err: unknown) {
+    repoError.value = `edit: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/**
+ * v3.11 (#128 follow-up) — the split affordance on the rebase banner.
+ *
+ * Closing `RebaseEditor` for the conflict banner took "Split this commit…"
+ * with it, leaving only Continue/Skip/Abort for the rest of the rebase. The
+ * banner outlives the editor, so the affordance belongs there.
+ *
+ * `operationHead` is `.git/REBASE_HEAD`, which at both halt kinds is the
+ * ORIGINAL pre-rebase commit, and that is exactly what `pendingSplits` keys
+ * on. Gated on `!hasConflict` for correctness, not neatness: `gitSplitCommit`
+ * runs `reset --mixed HEAD^`, so HEAD has to BE the commit being split. At an
+ * `edit` stop it is; at a conflict stop the commit has not been created yet
+ * and HEAD is its parent.
+ */
+const pendingSplitAtHalt = computed(() => {
+  const st = repoOperationState.value;
+  if (!showOperationBanner.value || !st || st.hasConflict) return null;
+  return getPendingSplitForHash(st.operationHead ?? null);
+});
+
+async function onRebaseBannerSplit() {
+  const pending = pendingSplitAtHalt.value;
+  const cwd = repoFolderPath.value;
+  if (!pending || !cwd) return;
+
+  // Deliberately NOT `pending.fullHash`, which is what the equivalent handler
+  // in RebaseEditor passes. That is the original pre-rebase commit, and it
+  // drives `getGitShow` for the modal's diff, while `gitSplitCommit` operates
+  // on HEAD. Whenever the replay rewrote the commit (a moved base, or a
+  // conflict the user just resolved) those are two different commits, so the
+  // modal would show the pre-rebase diff while the split acted on the
+  // post-rebase content. Use HEAD, which is the commit that will actually be
+  // split; `pending` only decides whether to offer the action at all.
+  // "HEAD" names the commit git just created at this `edit` stop, which is the
+  // one `reset --mixed HEAD^` will split.
+  await splitCommit.openFor(cwd, { hash: "HEAD", message: pending.message }, async () => {
+    // Keyed on the original hash, which is what `pendingSplits` stores.
+    resolvePendingSplit(pending.fullHash);
+    const { gitOperationAction } = await import("./utils/backend");
+    await gitOperationAction(cwd, "rebase", "continue");
+    await refreshRepoState();
+    await repoRefresh();
   });
 }
 
@@ -1050,6 +1285,15 @@ function handleOpenSubmodule(path: string) {
   if (!parent) return;
   const abs = `${parent.replace(/\/+$/, "")}/${path}`;
   openTab(abs);
+}
+
+/**
+ * An untracked nested repository, opened as its own tab (issue #183). Same
+ * treatment as a submodule, minus the trailing slash `git status` puts on a
+ * directory entry, which `openTab` must not see in the path it keys tabs by.
+ */
+function handleOpenNestedRepo(path: string) {
+  handleOpenSubmodule(path.replace(/\/+$/, ""));
 }
 
 // ─── Folder opening ─────────────────────────────────────
@@ -1460,7 +1704,22 @@ watch(
 // plain staging change within the SAME repo (e.g. the "Review now" round trip).
 watch(repoFolderPath, () => {
   commitReviewDecision.value = null;
+  // v3.11 — the per-hunk opt-out set is keyed by repo-relative path, so it
+  // must not survive a repo change: the same path means a different file. The
+  // confidence bar does: it is a user preference, so it is re-seeded from
+  // Settings rather than cleared.
+  resolutionSelection.resetAll();
+  resolutionSelection.minScore.value = settings.value.resolution.minConfidenceScore;
 });
+
+// The bar governs every apply path, including the merge editor's "Resolve
+// auto" and the MERGE_HEAD automation, so it has to hold the Setting's value
+// whether or not the user ever opens the Conflict Predictor.
+watch(
+  () => settings.value.resolution.minConfidenceScore,
+  (score) => { resolutionSelection.minScore.value = score; },
+  { immediate: true },
+);
 
 function onDiscardSection(sectionKey: string, paths: string[]) {
   discardSectionConfirm.value = { sectionKey, paths };
@@ -2429,26 +2688,44 @@ const showRebase = ref(false);
 // ─── Rebase-in-progress state (plain rebase from pull --rebase) ──────────
 // Polled after every repo refresh so the banner appears/disappears automatically.
 const repoOperationState = ref<RepoOperationState | null>(null);
-const showRebaseBanner = computed(() =>
+/** What the repository on disk says is in progress — null when unreadable. */
+const repoDiskOperation = ref<RepoOperationState["state"] | null>(null);
+/** True for a rebase specifically — several call sites below mean *that*, not
+ * "some operation is in progress", and would silently change meaning now that
+ * repoOperationState carries every operation. */
+const isRebasing = computed(() =>
+  repoOperationState.value?.state === "rebase" ||
+  repoOperationState.value?.state === "rebase_interactive",
+);
+
+/**
+ * The banner now drives every operation, not just a rebase: merge,
+ * cherry-pick and revert each get Continue/Abort there (design §6).
+ */
+const showOperationBanner = computed(() =>
   repoOperationState.value !== null &&
-  (repoOperationState.value.state === "rebase" || repoOperationState.value.state === "rebase_interactive") &&
   !showRebase.value &&   // don't overlap with the RebaseEditor (user-initiated interactive rebase)
   repoFolderPath.value !== ""
 );
 
 async function refreshRepoState() {
-  if (!repoFolderPath.value) { repoOperationState.value = null; return; }
+  if (!repoFolderPath.value) {
+    repoOperationState.value = null;
+    repoDiskOperation.value = null;
+    return;
+  }
   try {
     const state = await gitRepoState(repoFolderPath.value);
-    // Surface both plain and interactive rebase states — git ≥2.26 uses the
-    // sequencer backend (creates rebase-merge/interactive) even for plain
-    // pull --rebase.  We distinguish from a user-initiated RebaseEditor session
-    // via the showRebase flag (see showRebaseBanner computed above).
-    repoOperationState.value =
-      (state.state === "rebase" || state.state === "rebase_interactive") ? state : null;
+    repoDiskOperation.value = state.state;
+    // Every operation in progress, not just a rebase: the banner drives them
+    // all now. The places that specifically meant "a rebase is running" use
+    // the `isRebasing` computed instead of testing this ref for null.
+    repoOperationState.value = state.state === "clean" ? null : state;
   } catch (err) {
     console.warn("[rebase] gitRepoState error:", err);
     repoOperationState.value = null;
+    // null, not "clean": a failed read knows nothing at all.
+    repoDiskOperation.value = null;
   }
 }
 
@@ -2459,19 +2736,11 @@ async function refreshRepoState() {
  * is gone after the refresh. Callers pass the pre-action `wasRebasing` snapshot.
  */
 function preferForcePushIfRebaseCompleted(wasRebasing: boolean) {
-  if (wasRebasing && repoOperationState.value === null) {
+  if (wasRebasing && !isRebasing.value) {
     forcePushPreferred.value = true;
   }
 }
 
-async function onRebaseBannerActionDone(action: "continue" | "abort" | "skip") {
-  // After continue/abort/skip: re-poll state, refresh repo
-  const wasRebasing = repoOperationState.value !== null;
-  await refreshRepoState();
-  await repoRefresh();
-  // Abort restores the pre-rebase state, so it must NOT flip the preference.
-  if (action !== "abort") preferForcePushIfRebaseCompleted(wasRebasing);
-}
 
 // Driven into RebaseProgressBanner so it can show a spinner during the loop.
 const rebaseAutoResolving = ref(false);
@@ -2488,21 +2757,25 @@ async function onRebaseBannerAutoResolve() {
   if (!repoFolderPath.value || rebaseAutoResolving.value) return;
   rebaseAutoResolving.value = true;
   const cwd = repoFolderPath.value;
-  const wasRebasing = repoOperationState.value !== null;
+  // Rebase-only loop: `isRebasing`, not `!== null`, now that the ref carries
+  // merge and cherry-pick too.
+  const wasRebasing = isRebasing.value;
   try {
-    const { gitRebaseAction } = await import("./utils/backend");
+    const { gitOperationAction } = await import("./utils/backend");
     for (let i = 0; i < 100; i++) {
       await refreshRepoState();
-      // Rebase finished (or no longer paused) — we're done.
-      if (!repoOperationState.value) break;
+      // Rebase finished (or no longer paused) — we're done. This loop is
+      // rebase-only, so it stops as soon as the repo is not rebasing.
+      const op = repoOperationState.value;
+      if (!isRebasing.value || !op) break;
       // Paused without conflicts (e.g. an `edit`/`break` stop) — just advance.
-      if (!repoOperationState.value.hasConflict) {
-        await gitRebaseAction(cwd, "continue");
+      if (!op.hasConflict) {
+        await gitOperationAction(cwd, "rebase", "continue");
         continue;
       }
       // Resolve this step.
       await mergeOpenPath(cwd);
-      await resolveAll();
+      await resolveAll({ shouldApply: applyPredicateFor });
       await saveAllFiles();
       const resolved = mergeFiles.value
         .filter((f) => f.result.stats.totalConflicts === 0)
@@ -2512,7 +2785,7 @@ async function onRebaseBannerAutoResolve() {
       // Couldn't fully resolve this step → stop and hand back to the user.
       if (repoStatus.value && repoStatus.value.conflicted.length > 0) break;
       // Step clear → advance the rebase and loop.
-      await gitRebaseAction(cwd, "continue");
+      await gitOperationAction(cwd, "rebase", "continue");
     }
     await refreshRepoState();
     await repoRefresh();
@@ -2653,6 +2926,184 @@ async function openLaunchpadRepoChanges(repoPath: string) {
 }
 
 /**
+ * Merge a PR straight from its Launchpad inbox card (v3.10, Phase G). Confirms
+ * through the app's `askConfirm` modal (never native `confirm()`), then
+ * reuses `usePrPanel`'s own merge path (`mergingPr` + `mergePr()`) rather than
+ * calling `ghMergePr` directly, so error handling / cache invalidation /
+ * dock-badge refresh stay identical to merging from PrDetailView.
+ *
+ * Applies the same readiness gate `PrDetailView` uses to disable its merge
+ * button (`mergeBlocked` — conflicts / failing or pending checks / requested
+ * changes / no permission): `selectPr()` + `loadChecks()` populate the same
+ * `prDetail`/`prChecks`/`prReviews` that computed reads, so it reflects this
+ * PR rather than whatever was previously selected. `mergeMethod` is also
+ * reset to PrDetailView's own default ("merge") first, since it is a single
+ * app-wide ref that otherwise leaks whatever the user last picked for an
+ * unrelated PR.
+ */
+async function openLaunchpadMergePr(pr: PullRequest & { repoPath?: string }) {
+  if (pr.repoPath && pr.repoPath !== repoFolderPath.value) {
+    await handleOpenPath(pr.repoPath);
+    await nextTick();
+  }
+  await prPanel.loadRemote();
+  await prPanel.selectPr(pr);
+  await prPanel.loadChecks();
+  if (prPanel.mergeBlocked.value) {
+    repoError.value = prPanel.mergeBlockedReason.value;
+    return;
+  }
+  const confirmed = await askConfirm({
+    title: t("launchpad.confirm.merge.title"),
+    message: t("launchpad.confirm.merge.body", pr.title, pr.base),
+  });
+  if (!confirmed) return;
+  prPanel.mergeMethod.value = "merge";
+  prPanel.mergingPr.value = pr;
+  await prPanel.mergePr();
+  // `mergePr()` nulls `mergingPr` only on success — that is the real signal,
+  // not `!prPanel.error.value` (sticky from any unrelated prior PR action,
+  // so it can both mask a genuine failure and suppress today's success).
+  if (prPanel.mergingPr.value === null) {
+    showLaunchpadToast(t("launchpad.toast.merged"));
+  } else {
+    // On failure `prPanel.error` is only rendered inside PrDetailView, which
+    // isn't mounted from the Launchpad — funnel it into the app-wide
+    // error-toast banner so it doesn't fail silently, and clear `mergingPr`
+    // ourselves so PrDetailView's merge dialog doesn't pop back open on a
+    // stale value the next time the user opens the PRs view.
+    repoError.value = prPanel.error.value;
+    prPanel.mergingPr.value = null;
+  }
+}
+
+/**
+ * Arm forge-side auto-merge on a PR straight from its Launchpad inbox card
+ * (v3.11.0, Task 10). Same repo-switch + confirm dance as
+ * `openLaunchpadMergePr`, but calls `prPanel.armAutoMerge()` instead of
+ * `prPanel.mergePr()`, that composable method is the single caller of
+ * `forge.value.enableAutoMerge`, so this handler never talks to a per-forge
+ * wrapper directly and never branches on forge name.
+ *
+ * No `mergeBlocked` gate here: unlike an immediate merge, arming auto-merge
+ * is exactly what a PR that ISN'T mergeable yet needs. There is a
+ * repo-level gate though: the inbox list row has no `autoMergeSupport`
+ * (it is only ever carried on the PR detail, deliberately not fetched per
+ * row, see `gh_auto_merge_state`), so a repository whose owner never
+ * enabled "Allow auto-merge" would otherwise offer this action on every row
+ * and fail on every click. `selectPr` + `loadChecks` (mirroring
+ * `openLaunchpadMergePr`) load the detail bundle that carries the real
+ * `autoMergeSupport`, and this refuses with the forge's own `reason` the
+ * same way `openLaunchpadMergePr` surfaces `mergeBlockedReason`.
+ *
+ * Past that gate, `armAutoMerge` never throws, it catches its own errors
+ * (including `ForgeNotImplementedError` from a forge with no auto-merge API,
+ * e.g. Bitbucket/Cursor) and leaves them on `prPanel.error`, which is checked
+ * below the same way `openLaunchpadMergePr` checks it on failure. The
+ * classifier should never offer `auto-merge` for those forges (their
+ * descriptor reports `available: false`), so that remains a safety net, not
+ * the expected path.
+ */
+async function openLaunchpadAutoMergePr(pr: PullRequest & { repoPath?: string }) {
+  if (pr.repoPath && pr.repoPath !== repoFolderPath.value) {
+    await handleOpenPath(pr.repoPath);
+    await nextTick();
+  }
+  await prPanel.loadRemote();
+  await prPanel.selectPr(pr);
+  await prPanel.loadChecks();
+  const support = prPanel.prDetail.value?.autoMergeSupport;
+  if (support && !support.supported) {
+    repoError.value = support.reason
+      ? `${t("pr.detail.autoMergeUnavailable")}: ${support.reason}`
+      : t("pr.detail.autoMergeUnavailable");
+    return;
+  }
+  const confirmed = await askConfirm({
+    title: t("launchpad.confirm.autoMerge.title"),
+    message: t("launchpad.confirm.autoMerge.body", pr.title, pr.base),
+  });
+  if (!confirmed) return;
+  prPanel.mergeMethod.value = "merge";
+  await prPanel.armAutoMerge();
+  if (prPanel.error.value) {
+    repoError.value = prPanel.error.value;
+  } else {
+    showLaunchpadToast(t("launchpad.toast.autoMergeArmed"));
+  }
+}
+
+/**
+ * Nudge state for the Launchpad "post a reminder comment" flow (v3.10, Phase
+ * G). GitHub-only for this release (decision #6): `ghIssueAddComment` posts a
+ * plain top-level comment on the PR's issue thread, which is what a reminder
+ * needs — `ghPrCreateComment` posts a diff-anchored review comment and
+ * requires a file `path`/`line`, so it is the wrong primitive here. Non-GitHub
+ * forges fall back to `open-pr`.
+ *
+ * The comment text is editable (decision #7): the modal pre-fills
+ * `launchpad.nudge.comment` into a textarea the user can change before
+ * sending, so this cannot reuse the plain-message `askConfirm` modal — it is
+ * a small dedicated `BaseModal` instead, same pattern as the commit "tag"
+ * modal (editable text field + Cancel/Confirm footer).
+ */
+const nudgeConfirm = ref<{ pr: PullRequest & { repoPath?: string }; comment: string; busy: boolean } | null>(null);
+
+function openLaunchpadNudgePr(pr: PullRequest & { repoPath?: string; forge?: ForgeName }) {
+  if (pr.forge && pr.forge !== "github") {
+    void openLaunchpadPr(pr);
+    return;
+  }
+  nudgeConfirm.value = { pr, comment: t("launchpad.nudge.comment"), busy: false };
+}
+
+function cancelNudgePr() {
+  nudgeConfirm.value = null;
+}
+
+async function confirmNudgePr() {
+  if (!nudgeConfirm.value || !nudgeConfirm.value.pr.repoPath) return;
+  if (!(await requireOnline("gh issue comment (nudge)"))) {
+    repoError.value = t("connectivity.offline.disabledOp");
+    return;
+  }
+  const { pr, comment } = nudgeConfirm.value;
+  nudgeConfirm.value.busy = true;
+  try {
+    await ghIssueAddComment(pr.repoPath!, pr.number, comment);
+    nudgeConfirm.value = null;
+    showLaunchpadToast(t("launchpad.toast.nudged"));
+  } catch (err: any) {
+    repoError.value = err?.message ?? String(err);
+    if (nudgeConfirm.value) nudgeConfirm.value.busy = false;
+  }
+}
+
+/**
+ * Jump into the conflict resolver for a PR flagged DIRTY (mergeStateStatus)
+ * instead of opening the PR review page (v3.10, Phase G — a deliberate change
+ * from the previous open-pr behavior). Switches to the PR's repo, checks out
+ * its branch (same `checkoutPr` PrDetailView uses), then shows the Changes
+ * view where GitWand's own conflict engine surfaces working-tree conflicts.
+ */
+async function openLaunchpadResolvePr(pr: PullRequest & { repoPath?: string }) {
+  if (pr.repoPath && pr.repoPath !== repoFolderPath.value) {
+    await handleOpenPath(pr.repoPath);
+    await nextTick();
+  }
+  await prPanel.loadRemote();
+  // Clear any stale error first so the check below reflects this checkout,
+  // not a leftover from an unrelated prior PR action.
+  prPanel.error.value = null;
+  await prPanel.checkoutPr(pr);
+  if (prPanel.error.value) {
+    repoError.value = prPanel.error.value;
+    return;
+  }
+  viewMode.value = "changes";
+}
+
+/**
  * Handle the ⌘L / Ctrl+L shortcut (and the header Launchpad pill / menu item):
  * just switch to the Launchpad view. Its repos come from the open tabs, so
  * there is nothing to resolve — if no repo is open, the EmptyState shows.
@@ -2774,6 +3225,40 @@ function askConfirm(options: {
       resolve,
     };
   });
+}
+
+/**
+ * Run an operation action for the banner, and deal with what it leaves behind.
+ *
+ * One handler for every operation and every action. `canUndo` is the "there is
+ * work to lose" signal that makes the composable confirm an abort first; on an
+ * abort that git actually performed, the resolution state it belonged to is
+ * dropped and the changes view — which now has nothing to show — is left.
+ */
+async function onOperationAction(action: "continue" | "abort" | "skip") {
+  const wasRebasing = isRebasing.value;
+  const operationBefore = repoOperationState.value?.state ?? null;
+  const did = await runOperationAction(action, {
+    hasResolutionWork: canUndo.value,
+  });
+  await refreshRepoState();
+  await repoRefresh();
+  if (!did) return;
+  if (action === "abort") {
+    mergeReset();
+    viewMode.value = "graph";
+    return;
+  }
+  // Abort restores the pre-rebase state, so it must NOT flip the preference.
+  preferForcePushIfRebaseCompleted(wasRebasing);
+  // The merge-completed modal, on evidence rather than on assumption: the
+  // operation was a merge, git did not refuse, and the repository no longer
+  // reports one in progress. A `--continue` that merely halted on a further
+  // conflict leaves the state in place and so shows nothing, which is the
+  // whole point of distinguishing the two (design §3).
+  if (action === "continue" && operationBefore === "merge" && repoOperationState.value === null) {
+    showMergeSuccess.value = true;
+  }
 }
 
 // ─── Post-checkout "Update branch" prompt ────────────────
@@ -3342,7 +3827,7 @@ const scheduler = useScheduler({
   onLog: (msg) => pushErrorLog(msg),
   resolveConflicts: async () => {
     if (!repoFolderPath.value) return;
-    await resolveAll();
+    await resolveAll({ shouldApply: applyPredicateFor });
     await repoRefresh();
   },
   pullAndRebase: async () => {
@@ -3396,6 +3881,78 @@ const poller = useRepoPoller({
   },
 });
 watch(repoFolderPath, (p) => poller.setFolderPath(p), { immediate: true });
+
+// ─── Live Repo watcher (v3.10.0) ─────────────────────────────────────
+// The watcher is the primary refresh driver; the poller above demotes itself
+// to a 15 s fallback while `healthy` is true. When the user has turned the
+// feature off, or the backend cannot watch (network mount), we never start it
+// and the poller keeps its 2 s cadence.
+const repoWatcher = useRepoWatcher({
+  onHealthChange: (healthy) => poller.setWatcherHealthy(healthy),
+});
+
+watch(
+  [repoFolderPath, () => settings.value.liveRepoWatcher],
+  ([path, enabled]) => {
+    repoWatcher.setFolderPath(enabled ? path : null);
+  },
+  { immediate: true },
+);
+
+// Serialize watcher-driven refreshes: an `rm -rf node_modules` or a branch
+// switch produces several coalesced batches back to back, and repoRefresh()
+// routinely takes longer than the watcher's debounce window, so without this
+// a burst would stack concurrent repoRefresh() calls on the same repo. Keyed
+// per handler (not a single shared in-flight boolean): one coalesced event
+// batch can carry several kinds at once, so distinct handlers (worktree/index,
+// mergeState, stash, ...) routinely need to queue during the very same
+// in-flight window, and each must still run — see useWatcherRefreshQueue.ts.
+const watcherRefreshQueue = useWatcherRefreshQueue();
+
+repoWatcher.on(["worktree", "index"], () => {
+  watcherRefreshQueue.schedule("worktree-index", async () => {
+    await repoRefresh();
+    if (viewMode.value === "history" || showGitTree.value) await loadLog();
+  });
+});
+
+repoWatcher.on(["head", "refs"], () => {
+  watcherRefreshQueue.schedule("head-refs", async () => {
+    await repoRefresh();
+    await loadLog();
+  });
+});
+
+// The dock "prs" badge only refreshed on repo-open and manual refresh (PR #125).
+// A ref moving is the cheapest local proxy for "a PR's state may have changed";
+// the forge call itself is throttled to once a minute inside usePrPanel.
+repoWatcher.on(["refs"], () => {
+  if (document.hidden) return;
+  void prPanel.refreshDockPrCountThrottled();
+});
+
+repoWatcher.on(["mergeState"], () => {
+  watcherRefreshQueue.schedule("mergeState", async () => {
+    await repoRefresh();
+    // Gate on an actual conflict, mirroring useRepoPoller's rising-edge check
+    // (useRepoPoller.ts:115-121). classify_path reports "mergeState" for any
+    // write under .git/MERGE_MSG or .git/rebase-merge/*, which a completely
+    // clean merge or rebase also produces — calling onConflictDetected()
+    // unconditionally would burn its one-shot mergeHeadWasPresent latch on a
+    // clean merge and silently swallow auto-resolve for a real conflict later.
+    if (hasConflicts.value) await scheduler.onConflictDetected();
+  });
+});
+
+// "config" (.git/config writes) has no handler: nothing in the app reacts to
+// remote/branch-tracking config changes today. Left as a deliberate no-op so
+// a future consumer knows the kind exists rather than silently dropping it.
+
+repoWatcher.on(["stash"], () => {
+  watcherRefreshQueue.schedule("stash", async () => {
+    if (showStash.value) await loadStashes();
+  });
+});
 
 // v2.14 — Ensure the log is loaded when the Git Tree is toggled on.
 watch(showGitTree, (show) => {
@@ -3728,7 +4285,7 @@ onUnmounted(() => {
       :needs-publish="needsPublish" :ahead-count="aheadCount" :behind-count="behindCount"
       :main-commit-count="mainCommitCount" :push-remote="pushRemote"
       :ahead-push-count="aheadPushCount" :is-pushing="isPushing" :is-pulling="isPulling"
-      :force-push-preferred="forcePushPreferred" :is-fetching="isFetching"
+      :force-push-preferred="forcePushPreferred" :is-fetching="isFetching" :fetch-percent="fetchPercent"
       :cwd="repoFolderPath ?? ''" :branches="branches" :worktree-branches="worktreeBranches" :branches-loading="branchesLoading"
       :is-switching-branch="isSwitchingBranch" :is-merging="isMerging" :tabs="repoTabs" :active-tab-id="activeTabId"
       :active-repo-path="activeRepoPath" :load-worktrees="loadProjectWorktrees"
@@ -3741,6 +4298,10 @@ onUnmounted(() => {
       @sync="doSync" @publish="doPublish" @rebase-onto-remote="doRebaseOntoRemote" @merge-remote="doMergeRemote"
       @force-push="doForcePush" @discard-all="handleWipDiscardAll"
       @merge-branch="doMerge" @open-settings="settingsInitialTab = undefined; showSettings = true"
+      :applying-from-preview="applyingFromPreview" :apply-outcome="applyOutcome"
+      @apply-from-preview="handleApplyFromPreview"
+      @dismiss-apply="applyOutcome = null"
+      @open-residual="handleOpenResidual"
 
       :error-count="logUnreadCount" :is-offline="isOffline" @switch-branch="handleSwitchBranch" @open-logs="openLogsTab"
       @change-view="onViewModeChange"
@@ -3789,30 +4350,13 @@ onUnmounted(() => {
             <!-- Plain rebase-in-progress banner (pull --rebase paused on conflicts).
                  Non-blocking: sits at the top of the view so the resolution area
                  below stays reachable. -->
-            <RebaseProgressBanner v-if="showRebaseBanner && repoOperationState" :repo-state="repoOperationState"
-              :cwd="repoFolderPath ?? ''" :auto-resolving="rebaseAutoResolving"
-              @action-done="onRebaseBannerActionDone"
-              @auto-resolve="onRebaseBannerAutoResolve" @error="(msg) => { repoError = msg; }" />
+            <RebaseProgressBanner v-if="showOperationBanner && repoOperationState" :repo-state="repoOperationState"
+              :auto-resolving="rebaseAutoResolving"
+              :on-action="onOperationAction"
+              :pending-split="pendingSplitAtHalt !== null"
+              @split="onRebaseBannerSplit"
+              @auto-resolve="onRebaseBannerAutoResolve" />
 
-            <!-- Conflict banner (merge or cherry-pick) — suppressed during a
-                 paused rebase, which has its own banner + Continue/Skip/Abort. -->
-            <div v-if="hasConflicts && !showRebaseBanner" class="conflict-banner" role="alert">
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <path d="M9 1.5L16.5 15H1.5L9 1.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
-                <path d="M9 7v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-                <circle cx="9" cy="12.5" r="0.75" fill="currentColor" />
-              </svg>
-              <span class="conflict-text">
-                {{ repoStats.conflicted }} {{ repoStats.conflicted > 1 ? t('header.conflicts') : t('header.conflict') }}
-                — {{ t('header.resolveConflicts') }}
-              </span>
-              <button v-if="isCherryPicking" class="conflict-abort-btn" @click="doCherryPickAbort">
-                {{ t('header.abortCherryPick') }}
-              </button>
-              <button v-else class="conflict-abort-btn" @click="doAbortMerge">
-                {{ t('header.abortMerge') }}
-              </button>
-            </div>
 
             <!-- ── Dashboard view: full-bleed, no side panel ── -->
             <DashboardView v-if="viewMode === 'dashboard'" class="view__content"
@@ -3835,7 +4379,8 @@ onUnmounted(() => {
                   @apply-file-memory="(path, entry) => handleApplyFileMemory(path, entry)"
                   @resolve-tree-conflict="(path, choice) => handleResolveTreeConflict(path, choice)"
                   @reconstruct-conflict="(path) => handleReconstructConflict(path)"
-                  @keep-working-tree="(path) => handleKeepWorkingTree(path)" />
+                  @keep-working-tree="(path) => handleKeepWorkingTree(path)"
+                  @open-externally="(path) => handleOpenInEditor(path)" />
                 <FileHistoryViewer v-else-if="fileHistoryPath && repoFolderPath" :file-path="fileHistoryPath"
                   :cwd="repoFolderPath" @close="closeFileHistory"
                   @select-commit="(hash) => { closeFileHistory(); selectCommit(hash); viewMode = 'history'; }" />
@@ -3852,7 +4397,11 @@ onUnmounted(() => {
                   @update:diff-mode="onDiffModeChange" @open-file-history="openFileHistory"
                   @open-in-editor="handleOpenInEditor" @stage-patch="stagePatch"
                   @select-dir-file="(path) => repoSelectFile(path, false)"
-                  @dismiss-finding="(id) => commitReview.dismiss(id)" />
+                  @open-repo-tab="handleOpenNestedRepo"
+                  @add-to-gitignore="addToGitignore"
+                  @dismiss-finding="(id) => commitReview.dismiss(id)"
+                  :editable="!repoSelectedFileStaged && !isSelectedFileConflicted"
+                  @edit-hunk="handleEditHunk" />
               </div>
 
               <div v-if="showCommitRail" class="sidebar-handle" :class="{ 'sidebar-handle--active': sidebarResizing }"
@@ -3988,7 +4537,7 @@ onUnmounted(() => {
             <IssueDetailView v-else-if="viewMode === 'issue'" />
 
             <!-- Launchpad view: cross-repo dashboard (v2.10 nav revamp) -->
-            <LaunchpadView v-else-if="viewMode === 'launchpad'" :repos="launchpadRepos" @open-pr="openLaunchpadPr" @open-issue="openLaunchpadIssue" @open-repo-changes="openLaunchpadRepoChanges" />
+            <LaunchpadView v-else-if="viewMode === 'launchpad'" :repos="launchpadRepos" @open-pr="openLaunchpadPr" @open-issue="openLaunchpadIssue" @open-repo-changes="openLaunchpadRepoChanges" @merge-pr="openLaunchpadMergePr" @auto-merge-pr="openLaunchpadAutoMergePr" @nudge-pr="openLaunchpadNudgePr" @resolve-pr="openLaunchpadResolvePr" />
           </template>
         </template>
       </main>
@@ -4459,6 +5008,21 @@ onUnmounted(() => {
       </template>
     </BaseModal>
 
+    <!-- Launchpad "nudge" — reminder comment, editable before sending (v3.10, Phase G) -->
+    <BaseModal v-if="nudgeConfirm" :title="t('launchpad.confirm.nudge.title')" size="sm" role="alertdialog"
+      @close="cancelNudgePr">
+      <p class="ptc-desc">{{ t('launchpad.confirm.nudge.body', nudgeConfirm.pr.title) }}</p>
+      <textarea v-model="nudgeConfirm.comment" class="cam-input" rows="4"
+        :disabled="nudgeConfirm.busy" style="resize: vertical;"></textarea>
+      <template #footer>
+        <button class="bm-btn bm-btn--ghost" :disabled="nudgeConfirm.busy" @click="cancelNudgePr">{{ t('common.cancel') }}</button>
+        <button class="bm-btn bm-btn--primary" :disabled="nudgeConfirm.busy || !nudgeConfirm.comment.trim()"
+          @click="confirmNudgePr">
+          {{ nudgeConfirm.busy ? t('common.loading') : t('common.confirm') }}
+        </button>
+      </template>
+    </BaseModal>
+
     <!-- Post-checkout "Update branch" prompt (behind-only, no divergence) -->
     <BaseModal v-if="branchUpdatePrompt" :title="t('branches.updateAvailableTitle')" size="sm" role="alertdialog"
       @close="onBranchUpdateDismiss">
@@ -4771,38 +5335,9 @@ onUnmounted(() => {
 }
 
 /* ─── Merge conflict banner ──────────────────────────── */
-.conflict-banner {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  padding: var(--space-4) var(--space-6);
-  background: var(--color-warning-bg);
-  border-left: 3px solid var(--color-warning);
-  color: var(--color-warning);
-  font-size: var(--font-size-md);
-  font-weight: var(--font-weight-medium);
-  flex-shrink: 0;
-}
 
-.conflict-text {
-  flex: 1;
-}
 
-.conflict-abort-btn {
-  padding: var(--space-2) var(--space-5);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-base);
-  font-weight: var(--font-weight-semibold);
-  background: var(--color-bg-tertiary);
-  color: var(--color-text);
-  border: 1px solid var(--color-border);
-  cursor: pointer;
-  transition: background var(--transition-fast);
-}
 
-.conflict-abort-btn:hover {
-  background: var(--color-border);
-}
 
 /* ─── Toast ──────────────────────────────────────────── */
 .toast {

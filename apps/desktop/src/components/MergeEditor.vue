@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ConflictFile } from "../composables/useGitWand";
+import { useResolutionSelection, contentStamp } from "../composables/useResolutionSelection";
 import { summarizeTiers, type ConflictHunk } from "@gitwand/core";
 import { highlightConflict } from "../utils/diffHighlight";
 import { useI18n } from "../composables/useI18n";
 import { safeHtml } from "../composables/useSafeHtml";
-import { useAIProvider, type ConflictContext } from "../composables/useAIProvider";
+import { useAIProvider } from "../composables/useAIProvider";
+import { useAiHunkQueue, remapHunkIndices } from "../composables/useAiHunkQueue";
 
 import { useHunkExplanation } from "../composables/useHunkExplanation";
 import { useResizeObserver } from "../composables/useResizeObserver";
@@ -21,6 +23,12 @@ import {
 import LlmTracePanel from "./LlmTracePanel.vue";
 import TokenMergePanel from "./TokenMergePanel.vue";
 import ResolutionPreviewPanel from "./ResolutionPreviewPanel.vue";
+// Async on purpose, and NOT a contradiction of the static-import justification
+// above: that one covers thin BaseModal wrappers with no heavy dependencies.
+// CodeEditor is the entry point to CodeMirror (~400 KB), and it sits behind a
+// `v-if` on a default-null flag, which is verbatim the apps/desktop/CLAUDE.md
+// rule. Opening the merge editor must not pay for it; clicking Edit does.
+const CodeEditor = defineAsyncComponent(() => import("./CodeEditor.vue"));
 import AiSparkle from "./AiSparkle.vue";
 // Not lazy-loaded: this is a thin wrapper around BaseModal (already always-eager
 // per the P1.2 perf exception list) with no heavy additional deps — same static-import
@@ -28,7 +36,7 @@ import AiSparkle from "./AiSparkle.vue";
 import ResolveAutoSummaryModal from "./ResolveAutoSummaryModal.vue";
 
 const { t, locale } = useI18n();
-const { isAvailable: aiAvailable, isLoading: aiLoading, lastError: aiError, suggest: aiSuggest } = useAIProvider();
+const { isAvailable: aiAvailable } = useAIProvider();
 const { isGenerating: aiExplainLoading, explain: aiExplain } = useHunkExplanation();
 const { findMatchingRule, executeRule } = useCustomAutomations();
 const { findMemory, saveMemory, markUsed, detectPattern: _dp, applyMemory: _am } = useResolutionMemory();
@@ -52,62 +60,119 @@ const emit = defineEmits<{
   resolveTreeConflict: [path: string, choice: "ours" | "theirs" | "delete"];
   reconstructConflict: [path: string];
   keepWorkingTree: [path: string];
+  /** Conflicted file GitWand cannot decode: hand it to the user's own editor. */
+  openExternally: [path: string];
 }>();
 
 // ─── Inline Edit State ──────────────────────────────────
 const editingHunkIndex = ref<number | null>(null);
 const editContent = ref("");
 
+/**
+ * How the open edit box was filled. The label above the box and the
+ * explanation banner under it used to key on the queue's state instead, so a
+ * plain Custom edit on a hunk that happened to carry a staged suggestion was
+ * labelled "AI suggestion" while holding `startEditing`'s mechanical
+ * ours-plus-theirs concatenation, with the model's explanation beneath it.
+ * Provenance is a property of the opening, not of the queue.
+ */
+const editSource = ref<"custom" | "ai" | null>(null);
+
 function startEditing(hunkIndex: number, hunk: ConflictHunk) {
   editContent.value = [...hunk.oursLines, ...hunk.theirsLines].join("\n");
+  editSource.value = "custom";
   editingHunkIndex.value = hunkIndex;
 }
 
 function cancelEditing() {
   editingHunkIndex.value = null;
   editContent.value = "";
+  editSource.value = null;
 }
 
 function validateEditing(hunkIndex: number) {
   resolveHunkCustomWithMemory(props.file.path, hunkIndex, editContent.value);
   editingHunkIndex.value = null;
   editContent.value = "";
+  editSource.value = null;
 }
 
 // ─── AI Suggestion ─────────────────────────────────────
-const aiSuggestionHunkIndex = ref<number | null>(null);
-const aiSuggestionContent = ref<string | null>(null);
-const aiSuggestionExplanation = ref<string | null>(null);
+const aiQueue = useAiHunkQueue(() => props.file.path);
+// The reset of this state lives in the consolidated per-file watcher further
+// down, which also keys on the hunk array's identity: resolving one conflict
+// renumbers every later one under the same path, and per-hunk AI state that
+// survives that renumbering is attributed to the wrong hunk.
+//
+// `consumedHunkIndex` is what lets that watcher renumber instead of reset in
+// the one case where the renumbering is knowable: a single-hunk resolution
+// this component asked for. Every such emit records the index it consumed
+// here, and the watcher reads it once, on the re-parse that emit causes. An
+// undo, a redo or a file-wide resolve records nothing, so those still drop
+// the lot, which is safe by construction.
+let consumedHunkIndex: number | null = null;
 
-async function requestAISuggestion(hunkIndex: number, hunk: ConflictHunk) {
-  aiSuggestionHunkIndex.value = hunkIndex;
-  aiSuggestionContent.value = null;
-  aiSuggestionExplanation.value = null;
-
-  const ctx: ConflictContext = {
-    filePath: props.file.path,
-    base: hunk.baseLines?.join("\n") ?? "",
-    ours: hunk.oursLines.join("\n"),
-    theirs: hunk.theirsLines.join("\n"),
-  };
-
-  try {
-    const suggestion = await aiSuggest(ctx);
-    aiSuggestionContent.value = suggestion.resolvedContent;
-    aiSuggestionExplanation.value = suggestion.explanation;
-    // Pre-fill the edit area so user can review and tweak
-    editContent.value = suggestion.resolvedContent;
-    editingHunkIndex.value = hunkIndex;
-  } catch {
-    // Error is already in aiError ref
-    aiSuggestionHunkIndex.value = null;
-  }
+/**
+ * Open a hunk's already-staged suggestion for review. Reads the stored
+ * answer, so it costs nothing: a suggestion that has been paid for is opened,
+ * never re-requested.
+ */
+function openAISuggestion(hunkIndex: number): void {
+  const suggestion = aiQueue.suggestionFor(hunkIndex);
+  if (!suggestion) return;
+  editContent.value = suggestion.resolvedContent;
+  editSource.value = "ai";
+  editingHunkIndex.value = hunkIndex;
 }
 
-function dismissAISuggestion() {
-  aiSuggestionHunkIndex.value = null;
-  aiSuggestionContent.value = null;
-  aiSuggestionExplanation.value = null;
+async function requestAISuggestion(hunkIndex: number, hunk: ConflictHunk) {
+  const state = aiQueue.stateFor(hunkIndex);
+  if (state === "queued" || state === "loading") return;
+
+  // An answer is already staged for this hunk, typically by a batch: show it
+  // instead of buying a second one. Asking the model again is an explicit
+  // retry, which lives on the error banner where it belongs.
+  if (state === "ready") {
+    openAISuggestion(hunkIndex);
+    return;
+  }
+
+  await aiQueue.request(hunkIndex, hunk);
+
+  // Single-hunk behaviour is unchanged: the editor opens pre-filled so the
+  // user reviews before confirming. The batch deliberately does NOT do this,
+  // since only one hunk can be open at a time; it stages instead, and the
+  // row's staged banner is how those answers are reached.
+  if (aiQueue.stateFor(hunkIndex) === "ready") openAISuggestion(hunkIndex);
+}
+
+/** Ask the model again for a hunk whose call failed. */
+async function retryAISuggestion(hunkIndex: number, hunk: ConflictHunk) {
+  if (aiBusy(hunkIndex)) return;
+  // Clears the error entry, so the request below is not short-circuited by a
+  // stale `ready`/`error` state.
+  aiQueue.dismiss(hunkIndex);
+  await requestAISuggestion(hunkIndex, hunk);
+}
+
+function aiBusy(hunkIndex: number): boolean {
+  const s = aiQueue.stateFor(hunkIndex);
+  return s === "queued" || s === "loading";
+}
+
+/**
+ * Guards every action in a hunk's row while its own AI suggestion is in
+ * flight, not just the AI button itself: without this, accepting a hunk
+ * mid-flight would let `requestAISuggestion`'s answer land on a hunk the
+ * user already resolved and reopen its editor on finished work.
+ */
+function onRowAction(hunkIndex: number, fn: () => void): void {
+  if (aiBusy(hunkIndex)) return;
+  fn();
+}
+
+function dismissAISuggestion(hunkIndex: number) {
+  aiQueue.dismiss(hunkIndex);
 }
 
 // ─── AI Explanation (Phase 1.3.2) ───────────────────────
@@ -201,6 +266,7 @@ function applyFileMemory(hunkIndex: number, hunk: ConflictHunk) {
   const resolved = applyMemory(fileMemory.value, hunk);
   if (resolved !== null) {
     markUsed(fileMemory.value.id);
+    consumedHunkIndex = hunkIndex;
     emit("resolveHunkCustom", props.file.path, hunkIndex, resolved);
   }
 }
@@ -214,6 +280,7 @@ function autoDetectPattern(hunk: ConflictHunk): ResolutionStrategy | null {
 
 // ─── Override resolveHunk to capture memory offer ───────
 function resolveHunkWithMemory(path: string, hunkIndex: number, choice: ManualChoice) {
+  consumedHunkIndex = hunkIndex;
   emit("resolveHunk", path, hunkIndex, choice);
   const strategy: ResolutionStrategy = choice === "ours" ? "ours"
     : choice === "theirs" ? "theirs"
@@ -223,6 +290,7 @@ function resolveHunkWithMemory(path: string, hunkIndex: number, choice: ManualCh
 }
 
 function resolveHunkCustomWithMemory(path: string, hunkIndex: number, content: string) {
+  consumedHunkIndex = hunkIndex;
   emit("resolveHunkCustom", path, hunkIndex, content);
   // For custom edits, try to detect an auto-learnable pattern
   const hunk = hunks.value[hunkIndex];
@@ -245,10 +313,25 @@ function resolveHunkCustomWithMemory(path: string, hunkIndex: number, content: s
 // We track rejection client-side (per file path) because the core has
 // already produced the resolution — we don't want to re-run it. The set
 // is reset when the active file changes.
-const rejectedLlmHunks = ref<Set<number>>(new Set());
+// v3.11 — one store for every kind of "do not apply this hunk". It used to be
+// three independent refs, and `rejectedPreviewHunks` was read only by the
+// `v-if` that hid its own panel: rejecting a resolution hid the panel and then
+// applied the resolution anyway. Sharing one store with the code that actually
+// writes is what stops that from happening again.
+const selection = useResolutionSelection();
 
-/** Number of `llm_proposed` hunks the user explicitly rejected (this file). */
-const rejectedLlmCount = computed(() => rejectedLlmHunks.value.size);
+/** Fingerprint of the content the hunk indices were computed against. */
+const fileStamp = computed(() => contentStamp(props.file.content));
+
+/** Is this hunk excluded from the apply, whatever route excluded it? */
+function isHunkExcluded(hunkIndex: number): boolean {
+  return selection.isExcluded(props.file.path, hunkIndex, fileStamp.value);
+}
+
+/** Exclude one hunk from the apply (idempotent). */
+function excludeHunk(hunkIndex: number): void {
+  selection.setExcluded(props.file.path, hunkIndex, true, fileStamp.value);
+}
 
 /**
  * `file.result.stats.autoResolved` counts every hunk the core marked as
@@ -258,7 +341,7 @@ const rejectedLlmCount = computed(() => rejectedLlmHunks.value.size);
  * actually be applied.
  */
 const canResolve = computed(
-  () => props.file.result.stats.autoResolved - rejectedLlmCount.value > 0,
+  () => appliedResolutions.value.length > 0,
 );
 
 const hunks = computed(() => props.file.result.hunks);
@@ -309,6 +392,108 @@ function bulkResolve(choice: "ours" | "theirs" | "both") {
   emit("resolveFileBulk", props.file.path, choice);
 }
 
+// ─── Bulk AI resolution (issue #196) ────────────────────
+// Staged, not applied: unlike `bulkResolve` above this never emits
+// `resolveFileBulk` or touches merged content. Suggestions land in the same
+// per-hunk queue the single-hunk AI button uses, and the user still confirms
+// each one.
+/**
+ * The hunks the RUNNING "Resolve all with AI" batch queued. The queue itself
+ * is file-wide and is also driven by each hunk's own AI action, so the bulk
+ * bar has to track its own membership: without it, a single per-hunk
+ * request makes this button think a batch is running (and, since its click
+ * handler cancels while running, would silently cancel a request the user
+ * never associated with a batch).
+ *
+ * Emptied the moment the batch ends, cancel included. Membership that
+ * outlived its batch caused exactly the bug it was meant to prevent: a later
+ * per-hunk request on a hunk that happened to be in the last batch re-armed
+ * the cancel, which then killed that unrelated request.
+ */
+const aiBatchIndices = ref<Set<number>>(new Set());
+
+/**
+ * What the last finished batch achieved, snapshotted as it ends. The summary
+ * used to read it off `aiBatchIndices` afterwards, which is why that set had
+ * to stay populated past the end of its own batch.
+ */
+const aiBatchCounts = ref<{ ready: number; error: number } | null>(null);
+
+/**
+ * Distinguishes batches, so a cancelled batch's awaiter cannot clear the
+ * membership of the batch the user started right after it.
+ */
+let aiBatchRun = 0;
+
+/** Snapshot the outcome, then let the membership die with its batch. */
+function finishAiBatch(): void {
+  let ready = 0;
+  let error = 0;
+  for (const i of aiBatchIndices.value) {
+    const s = aiQueue.stateFor(i);
+    if (s === "ready") ready += 1;
+    else if (s === "error") error += 1;
+  }
+  aiBatchCounts.value = { ready, error };
+  aiBatchIndices.value = new Set();
+}
+
+/**
+ * Hunks that still need a human: everything the engine did not already
+ * resolve, minus what already carries a staged answer. The `autoResolved`
+ * test is the same signal `showResolutionPreviewFor` uses to hide those
+ * hunks' action rows, so the batch cannot pay for a hunk whose AI action the
+ * user could not even click.
+ */
+async function resolveAllWithAi() {
+  const items = hunks.value
+    .map((hunk, index) => ({ index, hunk }))
+    .filter(({ index }) => !resolutions.value[index]?.autoResolved)
+    .filter(({ index }) => aiQueue.stateFor(index) !== "ready");
+  if (items.length === 0) return;
+
+  const run = (aiBatchRun += 1);
+  aiBatchCounts.value = null;
+  aiBatchIndices.value = new Set(items.map((i) => i.index));
+  await aiQueue.requestAll(items);
+  if (run !== aiBatchRun) return;
+  finishAiBatch();
+}
+
+/** Bulk Cancel: ends the batch here rather than leaving its membership behind. */
+function cancelAiBatch(): void {
+  aiBatchRun += 1;
+  aiQueue.cancelAll();
+  finishAiBatch();
+}
+
+/** True only while a hunk that THIS batch queued is still queued/loading. */
+const aiBatchRunning = computed(() =>
+  [...aiBatchIndices.value].some((i) => {
+    const s = aiQueue.stateFor(i);
+    return s === "queued" || s === "loading";
+  }),
+);
+
+// Tracks what this batch actually queued, not every hunk in the file:
+// `requestAll` skips hunks that already have an answer, so dividing by the
+// file's full hunk count would read e.g. "8 of 12" forever on a second run.
+const aiBatchProgress = computed(() => {
+  const total = aiBatchIndices.value.size;
+  const left = [...aiBatchIndices.value].filter((i) => {
+    const s = aiQueue.stateFor(i);
+    return s === "queued" || s === "loading";
+  }).length;
+  return t("merge.bulkAiProgress", String(total - left), String(total));
+});
+
+/** Shown once a batch has finished and at least one of its hunks failed. */
+const aiBatchSummary = computed(() => {
+  const counts = aiBatchCounts.value;
+  if (!counts || counts.error === 0) return "";
+  return t("merge.bulkAiSummary", String(counts.ready), String(counts.error));
+});
+
 /** Does a given hunk carry an `llm_proposed` decision with a trace? */
 function hasLlmTrace(hunk: ConflictHunk): boolean {
   return (
@@ -323,7 +508,7 @@ function hasLlmTrace(hunk: ConflictHunk): boolean {
  */
 function showLlmPanelFor(hunkIndex: number, hunk: ConflictHunk): boolean {
   if (!hasLlmTrace(hunk)) return false;
-  if (rejectedLlmHunks.value.has(hunkIndex)) return false;
+  if (isHunkExcluded(hunkIndex)) return false;
   return true;
 }
 
@@ -339,10 +524,7 @@ function onLlmAccept(hunkId: string | number) {
 function onLlmReject(hunkId: string | number) {
   const idx = Number(hunkId);
   if (!Number.isFinite(idx)) return;
-  // Use a fresh Set so reactivity fires (computed `canResolve` recomputes).
-  const next = new Set(rejectedLlmHunks.value);
-  next.add(idx);
-  rejectedLlmHunks.value = next;
+  excludeHunk(idx);
   // Drop a previously-recorded accept so the UX badge doesn't lie.
   if (acceptedLlmHunks.value.has(idx)) {
     const a = new Set(acceptedLlmHunks.value);
@@ -363,6 +545,7 @@ function onTokenMergeAccept(hunkIndex: number) {
   const hunk = hunks.value[hunkIndex];
   const proposal = hunk?.trace.tokenMergeTrace;
   if (!proposal) return;
+  consumedHunkIndex = hunkIndex;
   emit("resolveHunkCustom", props.file.path, hunkIndex, proposal.mergedLines.join("\n"));
 }
 
@@ -384,25 +567,24 @@ function showTokenMergePanelFor(hunkIndex: number, hunk: ConflictHunk): boolean 
 // the "Résoudre auto" button would, via resolveHunkCustom. This replaces the
 // classic action bar's "Accepter les deux" for these hunks, which previously
 // did a raw ours+theirs concatenation instead of the engine's real merge.
-const rejectedPreviewHunks = ref<Set<number>>(new Set());
-
 function onPreviewAccept(hunkIndex: number) {
   const resolution = resolutions.value[hunkIndex];
   if (!resolution?.resolvedLines) return;
+  consumedHunkIndex = hunkIndex;
   emit("resolveHunkCustom", props.file.path, hunkIndex, resolution.resolvedLines.join("\n"));
 }
 
 function onPreviewReject(hunkIndex: number) {
-  const next = new Set(rejectedPreviewHunks.value);
-  next.add(hunkIndex);
-  rejectedPreviewHunks.value = next;
+  // Records the refusal where the apply path can see it, not merely where the
+  // panel's own `v-if` can. That gap was the bug.
+  excludeHunk(hunkIndex);
 }
 
 function showResolutionPreviewFor(hunkIndex: number, hunk: ConflictHunk): boolean {
   if (hunk.type === "llm_proposed" || hunk.type === "token_level_merge") return false;
   if (!resolutions.value[hunkIndex]?.autoResolved) return false;
   if (!resolutions.value[hunkIndex]?.resolvedLines) return false;
-  return !rejectedPreviewHunks.value.has(hunkIndex);
+  return !isHunkExcluded(hunkIndex);
 }
 
 // ─── Reset per-file UI-only state on file change ────────
@@ -410,28 +592,113 @@ function showResolutionPreviewFor(hunkIndex: number, hunk: ConflictHunk): boolea
 // each reset one slice of this UI-only state (inline edit, LLM panel,
 // token-merge/preview panels). Splitting them made it easy to add a new ref
 // and forget to wire it into a reset — that's exactly what happened when
-// rejectedTokenMergeHunks/rejectedPreviewHunks landed. One watcher, one place
-// to extend.
+// rejectedTokenMergeHunks/rejectedPreviewHunks landed, and again when the AI
+// queue arrived with a path-only reset of its own. One watcher, one place to
+// extend.
+//
+// The hunk array's identity is watched alongside the path, and it is the half
+// that matters most: every ref here is keyed by hunk index, resolving one
+// conflict renumbers every later one, and the parent hands back a re-parsed
+// `result` under the SAME path. A path-only watcher never fires on that, so
+// index 2's AI suggestion, explanation and panel state would silently become
+// index 1's.
 watch(
-  () => props.file.path,
-  () => {
+  [() => props.file.path, () => props.file.result.hunks],
+  ([nextPath, nextHunks], [prevPath, prevHunks]) => {
     editingHunkIndex.value = null;
     editContent.value = "";
-    rejectedLlmHunks.value = new Set();
+    editSource.value = null;
     acceptedLlmHunks.value = new Set();
     rejectedTokenMergeHunks.value = new Set();
-    rejectedPreviewHunks.value = new Set();
+
+    // Read once, whatever happens next: a recorded index that its own
+    // re-parse never arrived for (the store refuses a resolution whose
+    // content moved under it) must not be believed by some later re-parse.
+    const consumed = consumedHunkIndex;
+    consumedHunkIndex = null;
+
+    // Renumber only when the shape of the change is known: the same file, one
+    // conflict fewer, and the index of the one that went. Anything else (an
+    // undo, a redo, a file-wide resolve, a reload) could have moved any hunk,
+    // so it falls back to dropping everything, which is what this watcher
+    // always did. The AI queue keeps its settled answers across a renumber,
+    // so the user does not pay twice for hunks they have not touched; the
+    // batch's membership is index-keyed too and is renumbered by the same
+    // function, or it would start describing the wrong hunks.
+    const renumber =
+      consumed !== null
+      && nextPath === prevPath
+      && nextHunks.length === prevHunks.length - 1;
+    if (renumber) {
+      aiQueue.remapAfterApply([consumed]);
+      aiBatchIndices.value = new Set(
+        remapHunkIndices(aiBatchIndices.value, [consumed]).values(),
+      );
+      return;
+    }
+
+    aiQueue.reset();
+    aiBatchRun += 1;
+    aiBatchIndices.value = new Set();
+    aiBatchCounts.value = null;
+    // The opt-out set is deliberately NOT cleared here. It is keyed by path
+    // and guarded by a content stamp, so tabbing between two conflicted files
+    // and back keeps the user's choices instead of silently discarding them.
+    // It is cleared when the repository changes (App.vue).
   },
 );
 
 // ─── "Résoudre auto" summary confirmation ───────────────
 const showResolveAutoSummary = ref(false);
 
+/**
+ * The resolutions that would actually be written right now: everything the
+ * engine auto-resolved, minus what the confidence bar holds back, minus what
+ * the user ticked off. This is the single source the summary modal, the
+ * "Resolve auto" button's enabled state and its count all read, so they cannot
+ * disagree with each other or with what the apply does.
+ */
+const appliedResolutions = computed(() =>
+  resolutions.value
+    .map((r, hunkIndex) => ({
+      hunkIndex,
+      resolvedLines: r.resolvedLines,
+      score: r.hunk?.confidence?.score ?? 0,
+      label: r.hunk?.confidence?.label ?? "low",
+    }))
+    .filter((r, i) =>
+      selection.shouldApply(props.file.path, i, resolutions.value[i] as never, fileStamp.value),
+    ) as Array<{ hunkIndex: number; resolvedLines: string[]; score: number; label: string }>,
+);
+
+/** Everything the engine offered, annotated with whether it is currently on. */
 const autoResolutionsSummary = computed(() =>
   resolutions.value
-    .map((r, hunkIndex) => ({ hunkIndex, resolvedLines: r.resolvedLines, autoResolved: r.autoResolved }))
-    .filter((r) => r.autoResolved && r.resolvedLines !== null) as Array<{ hunkIndex: number; resolvedLines: string[] }>,
+    .map((r, hunkIndex) => ({
+      hunkIndex,
+      resolvedLines: r.resolvedLines,
+      score: r.hunk?.confidence?.score ?? 0,
+      label: String(r.hunk?.confidence?.label ?? "low"),
+      excluded: !selection.shouldApply(
+        props.file.path,
+        hunkIndex,
+        r as never,
+        fileStamp.value,
+      ),
+    }))
+    .filter((r) => r.resolvedLines !== null) as Array<{
+      hunkIndex: number;
+      resolvedLines: string[];
+      score: number;
+      label: string;
+      excluded: boolean;
+    }>,
 );
+
+/** Toggle one row from the summary modal. */
+function toggleSummaryRow(hunkIndex: number) {
+  selection.toggle(props.file.path, hunkIndex, fileStamp.value);
+}
 
 function confirmResolveAuto() {
   showResolveAutoSummary.value = false;
@@ -724,6 +991,28 @@ useResizeObserver(contentEl, drawMinimap);
         <button class="me-bulk-btn" @click="bulkResolve('ours')">{{ t('merge.bulkOurs') }}</button>
         <button class="me-bulk-btn" @click="bulkResolve('theirs')">{{ t('merge.bulkTheirs') }}</button>
         <button class="me-bulk-btn" @click="bulkResolve('both')">{{ t('merge.bulkBoth') }}</button>
+        <button
+          v-if="aiAvailable"
+          class="me-bulk-btn me-bulk-btn--ai"
+          @click="aiBatchRunning ? cancelAiBatch() : resolveAllWithAi()"
+        >
+          <!--
+            `cancelAiBatch` ends this batch and calls `cancelAll()`, not a
+            per-index cancel: it also stops any unrelated per-hunk request
+            that happens to be in flight at the same time. That is a
+            deliberate choice, not an oversight. A per-index cancel would be
+            more surface in the queue composable for a case nobody has asked
+            for, and cancelling everything AI-related when the user presses a
+            visible Cancel button is the predictable behaviour. What is NOT
+            acceptable is this button being armed at all outside a running
+            batch, which is why the membership it reads dies with its batch.
+          -->
+          <AiSparkle :size="12" :animated="aiBatchRunning" />
+          {{ aiBatchRunning
+              ? `${t('merge.bulkAiCancel')} (${aiBatchProgress})`
+              : t('merge.bulkAi') }}
+        </button>
+        <span v-if="aiBatchSummary" class="me-bulk-ai-summary muted">{{ aiBatchSummary }}</span>
         <span v-if="isGeneratedFileLocal" class="me-bulk-warn">{{ t('merge.bulkGeneratedWarning') }}</span>
       </div>
       <button
@@ -831,8 +1120,33 @@ useResizeObserver(contentEl, drawMinimap);
       </template>
     </div>
 
+    <!--
+      Unreadable conflict: git says the file is unmerged but its bytes could not
+      be decoded (read_file is read_to_string, so any non-UTF-8 file lands here).
+      There is no text to show hunks for, but the file still blocks the rebase,
+      so both side-picks are offered: they run `git checkout --ours/--theirs`,
+      which works on bytes and never needs to decode anything.
+    -->
+    <div v-if="file.loadError" class="me-tree-panel">
+      <h3 class="me-tree-title">{{ t('merge.unreadableTitle') }} — <span class="mono">{{ file.path }}</span></h3>
+      <p class="me-tree-explanation">{{ t('merge.unreadableExplanation') }}</p>
+      <div class="me-tree-actions">
+        <button class="me-bulk-btn" @click="emit('resolveTreeConflict', file.path, 'ours')">
+          {{ t('merge.unreadableKeepOurs') }}
+        </button>
+        <button class="me-bulk-btn" @click="emit('resolveTreeConflict', file.path, 'theirs')">
+          {{ t('merge.unreadableKeepTheirs') }}
+        </button>
+        <button class="me-bulk-btn" @click="emit('openExternally', file.path)">
+          {{ t('merge.unreadableOpenExternally') }}
+        </button>
+      </div>
+      <div class="me-tree-preview-label muted">{{ t('merge.unreadableReasonLabel') }}</div>
+      <pre class="me-tree-preview">{{ file.loadError }}</pre>
+    </div>
+
     <!-- Editor body: code + minimap -->
-    <div class="merge-body" v-if="!file.tree && !file.markerless">
+    <div class="merge-body" v-if="!file.tree && !file.markerless && !file.loadError">
       <div v-if="file.reconstructed" class="me-reconstructed-banner">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
           <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 10.5h-1.5v-1.5h1.5v1.5zm0-3h-1.5V4.5h1.5V8.5z"/>
@@ -904,6 +1218,8 @@ useResizeObserver(contentEl, drawMinimap);
               :resolved-lines="resolutions[seg.hunkIndex]!.resolvedLines!"
               :hunk-id="seg.hunkIndex"
               :explanation="hunkForSegment(seg)!.explanation"
+              :confidence-score="hunkForSegment(seg)!.confidence.score"
+              :confidence-label="hunkForSegment(seg)!.confidence.label"
               @accept="onPreviewAccept"
               @reject="onPreviewReject"
             />
@@ -916,47 +1232,53 @@ useResizeObserver(contentEl, drawMinimap);
               <a
                 class="inline-action inline-action--current"
                 :class="{ 'inline-action--recommended': isRecommended(hunkForSegment(seg)!, 'ours') }"
+                :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                 href="#"
-                @click.prevent="resolveHunkWithMemory(file.path, seg.hunkIndex!, 'ours')"
+                @click.prevent="onRowAction(seg.hunkIndex!, () => resolveHunkWithMemory(file.path, seg.hunkIndex!, 'ours'))"
               >{{ t('merge.acceptCurrent') }}<svg v-if="isRecommended(hunkForSegment(seg)!, 'ours')" class="recommend-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1L9.5 5.5L14 7L9.5 8.5L8 13L6.5 8.5L2 7L6.5 5.5L8 1Z"/></svg></a>
               <span class="inline-sep">|</span>
               <a
                 class="inline-action inline-action--incoming"
                 :class="{ 'inline-action--recommended': isRecommended(hunkForSegment(seg)!, 'theirs') }"
+                :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                 href="#"
-                @click.prevent="resolveHunkWithMemory(file.path, seg.hunkIndex!, 'theirs')"
+                @click.prevent="onRowAction(seg.hunkIndex!, () => resolveHunkWithMemory(file.path, seg.hunkIndex!, 'theirs'))"
               >{{ t('merge.acceptIncoming') }}<svg v-if="isRecommended(hunkForSegment(seg)!, 'theirs')" class="recommend-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1L9.5 5.5L14 7L9.5 8.5L8 13L6.5 8.5L2 7L6.5 5.5L8 1Z"/></svg></a>
               <span class="inline-sep">|</span>
               <a
                 class="inline-action inline-action--both"
                 :class="{ 'inline-action--recommended': isRecommended(hunkForSegment(seg)!, 'both') }"
+                :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                 href="#"
-                @click.prevent="resolveHunkWithMemory(file.path, seg.hunkIndex!, 'both')"
+                @click.prevent="onRowAction(seg.hunkIndex!, () => resolveHunkWithMemory(file.path, seg.hunkIndex!, 'both'))"
               >{{ t('merge.acceptBoth') }}<svg v-if="isRecommended(hunkForSegment(seg)!, 'both')" class="recommend-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1L9.5 5.5L14 7L9.5 8.5L8 13L6.5 8.5L2 7L6.5 5.5L8 1Z"/></svg></a>
               <span class="inline-sep">|</span>
               <a
                 class="inline-action inline-action--edit"
+                :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                 href="#"
-                @click.prevent="startEditing(seg.hunkIndex!, hunkForSegment(seg)!)"
+                @click.prevent="onRowAction(seg.hunkIndex!, () => startEditing(seg.hunkIndex!, hunkForSegment(seg)!))"
               >{{ t('merge.customEdit') }}</a>
               <template v-if="aiAvailable">
                 <span class="inline-sep">|</span>
                 <a
                   class="inline-action inline-action--ai"
-                  :class="{ 'inline-action--loading': aiLoading && aiSuggestionHunkIndex === seg.hunkIndex }"
+                  :class="{ 'inline-action--loading': aiBusy(seg.hunkIndex!) }"
+                  :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                   href="#"
                   @click.prevent="requestAISuggestion(seg.hunkIndex!, hunkForSegment(seg)!)"
                 >
-                  <AiSparkle :size="12" :animated="aiLoading && aiSuggestionHunkIndex === seg.hunkIndex" />
-                  {{ aiLoading && aiSuggestionHunkIndex === seg.hunkIndex ? t('mergeEditor.aiLoading') : t('mergeEditor.aiButton') }}
+                  <AiSparkle :size="12" :animated="aiBusy(seg.hunkIndex!)" />
+                  {{ aiBusy(seg.hunkIndex!) ? t('mergeEditor.aiLoading') : t('mergeEditor.aiButton') }}
                 </a>
                 <span class="inline-sep">|</span>
                 <a
                   class="inline-action inline-action--explain"
                   :class="{ 'inline-action--loading': aiExplainLoading && explanationHunkIndex === seg.hunkIndex }"
+                  :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                   href="#"
                   :title="t('mergeEditor.explainTooltip')"
-                  @click.prevent="requestHunkExplanation(seg.hunkIndex!, hunkForSegment(seg)!)"
+                  @click.prevent="onRowAction(seg.hunkIndex!, () => requestHunkExplanation(seg.hunkIndex!, hunkForSegment(seg)!))"
                 >
                   <svg class="ai-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
                     <path d="M8 14.5a.75.75 0 0 0 .75-.75v-1h-1.5v1a.75.75 0 0 0 .75.75Z" fill="currentColor" stroke="none"/>
@@ -969,9 +1291,10 @@ useResizeObserver(contentEl, drawMinimap);
                 <span class="inline-sep">|</span>
                 <a
                   class="inline-action inline-action--memory"
+                  :aria-disabled="aiBusy(seg.hunkIndex!) ? 'true' : 'false'"
                   href="#"
                   :title="fileMemory.description"
-                  @click.prevent="applyFileMemory(seg.hunkIndex!, hunkForSegment(seg)!)"
+                  @click.prevent="onRowAction(seg.hunkIndex!, () => applyFileMemory(seg.hunkIndex!, hunkForSegment(seg)!))"
                 >
                   <svg class="ai-icon" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                     <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm1 10H7v-1.5h2V11zm0-3H7V5h2v3z"/>
@@ -986,17 +1309,49 @@ useResizeObserver(contentEl, drawMinimap);
             </div>
 
             <!-- ── AI error banner ──────────────────────── -->
-            <div v-if="aiError && aiSuggestionHunkIndex === seg.hunkIndex" class="ai-error-banner">
-              <span>{{ t('mergeEditor.aiErrorPrefix') }} : {{ aiError }}</span>
-              <a href="#" @click.prevent="dismissAISuggestion" class="ai-error-close">OK</a>
+            <div v-if="aiQueue.errorFor(seg.hunkIndex!)" class="ai-error-banner">
+              <span>{{ t('mergeEditor.aiErrorPrefix') }} : {{ aiQueue.errorFor(seg.hunkIndex!) }}</span>
+              <!-- Asking the model again is an explicit action, and it lives
+                   here rather than being overloaded onto the hunk's AI entry:
+                   that entry now opens an answer already paid for. -->
+              <a
+                v-if="hunkForSegment(seg)"
+                href="#"
+                class="ai-error-retry"
+                @click.prevent="retryAISuggestion(seg.hunkIndex!, hunkForSegment(seg)!)"
+              >{{ t('mergeEditor.aiRetry') }}</a>
+              <a href="#" @click.prevent="dismissAISuggestion(seg.hunkIndex!)" class="ai-error-close">OK</a>
+            </div>
+
+            <!-- ── Staged AI suggestion, waiting to be reviewed ──────── -->
+            <!-- A batch leaves no hunk in edit mode, so without this row its
+                 answers would be invisible: both the explanation banner and
+                 the edit area render only for the hunk currently open. -->
+            <div
+              v-if="aiQueue.stateFor(seg.hunkIndex!) === 'ready' && editingHunkIndex !== seg.hunkIndex"
+              class="ai-staged-banner"
+            >
+              <AiSparkle :size="12" />
+              <span class="ai-staged-label">{{ t('mergeEditor.aiStagedReady') }}</span>
+              <a
+                href="#"
+                class="inline-action ai-staged-review"
+                @click.prevent="openAISuggestion(seg.hunkIndex!)"
+              >{{ t('mergeEditor.aiStagedReview') }}</a>
+              <span class="inline-sep">|</span>
+              <a
+                href="#"
+                class="inline-action ai-staged-discard"
+                @click.prevent="dismissAISuggestion(seg.hunkIndex!)"
+              >{{ t('mergeEditor.aiStagedDiscard') }}</a>
             </div>
 
             <!-- ── AI explanation banner ──────────────────── -->
-            <div v-if="aiSuggestionExplanation && editingHunkIndex === seg.hunkIndex && aiSuggestionHunkIndex === seg.hunkIndex" class="ai-explanation-banner">
+            <div v-if="aiQueue.suggestionFor(seg.hunkIndex!)?.explanation && editingHunkIndex === seg.hunkIndex && editSource === 'ai'" class="ai-explanation-banner">
               <svg class="ai-explanation-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
                 <path d="M8 1v2m0 10v2M1 8h2m10 0h2"/><circle cx="8" cy="8" r="4"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/>
               </svg>
-              <span>{{ aiSuggestionExplanation }}</span>
+              <span>{{ aiQueue.suggestionFor(seg.hunkIndex!)?.explanation }}</span>
             </div>
 
             <!-- ── Hunk NL explanation (Phase 1.3.2) ──────── -->
@@ -1014,7 +1369,10 @@ useResizeObserver(contentEl, drawMinimap);
             <!-- ── Inline Edit Mode ─────────────────────── -->
             <div v-if="editingHunkIndex === seg.hunkIndex" class="hunk-edit">
               <div class="edit-header">
-                <span class="edit-label">{{ aiSuggestionHunkIndex === seg.hunkIndex ? t('mergeEditor.aiSuggestionLabel') : t('merge.customEdit') }}</span>
+                <!-- Keyed on how the box was opened, not on the queue: a
+                     Custom edit on a hunk that carries a staged suggestion is
+                     still a Custom edit. -->
+                <span class="edit-label">{{ editSource === 'ai' ? t('mergeEditor.aiSuggestionLabel') : t('merge.customEdit') }}</span>
                 <div class="edit-actions-inline">
                   <a
                     class="inline-action inline-action--validate"
@@ -1029,13 +1387,21 @@ useResizeObserver(contentEl, drawMinimap);
                   >{{ t('common.cancel') }}</a>
                 </div>
               </div>
-              <textarea
-                class="edit-textarea mono"
+              <!-- `:key` is a correctness fix, not cosmetics. `requestAISuggestion`
+                   can point `editingHunkIndex` at a different hunk while a box is
+                   open; without the key Vue patches the existing component and
+                   CodeMirror's undo history survives across hunks, so enough
+                   Cmd+Z could resurrect hunk i's text into hunk j's write. -->
+              <CodeEditor
+                :key="seg.hunkIndex"
+                class="edit-cm"
                 v-model="editContent"
-                :aria-label="`Edit conflict ${seg.hunkIndex}`"
-                spellcheck="false"
-                rows="8"
-              ></textarea>
+                :file-path="props.file.path"
+                :aria-label="t('mergeEditor.editAriaLabel', String((seg.hunkIndex ?? 0) + 1))"
+                :min-lines="8"
+                :max-lines="24"
+                autofocus
+              />
             </div>
 
             <!-- ── Two-panel view (ours / theirs) ──────────── -->
@@ -1128,6 +1494,7 @@ useResizeObserver(contentEl, drawMinimap);
     <ResolveAutoSummaryModal
       v-if="showResolveAutoSummary"
       :resolutions="autoResolutionsSummary"
+      @toggle="toggleSummaryRow"
       @confirm="confirmResolveAuto"
       @cancel="showResolveAutoSummary = false"
     />
@@ -1368,6 +1735,11 @@ useResizeObserver(contentEl, drawMinimap);
   pointer-events: none;
 }
 
+.inline-action[aria-disabled="true"] {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
 .ai-icon {
   flex-shrink: 0;
 }
@@ -1498,22 +1870,26 @@ useResizeObserver(contentEl, drawMinimap);
   gap: 0;
 }
 
-.edit-textarea {
+/* The textarea this replaces had `resize: vertical`. That is deliberately not
+   carried over: a CodeMirror view inside a user-resizable box fights its own
+   measurement loop, and max-lines plus internal scrolling covers what the drag
+   handle was for. */
+.edit-cm {
   width: 100%;
-  min-height: 120px;
-  padding: 12px 20px;
-  background: var(--color-bg);
-  color: var(--color-text);
+  padding: 0 20px 12px;
+}
+.edit-cm :deep(.cm-editor) {
   border: none;
   border-bottom: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-bg);
   font-size: var(--text-md);
   line-height: 1.6;
-  resize: vertical;
-  outline: none;
   tab-size: 2;
 }
 
-.edit-textarea:focus {
+.edit-cm :deep(.cm-editor.cm-focused) {
+  outline: none;
   background: var(--color-bg-secondary);
   box-shadow: inset 0 0 0 2px var(--color-accent);
 }
@@ -1570,6 +1946,39 @@ useResizeObserver(contentEl, drawMinimap);
   font-weight: var(--font-semibold);
   font-size: var(--text-xs);
   text-decoration: none;
+}
+
+.ai-error-retry {
+  color: var(--color-danger);
+  font-weight: var(--font-semibold);
+  font-size: var(--text-xs);
+  text-decoration: none;
+  margin-left: auto;
+  margin-right: 12px;
+}
+
+.ai-staged-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  margin: 4px 12px;
+  background: var(--color-accent-soft);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-base);
+  color: var(--color-accent);
+}
+
+.ai-staged-label {
+  margin-right: auto;
+}
+
+/* Single-class selectors on purpose: prefixing them with the banner would
+   raise the specificity over `.inline-action` for no gain, and source order
+   already settles it. */
+.ai-staged-review,
+.ai-staged-discard {
+  color: var(--color-accent);
 }
 
 .ai-explanation-banner {
@@ -1774,6 +2183,19 @@ useResizeObserver(contentEl, drawMinimap);
 }
 .me-bulk-btn:hover {
   background: var(--hover-bg, rgba(0, 0, 0, 0.05));
+}
+.me-bulk-btn--ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--color-ai);
+  font-weight: var(--font-semibold);
+}
+.me-bulk-btn--ai:hover {
+  color: var(--color-ai-hover);
+}
+.me-bulk-ai-summary {
+  font-size: 11px;
 }
 .me-bulk-warn {
   font-size: 11px;
