@@ -1,8 +1,8 @@
 use crate::git::cmd::git_cmd;
 use crate::types::{
-    DiffHunk, DiffLine, FileLogEntry, FolderDiffNode, GhIssueRaw, GhPrDetailRaw, GhPrRaw,
-    GhPrStatusCheck, Issue, MonorepoPackage, PullRequest, PullRequestDetail, RawFileChange,
-    RepoTreeNode, ShortlogEntry,
+    BlameLine, DiffHunk, DiffLine, FileLogEntry, FolderDiffNode, GhIssueRaw, GhPrDetailRaw,
+    GhPrRaw, GhPrStatusCheck, Issue, MonorepoPackage, PullRequest, PullRequestDetail,
+    RawFileChange, RepoTreeNode, ShortlogEntry,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -145,6 +145,80 @@ pub(crate) fn parse_diff_hunks(stdout: &str) -> (Vec<DiffHunk>, Option<String>) 
     }
 
     (hunks, detected_status)
+}
+
+/// Parse `git blame --porcelain` output into `BlameLine`s.
+///
+/// Porcelain compaction: the metadata block (`author `, `author-time `,
+/// `summary `, …) is only emitted the FIRST time a commit is seen in the
+/// output; later hunks attributed to the same commit carry just the header
+/// line and the content line, with the reader expected to remember the
+/// metadata from that first sighting (documented `git-blame` porcelain
+/// behavior). Without the cache below, a repeated commit would render with a
+/// blank author/date/summary in the blame gutter; this must match the
+/// libgit2 fast path (`libgit2_blame`), which always resolves full commit
+/// metadata per hunk.
+pub(crate) fn parse_blame_porcelain(raw: &str, max_entries: usize) -> Vec<BlameLine> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut blame_lines: Vec<BlameLine> = Vec::new();
+    let mut meta_cache: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() && blame_lines.len() < max_entries {
+        // Header: <40-char-sha> <orig-line> <final-line> [<num-lines-in-group>]
+        let parts: Vec<&str> = lines[i].split_whitespace().collect();
+        if parts.len() < 3 || parts[0].len() != 40 {
+            i += 1;
+            continue;
+        }
+        let hash_full = parts[0].to_string();
+        let hash = hash_full[..7].to_string();
+        let orig_line: u32 = parts[1].parse().unwrap_or(0);
+        let final_line: u32 = parts[2].parse().unwrap_or(0);
+        i += 1;
+        let mut author = String::new();
+        let mut author_date = String::new();
+        let mut summary = String::new();
+        let mut content = String::new();
+        while i < lines.len() && !lines[i].starts_with('\t') {
+            if lines[i].starts_with("author ") {
+                author = lines[i][7..].to_string();
+            } else if lines[i].starts_with("author-time ") {
+                author_date = lines[i][12..].to_string();
+            } else if lines[i].starts_with("summary ") {
+                summary = lines[i][8..].to_string();
+            }
+            i += 1;
+        }
+        if i < lines.len() && lines[i].starts_with('\t') {
+            content = lines[i][1..].to_string();
+            i += 1;
+        }
+
+        if author.is_empty() && author_date.is_empty() && summary.is_empty() {
+            if let Some((cached_author, cached_date, cached_summary)) = meta_cache.get(&hash_full) {
+                author = cached_author.clone();
+                author_date = cached_date.clone();
+                summary = cached_summary.clone();
+            }
+        } else {
+            meta_cache.insert(
+                hash_full.clone(),
+                (author.clone(), author_date.clone(), summary.clone()),
+            );
+        }
+
+        blame_lines.push(BlameLine {
+            hash,
+            hash_full,
+            final_line,
+            orig_line,
+            author,
+            author_date,
+            summary,
+            content,
+        });
+    }
+    blame_lines
 }
 
 pub(crate) fn parse_name_status_z(s: &str) -> Vec<(String, String, Option<String>)> {
@@ -468,6 +542,15 @@ pub(crate) fn gh_pr_detail_raw_to_detail(r: GhPrDetailRaw) -> PullRequestDetail 
         // viewerPermission lookup — `gh pr view` doesn't carry it.
         can_merge: None,
         head_sha: r.head_ref_oid,
+        auto_merge: crate::commands::gh::gh_auto_merge_state(&serde_json::json!({
+            "autoMergeRequest": r.auto_merge_request
+        })),
+        // Populated by the caller (gh_pr_detail_inner): needs a repo-level
+        // `autoMergeAllowed` lookup this per-PR JSON object doesn't carry.
+        // That lookup is GitHub's GraphQL `Repository` type, reachable via
+        // `gh api graphql`, not `gh repo view --json autoMergeAllowed`
+        // (`gh repo view` rejects that field with "Unknown JSON field").
+        auto_merge_support: Default::default(),
     }
 }
 
@@ -523,6 +606,9 @@ pub(crate) fn gh_pr_raw_to_pr(r: GhPrRaw) -> PullRequest {
         merge_state_status: r.merge_state_status.unwrap_or_default(),
         checks_rollup,
         comment_count,
+        auto_merge: crate::commands::gh::gh_auto_merge_state(&serde_json::json!({
+            "autoMergeRequest": r.auto_merge_request
+        })),
     }
 }
 
@@ -536,6 +622,13 @@ pub(crate) fn gh_pr_raw_to_pr(r: GhPrRaw) -> PullRequest {
 /// Cursor Origin (v3.8) is matched on its dedicated git host
 /// `origin.cursor.com`, NOT on a bare `cursor.com`: the latter is the web UI
 /// and would misfire on any URL merely containing it.
+///
+/// The gitea arm matches the bare substrings "gitea"/"forgejo" anywhere in
+/// the URL, including the repo name, so it must stay ordered after every
+/// other arm with a narrower match, azure included: an Azure DevOps repo
+/// merely named `forgejo-mirror` would otherwise misdetect as gitea. (The
+/// gitlab and bitbucket arms have the same broad-substring shape and the
+/// same latent azure collision; that predates this fix and is left alone.)
 pub(crate) fn detect_provider(url: &str) -> &'static str {
     if url.contains("github.com") {
         "github"
@@ -547,6 +640,8 @@ pub(crate) fn detect_provider(url: &str) -> &'static str {
         "bitbucket"
     } else if url.contains("dev.azure.com") || url.contains("visualstudio.com") {
         "azure"
+    } else if url.contains("codeberg.org") || url.contains("gitea") || url.contains("forgejo") {
+        "gitea"
     } else {
         "unknown"
     }
@@ -556,6 +651,13 @@ pub(crate) fn detect_provider(url: &str) -> &'static str {
 /// `scheme://[user@]host[:port]/owner/repo.git`). Returns `None` for a URL
 /// shaped like neither form.
 ///
+/// Lowercased: hostnames are case-insensitive, but `gitea.rs`'s keychain
+/// lookup key is not (`git.acme.io` vs `Git.ACME.io` are different keyring
+/// accounts), and the stored key is always lowercase (`giteaHostFromUrl` on
+/// the frontend runs it through `URL.hostname`, which lowercases). Without
+/// this, a remote typed or cloned with mixed-case casing would silently miss
+/// a configured Gitea account.
+///
 /// Used as the input to the CLI-auth fallback in `git_remote_info`
 /// (`commands/ops.rs`) when `detect_provider` can't identify the forge from
 /// the URL text alone — e.g. a self-hosted GitLab instance on a hostname that
@@ -563,7 +665,7 @@ pub(crate) fn detect_provider(url: &str) -> &'static str {
 pub(crate) fn extract_remote_host(url: &str) -> Option<String> {
     if let Some(rest) = url.strip_prefix("git@") {
         let host = rest.split(':').next()?;
-        return (!host.is_empty()).then(|| host.to_string());
+        return (!host.is_empty()).then(|| host.to_lowercase());
     }
     let host_start = url.find("://")? + 3;
     let rest = &url[host_start..];
@@ -571,7 +673,7 @@ pub(crate) fn extract_remote_host(url: &str) -> Option<String> {
         .rsplit_once('@')
         .map_or(rest, |(_, host_part)| host_part);
     let host = rest.split(['/', ':']).next()?;
-    (!host.is_empty()).then(|| host.to_string())
+    (!host.is_empty()).then(|| host.to_lowercase())
 }
 
 pub(crate) fn parse_remote_owner_repo(url: &str) -> (String, String) {
@@ -1706,6 +1808,63 @@ mod repo_tree_tests {
 }
 
 #[cfg(test)]
+mod blame_porcelain_tests {
+    use super::*;
+
+    /// Porcelain omits the metadata block on a commit's second (and later)
+    /// appearance in the same blame output, so the parser must carry the
+    /// author/date/summary forward from the first sighting rather than
+    /// leaving them blank.
+    #[test]
+    fn carries_forward_metadata_for_a_repeated_commit() {
+        let raw = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1
+author Alice
+author-time 1704067200
+summary first commit
+filename a.txt
+\tone
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2 2 2
+author Bob
+author-time 1704067201
+summary second commit
+filename a.txt
+\tTWO
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 3 3
+\tfour
+";
+        let lines = parse_blame_porcelain(raw, 10_000);
+        assert_eq!(lines.len(), 3);
+        // Repeated commit `bbbb...` on the third hunk carries no metadata
+        // block in the raw porcelain text, but must resolve to Bob's info.
+        assert_eq!(
+            lines[2].hash_full,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(lines[2].author, "Bob");
+        assert_eq!(lines[2].author_date, "1704067201");
+        assert_eq!(lines[2].summary, "second commit");
+        assert_eq!(lines[2].content, "four");
+    }
+
+    #[test]
+    fn caps_output_at_max_entries() {
+        let raw = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1
+author Alice
+author-time 1704067200
+summary only commit
+filename a.txt
+\tone
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2
+\ttwo
+";
+        let lines = parse_blame_porcelain(raw, 1);
+        assert_eq!(lines.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod remote_provider_tests {
     use super::{detect_provider, extract_remote_host, parse_remote_owner_repo};
 
@@ -1766,6 +1925,50 @@ mod remote_provider_tests {
     }
 
     #[test]
+    fn azure_wins_over_gitea_when_the_repo_name_contains_a_gitea_keyword() {
+        // The gitea arm matches on the substring "gitea"/"forgejo" anywhere in
+        // the URL, including the repo name, so it must be checked after the
+        // azure arm, not before, or a repo like `.../_git/forgejo-mirror` on
+        // dev.azure.com loses its Azure PR panel to a false gitea match.
+        assert_eq!(
+            detect_provider("https://dev.azure.com/acme/tools/_git/forgejo-mirror"),
+            "azure"
+        );
+    }
+
+    #[test]
+    fn detects_gitea_and_forgejo_hosts() {
+        assert_eq!(
+            detect_provider("https://codeberg.org/acme/checkout.git"),
+            "gitea"
+        );
+        assert_eq!(
+            detect_provider("https://gitea.com/acme/checkout.git"),
+            "gitea"
+        );
+        assert_eq!(
+            detect_provider("git@gitea.acme.io:acme/checkout.git"),
+            "gitea"
+        );
+        assert_eq!(
+            detect_provider("https://forgejo.acme.io/acme/checkout.git"),
+            "gitea"
+        );
+    }
+
+    #[test]
+    fn leaves_a_bare_self_hosted_host_unknown() {
+        // A self-hosted Gitea on a neutral hostname cannot be recognised from
+        // the URL alone. It resolves in the frontend against the configured
+        // accounts (see the gitRemoteInfo wrapper), so the pure function must
+        // stay honest rather than guess.
+        assert_eq!(
+            detect_provider("https://git.acme.io/acme/checkout.git"),
+            "unknown"
+        );
+    }
+
+    #[test]
     fn extracts_host_from_ssh_and_https_remotes() {
         assert_eq!(
             extract_remote_host("git@github.com:acme/checkout.git"),
@@ -1796,6 +1999,21 @@ mod remote_provider_tests {
     fn extract_remote_host_returns_none_for_malformed_urls() {
         assert_eq!(extract_remote_host("not-a-remote-url"), None);
         assert_eq!(extract_remote_host(""), None);
+    }
+
+    #[test]
+    fn extract_remote_host_lowercases_a_mixed_case_host() {
+        // The keychain lookup key for a Gitea account is always lowercase
+        // (the frontend derives it via `URL.hostname`), so a remote typed or
+        // cloned with mixed-case casing must still resolve to the same key.
+        assert_eq!(
+            extract_remote_host("git@Git.ACME.io:acme/checkout.git"),
+            Some("git.acme.io".to_string())
+        );
+        assert_eq!(
+            extract_remote_host("https://Git.ACME.io/acme/checkout.git"),
+            Some("git.acme.io".to_string())
+        );
     }
 
     #[test]

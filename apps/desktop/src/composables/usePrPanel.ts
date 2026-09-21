@@ -27,6 +27,10 @@ import {
   type ForkInfo,
   ghPrFreshnessSignal,
   type PrFreshnessSignal,
+  type AutoMergeState,
+  type AutoMergeSupport,
+  CLOSED_AUTO_MERGE,
+  UNSUPPORTED_AUTO_MERGE,
 } from "../utils/backend";
 import { forgeFromRemoteInfo, githubProvider } from "./forge/useForge";
 import { ForgeNotImplementedError, CURSOR_WEB_BASE, forgeSupportsPRs } from "./forge/types";
@@ -77,6 +81,45 @@ const CLI_MISSING_INFO: Record<string, { cli: string; url: string }> = {
  */
 export function isMergeConflict(mergeable: string | null | undefined): boolean {
   return ["CONFLICTING", "CONFLICTS", "DIRTY"].includes((mergeable || "").toUpperCase());
+}
+
+/** What the PR detail panel should offer for forge-side auto-merge (v3.11.0). */
+export type AutoMergeOffer =
+  | { kind: "arm" }
+  | { kind: "disarm" }
+  | { kind: "explain"; reason: string }
+  | { kind: "none" };
+
+/**
+ * What the panel should offer for forge-side auto-merge.
+ *
+ * The load-bearing rule is the second branch: auto-merge is never offered on
+ * a PR that is already mergeable. An auto-merge that cannot be armed must
+ * never become a merge, and `gh pr merge --auto` against an already-clean PR
+ * may merge immediately. Hiding the button there deletes the whole class of
+ * problem, and costs nothing, since the immediate merge sits next to it.
+ *
+ * `canMerge` is gated strictly against `false`: it must never be a loose
+ * falsy check, since `null`/`undefined` (what GitLab, Azure and Bitbucket
+ * produce, and what any failed `gh` permission lookup also produces) means
+ * "unknown", not "no permission", and must not remove the button on its own.
+ *
+ * Exported as a free function (same precedent as `isMergeConflict` above) so
+ * it is unit-testable without instantiating the whole composable.
+ */
+export function computeAutoMergeOffer(
+  support: AutoMergeSupport,
+  state: AutoMergeState,
+  readiness: { ready: boolean; reason: string } | null,
+  canMerge?: boolean | null,
+): AutoMergeOffer {
+  if (state.armed) return { kind: "disarm" };
+  if (canMerge === false) return { kind: "explain", reason: "" };
+  if (!support.supported) return { kind: "explain", reason: support.reason ?? "" };
+  if (!state.available) return { kind: "explain", reason: state.reason ?? "" };
+  if (readiness === null) return { kind: "none" };
+  if (readiness.ready) return { kind: "none" };
+  return { kind: "arm" };
 }
 
 /** Optional host hooks so the panel can notify the app of side effects. */
@@ -432,6 +475,22 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
   });
 
   /**
+   * Forge-side auto-merge offer for the selected PR (v3.11.0), see
+   * `computeAutoMergeOffer`'s doc comment for the load-bearing rule. Falls
+   * back to the closed/unsupported descriptors before the detail bundle
+   * (or its repo-level `autoMergeSupport`) has loaded, so the panel never
+   * offers to arm something it hasn't confirmed the forge can do.
+   */
+  const autoMergeOffer = computed<AutoMergeOffer>(() =>
+    computeAutoMergeOffer(
+      prDetail.value?.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
+      prDetail.value?.autoMerge ?? CLOSED_AUTO_MERGE,
+      mergeReadiness.value,
+      prDetail.value?.canMerge,
+    ),
+  );
+
+  /**
    * v2.10 — Virtual 'Merge Conflict' check surfaced in the CI tab.
    * If the PR's mergeable state is CONFLICTING, we unshift a hard failure
    * into the checks list so the user sees exactly what's blocking.
@@ -604,14 +663,26 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
   }
 
   /**
+   * Minimum wall-clock gap between two dock-badge forge calls. The badge is
+   * refreshed from watcher `refs` events (v3.10.0), and a rebase or a fetch
+   * can move dozens of refs in one batch. v2.8.5 ruled out periodic polling
+   * here on boot-perf grounds, so the event path must be at least as cheap.
+   */
+  const DOCK_PR_COUNT_MIN_GAP_MS = 60_000;
+  let _lastDockPrCountAt = 0;
+
+  /**
    * Refresh the dock's PR badge count via a single cheap forge call
    * (`getPRCount`, backed by a `/search/issues?...&per_page=1`-style REST
    * call or GraphQL `totalCount` query per forge — no per-PR enrichment).
    * Independent of `loadPrs`/`ensurePrsLoaded`: this can run even if the
    * user has never opened the branch popover, graph mode, or the PR view.
+   *
+   * Returns whether a forge call actually happened, so the throttle above it
+   * only spends its window on real calls.
    */
-  async function refreshDockPrCount() {
-    if (!cwd.value) return;
+  async function refreshDockPrCount(): Promise<boolean> {
+    if (!cwd.value) return false;
     const repo = cwd.value;
     // Cold badge refresh on a repo with no cached remote yet: `forge`
     // defaults to `githubProvider` until `remote` resolves, so firing here
@@ -619,7 +690,7 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     // first open and surface a doomed `gh` call (#149 follow-up).
     if (!remote.value) {
       await loadRemote();
-      if (cwd.value !== repo) return; // repo changed while the remote resolved
+      if (cwd.value !== repo) return false; // repo changed while the remote resolved
     }
     try {
       const count = await forge.value.getPRCount(repo, "open");
@@ -628,10 +699,36 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
       // navigated away from can silently overwrite a newer, correct count
       // with nothing to correct it afterward (no polling on this value).
       if (cwd.value === repo) dockPrCount.value = count;
+      return true;
     } catch {
       // Defense-in-depth: ghPrCount's own implementations already swallow
       // failures to 0, but don't assume every forge does.
       if (cwd.value === repo) dockPrCount.value = 0;
+      return false;
+    }
+  }
+
+  /**
+   * Refresh the dock badge, skipping the forge call when the last one was
+   * less than DOCK_PR_COUNT_MIN_GAP_MS ago. `force` bypasses the throttle
+   * (repo open, explicit user refresh).
+   *
+   * The window is stamped *after* a call that actually reached the forge, not
+   * before one that may never happen: `refreshDockPrCount` returns early with
+   * no request when there is no repo or no resolvable remote (offline, no
+   * token, a fresh folder), and stamping up front would burn the whole 60 s
+   * on that no-op and skip the next real `refs` event. The in-flight guard is
+   * what keeps the late stamp from letting two calls through at once.
+   */
+  let _dockPrCountInFlight = false;
+  async function refreshDockPrCountThrottled(force = false) {
+    if (_dockPrCountInFlight) return;
+    if (!force && Date.now() - _lastDockPrCountAt < DOCK_PR_COUNT_MIN_GAP_MS) return;
+    _dockPrCountInFlight = true;
+    try {
+      if (await refreshDockPrCount()) _lastDockPrCountAt = Date.now();
+    } finally {
+      _dockPrCountInFlight = false;
     }
   }
 
@@ -1007,8 +1104,9 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     _lastFreshnessCheck = 0;
     ++_prPrefetchToken; // invalidate any in-flight background prefetch for the old repo
     dockPrCount.value = null;
+    _lastDockPrCountAt = 0;
     resetDetail();
-    if (newCwd) void refreshDockPrCount();
+    if (newCwd) void refreshDockPrCountThrottled(true);
     if (newCwd && panelMounted.value) init();
   });
 
@@ -1102,6 +1200,44 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
       mergingPr.value = null;
       await loadPrs();
     } catch (err: any) { error.value = err.message; }
+  }
+
+  /**
+   * Arm forge-side auto-merge on the selected PR (v3.11.0), through the
+   * `ForgeProvider` abstraction: this composable never branches on which
+   * forge is active. `method` defaults to whatever the merge dialog's radio
+   * is set to, so a user who already picked squash/rebase there gets the
+   * same method here.
+   *
+   * On failure the forge's message is surfaced as-is (not translated, it is
+   * the forge's own text, not GitWand copy) and the PR is re-fetched either
+   * way, so a stale `autoMerge` descriptor corrects itself instead of the app
+   * remembering a refusal that may no longer hold.
+   */
+  async function armAutoMerge(method?: "merge" | "squash" | "rebase") {
+    if (!selectedPr.value) return;
+    try {
+      await forge.value.enableAutoMerge(cwd.value, selectedPr.value.number, method ?? mergeMethod.value);
+      error.value = null;
+    } catch (err: any) {
+      error.value = err.message;
+    } finally {
+      await revalidateOpenDetail();
+    }
+  }
+
+  /** Cancel a previously armed auto-merge. Same refetch-either-way contract
+   *  as `armAutoMerge`. */
+  async function disarmAutoMerge() {
+    if (!selectedPr.value) return;
+    try {
+      await forge.value.disableAutoMerge(cwd.value, selectedPr.value.number);
+      error.value = null;
+    } catch (err: any) {
+      error.value = err.message;
+    } finally {
+      await revalidateOpenDetail();
+    }
   }
 
   // ─── Comment actions ────────────────────────────────────
@@ -1389,6 +1525,11 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
       // v3.7.0 — same reuse for Commit Review's queue (a different queue
       // instance entirely — see `PrPanelOptions.onVisibilityResume`).
       opts.onVisibilityResume?.();
+      // v3.10.0: the watcher-driven badge refresh is skipped while the tab
+      // is hidden (App.vue's `refs` handler), so a ref that moved in the
+      // background left the count stale with nothing to correct it. Throttled,
+      // so a brief alt-tab costs nothing.
+      void refreshDockPrCountThrottled();
     }
   }
 
@@ -1516,14 +1657,15 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     // Pagination (v2.8.5)
     hasMore, loadingMore,
     // Dock badge count
-    dockPrCount, refreshDockPrCount,
+    dockPrCount, refreshDockPrCount, refreshDockPrCountThrottled,
     // Computed
     forge, forgeLabel,
     commentsForFile, commentCount, mergeReadiness, mergeBlocked, mergeBlockedReason, selectedDiff, displayedPrs,
+    autoMergeOffer,
     // Actions
-    init, ensurePrsLoaded, loadRemote, loadPrs, loadMorePrs, loadCurrentUser, selectPr, loadDiff,
+    init, ensurePrsLoaded, loadRemote, loadPrs, loadMorePrs, loadCurrentUser, selectPr, loadDiff, loadChecks,
     revalidateOpenDetail,
-    createPr, checkoutPr, mergePr, convertDraftToReady,
+    createPr, checkoutPr, mergePr, armAutoMerge, disarmAutoMerge, convertDraftToReady,
     handleCreateComment, handleReplyComment, handleEditComment,
     handleDeleteComment, handleApplySuggestion, handleAddToReview, handleSubmitReview,
     handleDismissReview, handleRequestReviewers, forgeSupportsDismissReview, forgeSupportsRequestReviewers,

@@ -58,6 +58,7 @@ const ptBR: Locale = {
     pull: "Pull",
     sync: "Sincronizar",
     syncTooltip: "Buscar branches remotos e fazer pull",
+    fetchProgress: "Buscando… {0}%",
     merge: "Merge",
     mergeTooltip: "Fazer merge de um branch no branch atual",
     mergeNoFf: "Sempre criar um commit de merge",
@@ -91,9 +92,19 @@ const ptBR: Locale = {
     stashDone: "Mudanças guardadas no stash",
     mergeDone: "Merge concluído",
     mergeAborted: "Merge abortado",
+    cherryPickDone: "Cherry-pick conclu\u00eddo",
+    cherryPickAborted: "Cherry-pick abortado",
     resolveConflicts: "resolva os conflitos para continuar",
     abortMerge: "Abortar merge",
     abortCherryPick: "Abortar cherry-pick",
+    pausedMerge: "Merge pausado",
+    pausedCherryPick: "Cherry-pick pausado",
+    pausedRevert: "Revert pausado",
+    operationContinue: "Continuar",
+    abortRevert: "Abortar revert",
+    abortConfirmTitle: "Abortar esta opera\u00e7\u00e3o?",
+    abortConfirmMessage: "Suas resolu\u00e7\u00f5es ser\u00e3o descartadas. Os arquivos voltam ao estado anterior \u00e0 opera\u00e7\u00e3o.",
+    abortConfirmLabel: "Abortar",
     // Search trigger
     searchTooltip: "Buscar (\u2318K)",
     searchAriaLabel: "Abrir busca",
@@ -331,6 +342,16 @@ const ptBR: Locale = {
 
   // ─── DiffViewer ─────────────────────────────────────────
   diff: {
+    editHunk: "Editar este hunk",
+    editBusy: "Conclua primeiro o hunk em edi\u00e7\u00e3o",
+    editStale: "O arquivo mudou desde que este diff foi calculado. Atualize e tente novamente.",
+    newFolder: "Nova pasta",
+    newFolderCount: "{0} arquivo(s)",
+    nestedRepo: "Reposit\u00f3rio Git aninhado",
+    nestedRepoHint:
+      "Esta pasta tem o pr\u00f3prio .git, ent\u00e3o o Git n\u00e3o rastreia o conte\u00fado dela a partir daqui. Adicione-a como subm\u00f3dulo, ignore-a, ou remova o .git dela para rastrear os arquivos.",
+    nestedRepoOpen: "Abrir em uma nova aba",
+    nestedRepoIgnore: "Adicionar ao .gitignore",
     noDiff: "Nenhum diff disponível para este arquivo",
     noDiffHint: "Arquivo novo ou binário",
     selectFile: "Selecione um arquivo para ver o diff",
@@ -508,6 +529,20 @@ const ptBR: Locale = {
 
   // ─── Merge Preview ──────────────────────────────────────
   mergePreview: {
+    applying: "Aplicando\u2026",
+    applyAndMerge: "Mesclar e auto-resolver",
+    applyEstimate: "Estimativa: {0} de {1} hunks auto-resolv\u00edveis",
+    applyDone: "Conclu\u00eddo",
+    applyStopped: "Parado nos conflitos que precisam de voc\u00ea",
+    applyLoopBound: "Parado ap\u00f3s passos de rebase demais",
+    applyFailed: "A opera\u00e7\u00e3o falhou",
+    applyCounts: "{0} aplicados, {1} restantes",
+    applyDrift: "A pr\u00e9via estimou {0}. A opera\u00e7\u00e3o real v\u00ea outra mesclagem, ent\u00e3o podem divergir.",
+    applyNoSnapshot: "Nenhum snapshot foi capturado, n\u00e3o h\u00e1 volta em um clique.",
+    hunkHeldBack: "retido ({0}%)",
+    thresholdLabel: "Aplicar apenas acima de",
+    thresholdOff: "Nenhum",
+    thresholdSummary: "{0} auto-resolviveis, {1} retidos pelo limite, {2} manuais",
     aiRisk: "Avaliação de risco",
     aiRiskHint: "Pergunte à IA se este merge parece seguro.",
     aiRiskAnalyzing: "Analisando riscos…",
@@ -733,10 +768,15 @@ const ptBR: Locale = {
     resolveAutoSummaryBody: "{0} conflito(s) serão resolvidos assim:",
     resolveAutoSummaryConfirm: "Confirmar",
     resolveAutoSummaryCancel: "Cancelar",
+    resolveAutoSummaryToggle: "Aplicar o conflito {0}",
     bulkLabel: "Aceitar tudo:",
     bulkOurs: "Atual",
     bulkTheirs: "Recebido",
     bulkBoth: "Ambos",
+    bulkAi: "IA",
+    bulkAiCancel: "Cancelar",
+    bulkAiProgress: "{0} de {1}",
+    bulkAiSummary: "{0} resolvidos, {1} com erro",
     bulkGeneratedWarning: "⚠ Concatenar pode quebrar um arquivo gerado",
     recommended: "recomendado",
     autoResolved: "auto",
@@ -766,6 +806,12 @@ const ptBR: Locale = {
     markerlessExplanation: "O Git registra um conflito para este arquivo, mas a cópia de trabalho não tem marcadores e não corresponde a nenhum dos lados.",
     reconstructConflict: "Reconstruir conflito",
     keepWorkingTree: "Manter minha versão (preparar como está)",
+    unreadableTitle: "O arquivo não pode ser lido como texto",
+    unreadableExplanation: "O Git relata este arquivo como em conflito, mas o conteúdo não é texto UTF-8 válido, portanto não há blocos para exibir. Costuma ser um artefato de build ou um binário. Você ainda pode resolvê-lo escolhendo um lado inteiro, o que opera sobre os bytes brutos, ou abri-lo no seu próprio editor.",
+    unreadableKeepOurs: "Manter nossa versão",
+    unreadableKeepTheirs: "Manter a versão deles",
+    unreadableOpenExternally: "Abrir no editor externo",
+    unreadableReasonLabel: "Motivo relatado",
   },
 
   // ─── PR creation ────────────────────────────────────────
@@ -856,6 +902,7 @@ const ptBR: Locale = {
       stateMerged: "Merged",
       stateClosed: "Closed",
       draft: "Draft",
+      autoMergeBadge: "Auto-merge",
     },
     detail: {
       mergePromptPrefix: "Mesclar a PR",
@@ -882,6 +929,10 @@ const ptBR: Locale = {
       mergeProblem: "Problema detectado",
       mergeUnknown: "Desconhecido",
       mergeNoPermission: "Você não tem permissão para fazer merge deste pull request",
+      autoMergeArm: "Mesclar quando as verificações passarem",
+      autoMergeDisarm: "Cancelar merge agendado",
+      autoMergeArmed: "Será mesclado quando as verificações passarem",
+      autoMergeUnavailable: "Merge agendado indisponível",
       statFiles: "Arquivos",
       statDiff: "Diff",
       statComments: "Comentários",
@@ -1057,6 +1108,13 @@ const ptBR: Locale = {
 
   // ─── Settings ───────────────────────────────────────────
   settings: {
+    resolution: {
+      title: "Confianca de resolucao",
+      subtitle: "Um limite sobre a confianca por hunk do motor, aplicado em toda resolucao do GitWand.",
+      minConfidenceScore: "Aplicar apenas acima de",
+      minConfidenceScoreHint: "Auto-resolucoes abaixo deste valor sao propostas em vez de aplicadas. Nunca deixa passar o que o motor ja recusou.",
+      barOff: "Nenhum",
+    },
     title: "Configurações",
     tabGeneral: "Geral",
     tabDock: "Dock",
@@ -1262,6 +1320,8 @@ const ptBR: Locale = {
     defaultBranch: "Branch padrão",
     commitSignature: "Adicionar «🪄 Commit via GitWand» à descrição",
     commitSignatureHint: "Uma pequena assinatura adicionada automaticamente — removível a qualquer momento",
+    liveRepoWatcher: "Atualização ao vivo do repositório",
+    liveRepoWatcherHint: "Atualiza instantaneamente a partir de eventos do sistema de arquivos em vez de consultar periodicamente. Desative se o repositório estiver em uma unidade de rede.",
     blameAlgorithm: "Algoritmo de diff para blame",
     blameAlgorithmHint: "Controla como git blame detecta linhas movidas. histogram dá os melhores resultados.",
     secretsScannerEnabled: "Verificar alterações no stage em busca de segredos",
@@ -1497,6 +1557,12 @@ const ptBR: Locale = {
     accountsAzureDevMock: "O login do Azure só está disponível no aplicativo desktop.",
     accountsAzureWaiting: "Aguardando autorização…",
     accountsAzureConnected: "Conectado como",
+    accountsGiteaUrlLabel: "URL do servidor",
+    accountsGiteaTokenLabel: "Token de acesso",
+    accountsGiteaTokenHint: "Gitea: Configurações > Aplicativos > Gerar token. Escopos: leitura e escrita de repositórios e issues.",
+    accountsGiteaUrlInvalid: "Informe uma URL de servidor válida, por exemplo https://git.acme.io",
+    accountsGiteaTokenRequired: "Um token de acesso é obrigatório.",
+    accountsGiteaHostTaken: "Já existe uma conta Gitea para {0}. Remova-a primeiro para adicionar outra.",
     accountsDeleteConfirm: "Remover esta conta?",
     // v2.12
     git: {
@@ -1671,13 +1737,13 @@ const ptBR: Locale = {
     },
     action: {
       merge: "Mesclar",
+      "auto-merge": "Agendar merge",
       review: "Revisar",
       seeFailure: "Ver falha",
       reply: "Responder",
       resolve: "Resolver",
       follow: "Acompanhar",
       nudge: "Lembrar",
-      autoMerge: "Auto-merge",
       view: "Ver",
     },
     case: {
@@ -1746,6 +1812,28 @@ const ptBR: Locale = {
     reviewersShort: "Revisores",
     refreshAll: "Atualizar tudo",
     refreshAllTooltip: "Atualizar as 4 abas em paralelo",
+    confirm: {
+      merge: {
+        title: "Mesclar esta pull request?",
+        body: "{0} será mesclada em {1}.",
+      },
+      autoMerge: {
+        title: "Agendar o merge desta pull request?",
+        body: "{0} será mesclada em {1} assim que as verificações passarem.",
+      },
+      nudge: {
+        title: "Enviar um lembrete?",
+        body: "Um comentário será publicado em {0}.",
+      },
+    },
+    nudge: {
+      comment: "Lembrete amigável: esta pull request está pronta para revisão.",
+    },
+    toast: {
+      merged: "Pull request mesclada.",
+      autoMergeArmed: "Merge agendado.",
+      nudged: "Lembrete enviado.",
+    },
     noWorkspace: {
       warning: "Crie um workspace primeiro para usar Today",
     },
@@ -1759,6 +1847,7 @@ const ptBR: Locale = {
     bitbucket: "Bitbucket",
     azure: "Azure DevOps",
     cursor: "Cursor Origin",
+    gitea: "Gitea / Forgejo",
     action: "Abrir Configurações",
   },
 
@@ -1848,10 +1937,15 @@ const ptBR: Locale = {
 
   // ─── MergeEditor inline AI actions ──────────────────────
   mergeEditor: {
+    editAriaLabel: "Editar o conflito {0}",
     aiButton: "IA",
     aiLoading: "IA…",
     aiErrorPrefix: "IA",
     aiSuggestionLabel: "Sugestão IA — revise e ajuste",
+    aiStagedReady: "Sugestão IA pronta",
+    aiStagedReview: "Revisar",
+    aiStagedDiscard: "Descartar",
+    aiRetry: "Tentar de novo",
     explainTooltip: "Explicar este conflito em linguagem natural",
     explain: "Explicar",
     explainAnalyzing: "Analisando…",
