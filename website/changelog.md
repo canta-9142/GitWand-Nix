@@ -5,6 +5,110 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.11.1 — September 2026
+
+### The model now knows why each side changed the code
+
+When GitWand can't resolve a conflict on its own and hands it to a model, whether automatically or when you click "Resolve with AI", the model used to get the hunk and a few lines of surrounding context. It saw what each side had written, never why. The prompt now answers that question. For each side, it lists the commits since the merge base that touched the conflicting lines: the messages always, and the diffs narrowed to those lines while the budget allows. A conflict between a rename and a bug fix reads very differently once the model knows which is which.
+
+All of it is computed locally, and only for the hunks that actually go to a model, so a conflict resolved deterministically costs nothing. Each hunk has a two-second budget. History can make a prompt poorer, but it can never make a resolution fail.
+
+### A budget, and honesty when there is nothing to say
+
+History is capped at 1,500 tokens by default, adjustable between 200 and 8,000. When a prompt is over the budget, the diffs go first, then the message bodies, then the oldest commits. The newest commit's subject on each side always stays.
+
+When there is no history worth sending, the prompt says so instead of leaving a silent gap. That covers two branches with no common ancestor, a side that simply deleted the lines, and git taking too long. The model learns that the absence is information. Cherry-picks and reverts use only the commit being applied. A side that only reformatted the lines shows its reformat commit, rather than claiming that nobody touched them.
+
+### Your repository decides what leaves the machine
+
+Commit messages and diffs are sent to whichever AI provider you have configured, so the feature can be turned off in Settings → AI. A repository can also turn it off for everyone, with `"history": { "enabled": false }` under `llmFallback` in its `.gitwandrc`. That setting wins over any individual preference. The LLM trace panel shows what was sent with each prompt, or that nothing was.
+
+### Two quiet bugs, found on the way
+
+Manual testing turned up the kind of bug that no error message ever reveals. The merge editor was never told which repository it was in. So everything that needed that information turned itself off without complaint: custom automations, applying a remembered resolution, and the new history of "Resolve with AI". All three work again, and a test now guards that one line.
+
+Saving the LLM-fallback settings was also rewriting that section of `.gitwandrc` from scratch, dropping whatever it didn't edit. Your model choice, and now a repository's history opt-out, survive a save.
+
+## v3.11.0 — September 2026
+
+### The Conflict Predictor now does the merge
+
+Until now the predictor told you what a merge *would* do and then left you to it: merge blind, or detour through a scratch worktree. "Merge and auto-resolve" runs the real operation, re-runs the engine against what git actually produced, applies every resolution that clears the gates, stages them, and stops with the operation still in progress on whatever needs a human.
+
+It never aborts on your behalf — an abort discards hand resolution that no snapshot can give back — and it never continues past a residual. The button says "Estimated N" because the preview is a simulation over three blobs, with no index and no merge drivers; when the estimate and the outcome disagree, the report says so rather than quietly rounding.
+
+### A confidence bar you can actually set
+
+The engine has always scored each resolution. That score is now a number you can act on: `minConfidenceScore`, from 0 to 100, settable in the desktop app, in `.gitwandrc`, on the CLI and through the MCP tools. It is combined with the existing label gate rather than replacing it, which is the design rather than an implementation detail — `complex` scores 60, so a numeric gate on its own would have silently started applying complex hunks. Being purely subtractive, no setting of the bar can make GitWand apply more than it would with the bar off.
+
+Alongside it, the merge editor's summary lists every offered resolution with its score and a checkbox, so a single hunk can be declined without declining the rest.
+
+### The diff is a place you can fix things
+
+The merge editor's bare textarea is gone, replaced by CodeMirror 6: syntax highlighting, line numbers, real undo. And an inline diff hunk can now be edited where you are reading it — deliberately bounded to unstaged, non-conflicted files, one hunk at a time, writing back through a layer that reconstructs from the original bytes so trailing newlines and CRLF endings survive.
+
+### Gitea and Forgejo
+
+Sign in with a personal access token and the PR tab works on any self-hosted Gitea or Forgejo server: list, detail, diff, CI status, comments, create, merge, checkout, draft to ready. Verified against a live Gitea 1.27.3, which corrected two things the documentation had led us to believe and exposed a comment list that served the same comment three hundred times.
+
+### Merges that arm themselves
+
+A pull request whose checks have not finished can be told to merge itself once they pass, on GitHub, GitLab and Azure DevOps. Bitbucket has no such capability, and says so plainly instead of pretending. The action only ever appears on a PR that is not already mergeable — when a PR is clean, the plain merge sitting next to it is what you want.
+
+### Abort and continue stopped lying
+
+"Abort merge" used to report success even when git had refused, leaving the conflict on disk and the app claiming otherwise. The cause outlived the symptom: GitWand modelled merge, cherry-pick, revert and rebase four different ways, with three different conventions for reporting failure.
+
+They now share one command and one convention, built on a distinction that was missing everywhere — an operation ends in three ways, not two. It completes, it halts on a further conflict, or it fails. Collapsing the last two is what produced both a success message on a refusal and an error message on a cherry-pick that was simply advancing to the next commit.
+
+Alongside it: a revert you start can now be finished or abandoned, which was impossible before; abandoning work asks first; and nothing commits by itself when the last conflict is resolved — the banner's Continue button is the one way forward, for every operation.
+
+### Making `dev:web` tell the truth
+
+GitWand's own development server stands in for the Rust backend when the app runs in a browser, which is where most manual testing happens. If a command has no route there, or behaves differently, that testing quietly checks something other than what ships.
+
+Every command the interface calls now declares either its route or the reason it has none, with a test that fails when that stops being true. The audit found eleven gaps, two of them live defects, and a further round comparing how both sides *fail* — not just how they succeed — caught a submodule update that reported success whatever git did.
+
+## v3.10.1 — September 2026
+
+### One unreadable file no longer blocks every conflict
+
+A conflict that GitWand could not open, reported the day v3.10.0 shipped. The sidebar listed four conflicted files, the banner asked for them to be resolved, and selecting any of them showed a read-only diff with no way to reach the resolver at all.
+
+The cause was not the resolver. GitWand loads every conflicted file in one batch, and it reads them as text. A file that is not valid UTF-8, typically a minified bundle or some other build artifact, could not be read, and that single failure aborted the whole batch. What made it invisible rather than merely broken is what happened next: the app fell back to its built-in demonstration files, so the merge editor was left holding examples instead of the repository's real conflicts, quietly, with no error. Files that were perfectly readable, including one-line conflicts the engine settles on its own, became unreachable along with the file that actually failed.
+
+Each file is now loaded on its own, and a failure affects only that file. The demonstration set is no longer used when something goes wrong in a real repository: substituting invented files for someone's actual conflicts hid the problem instead of reporting it.
+
+A file GitWand genuinely cannot decode now gets a panel of its own rather than disappearing. It stays in the list, because git still counts it and a rebase will not continue until it is settled, and it offers the two choices that make sense without reading the contents: keep your side, keep theirs, or open it in your own editor. Both choices are carried out by git directly on the raw bytes, so they work on a file no text editor could show you.
+
+## v3.10.0 — September 2026
+
+### The repo stops being asked, and starts telling
+
+Until now GitWand kept a repository up to date the crude way: it asked, every two seconds, forever. Edit a file in your editor, run a command in another terminal, and the change surfaced whenever the next poll happened to land. That poll is gone as the primary mechanism. A filesystem watcher sits on `.git/` and the working tree, and changes appear as they happen, typically inside a second, whoever made them and wherever they came from.
+
+What the watcher emits is not a firehose of raw OS events. They are coalesced into a handful of meaningful kinds, status, index, refs, head, so the app can refresh precisely the thing that moved instead of redrawing everything on every keystroke in a saved file. A `git checkout` touching thousands of files cannot stall the stream: both how long events are batched and how many are batched at once are bounded. One watcher runs per repository no matter how many parts of the UI are listening, which matters because the next consumer is already designed for: the incremental code index behind the v4.0 work.
+
+The old two second poll survives as a fifteen second safety net, and drops back to its former self only when the watcher genuinely cannot run: a network mount, a platform failure, or the setting switched off. It lives in Settings under Git as "Live repo updates", on by default. Turn it off and you get the previous behaviour back immediately, exactly as it was.
+
+### Less waiting, in three other places
+
+Opening a diff no longer spawns a git subprocess. `git_diff` now goes through libgit2 directly, which matters because it sits on the busiest read path in the app. The command line remains the reference implementation and the fallback, and a parity test suite compares the two on every run so the fast path cannot quietly drift away from what git itself would say.
+
+Analysing a large conflicted file used to freeze the interface while it worked. That analysis now happens on a separate thread, so the window stays responsive no matter how big the file is. Nothing about the conflict engine itself changed, only where it runs.
+
+Clone and fetch progress used to be broadcast globally, with every listener hearing about every operation. Each now streams on its own private channel, and fetch gained a progress indicator it simply never had before.
+
+### Today can finally act
+
+The Today inbox listed work without being able to do any of it. Now it can. Merge really merges, and refuses honestly when a pull request is not actually mergeable rather than failing silently. Nudge posts a reminder you get to edit before it goes out, on GitHub for the moment. Resolve drops you directly into the conflict resolver instead of the pull request review page.
+
+One thing deliberately absent: queueing a merge to happen once checks pass. That needs a different call to every forge, and Bitbucket has no equivalent at all, so rather than ship a button labelled "Auto-merge" that could only ever say "waiting", the action performs an honest immediate merge and tells you when checks are still running.
+
+### Told plainly: what did not ship
+
+Blame was meant to move to libgit2 alongside diff. It did not. The accuracy test caught libgit2 and the command line attributing a moved block of code to different commits, and worse, the result depended on which version of git was installed: correct against 2.50.1, wrong against 2.55.0. Blame is something you read and trust, so it stays on the command line until that is resolved. The unused implementation and its failing scenario stay in the codebase as a guard against anyone switching it on without fixing the underlying disagreement first.
+
 ## v3.9.1 — September 2026
 
 A community request, filed as a one-line issue: "the branch merge UI doesn't include the ability to merge with no fast forward option. This is the base working process in our company." Some teams want every merge to leave a visible seam, a real merge commit, even for a branch that could otherwise fast-forward silently into the trunk. GitWand's merge popover had no way to ask for that. It does now: an "Always create a merge commit" checkbox sits next to the branch picker, off by default, and checking it before merging runs `git merge --no-ff` instead of letting a fast-forward slide through unannounced. Leave it unchecked and nothing changes.

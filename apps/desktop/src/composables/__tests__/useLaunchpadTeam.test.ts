@@ -42,6 +42,9 @@ const BASE_PR = {
   mergeStateStatus: "CLEAN",
   checksRollup: "SUCCESS",
   commentCount: 0,
+  // Not imported from "../../utils/backend" (mocked above): inline the same
+  // closed-descriptor shape as CLOSED_AUTO_MERGE.
+  autoMerge: { armed: false, available: false, reason: null },
 };
 
 const EMPTY_WIP = [

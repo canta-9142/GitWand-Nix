@@ -568,6 +568,7 @@ fn json_to_pr(r: &AzureRepo, pr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(pr, "mergeStatus").to_uppercase(),
         checks_rollup: String::new(),
         comment_count: 0,
+        auto_merge: az_auto_merge_state(pr),
     }
 }
 
@@ -620,6 +621,15 @@ fn json_to_detail(r: &AzureRepo, pr: &serde_json::Value) -> PullRequestDetail {
         // cheaply available here. Unknown ⇒ UI gates on errors only.
         can_merge: None,
         head_sha: jnested(pr, "lastMergeSourceCommit", "commitId"),
+        auto_merge: az_auto_merge_state(pr),
+        // Azure has no repository-level auto-complete gate (unlike GitHub's
+        // "Allow auto-merge" repo setting): any non-draft PR can request it,
+        // subject only to the per-PR draft precondition `az_auto_merge_state`
+        // already checks.
+        auto_merge_support: crate::types::AutoMergeSupport {
+            supported: true,
+            reason: None,
+        },
     }
 }
 
@@ -653,6 +663,44 @@ fn rest_current_user_with(token: &str) -> Result<String, String> {
         name
     };
     Ok(name)
+}
+
+/// Process-lifetime cache of the signed-in identity's GUID, keyed by
+/// organisation. The identity doesn't change during a session, yet arming
+/// auto-complete needs it on every call, same lifetime model as
+/// `FORK_INFO_CACHE` in `github_api.rs`.
+static AZ_IDENTITY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Resolve the signed-in user's Azure DevOps identity id (a GUID), required
+/// by `autoCompleteSetBy.id` when arming auto-complete.
+///
+/// Deliberately does NOT reuse `rest_current_user`: that function hits the
+/// GLOBAL `app.vssps.visualstudio.com` profile endpoint, which returns a
+/// `displayName`/`emailAddress`, never an id. `autoCompleteSetBy` needs the
+/// identity **GUID**, which only comes back from an organisation-scoped
+/// endpoint. `_apis/connectionData` carries `authenticatedUser.id`, so this
+/// resolves the org the same way every other REST call in this module does
+/// (`azure_repo`, from the repo's `origin` remote) and hits that endpoint
+/// scoped to it.
+fn az_current_identity_id(cwd: &str) -> Result<String, String> {
+    let r = azure_repo(cwd)?;
+
+    let cache = AZ_IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(id) = cache.lock().unwrap().get(&r.org) {
+        return Ok(id.clone());
+    }
+
+    let url = with_api_version(&format!(
+        "https://dev.azure.com/{}/_apis/connectionData",
+        urlenc(&r.org)
+    ));
+    let v = az_json("GET", &url, None)?;
+    let id = jnested(&v, "authenticatedUser", "id");
+    if id.is_empty() {
+        return Err("Azure DevOps did not return an identity id for this token.".to_string());
+    }
+    cache.lock().unwrap().insert(r.org.clone(), id.clone());
+    Ok(id)
 }
 
 fn search_status(state: &str) -> &'static str {
@@ -1113,6 +1161,55 @@ fn rest_merge_pr(cwd: &str, number: i64, method: &str) -> Result<(), String> {
             "deleteSourceBranch": true,
         },
     });
+    let url = with_api_version(&format!("{}/pullrequests/{}", r.api_base(), number));
+    az_json("PATCH", &url, Some(&payload.to_string()))?;
+    Ok(())
+}
+
+/// Body for the PATCH that arms or clears Azure auto-complete.
+///
+/// `Some(id)` arms with that identity and its merge strategy. `None` clears
+/// it by sending ONLY an explicit null `autoCompleteSetBy`, no
+/// `completionOptions`: the null is explicit rather than an omitted key,
+/// since Azure treats an absent field as "do not change" and would leave
+/// auto-complete armed while the call reported success, but sending
+/// `completionOptions` alongside the null on a disarm silently rewrites the
+/// PR's merge strategy as a side effect of cancelling, which is not what
+/// cancelling should do.
+fn az_auto_complete_body(identity_id: Option<&str>, method: &str) -> serde_json::Value {
+    match identity_id {
+        Some(id) => {
+            let strategy = match method {
+                "squash" => "squash",
+                "rebase" => "rebase",
+                "merge" => "noFastForward",
+                _ => "noFastForward",
+            };
+            serde_json::json!({
+                "autoCompleteSetBy": { "id": id },
+                "completionOptions": { "mergeStrategy": strategy },
+            })
+        }
+        None => serde_json::json!({ "autoCompleteSetBy": null }),
+    }
+}
+
+/// Queue this PR to merge once its checks pass, by PATCHing it with the
+/// signed-in identity in `autoCompleteSetBy` (Azure's auto-complete gate).
+fn rest_enable_auto_merge(cwd: &str, number: i64, method: &str) -> Result<(), String> {
+    let r = azure_repo(cwd)?;
+    let id = az_current_identity_id(cwd)?;
+    let payload = az_auto_complete_body(Some(&id), method);
+    let url = with_api_version(&format!("{}/pullrequests/{}", r.api_base(), number));
+    az_json("PATCH", &url, Some(&payload.to_string()))?;
+    Ok(())
+}
+
+/// Cancel a queued auto-complete by clearing `autoCompleteSetBy` (explicit
+/// null, see `az_auto_complete_body`).
+fn rest_disable_auto_merge(cwd: &str, number: i64) -> Result<(), String> {
+    let r = azure_repo(cwd)?;
+    let payload = az_auto_complete_body(None, "merge");
     let url = with_api_version(&format!("{}/pullrequests/{}", r.api_base(), number));
     az_json("PATCH", &url, Some(&payload.to_string()))?;
     Ok(())
@@ -1754,6 +1851,32 @@ pub(crate) async fn az_merge_pr(
     .map_err(|e| e.to_string())?
 }
 
+/// Queue this PR to merge once its checks pass.
+///
+/// A separate command from `az_merge_pr` rather than a flag on it: arming
+/// takes a merge method, disarming takes none, mirroring the GitHub/GitLab
+/// pair already shipped for this feature.
+#[tauri::command]
+pub(crate) async fn az_enable_auto_merge(
+    cwd: String,
+    number: i64,
+    method: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rest_enable_auto_merge(&cwd, number, &method.unwrap_or_else(|| "merge".to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Cancel a queued auto-complete. Takes no method: there is nothing to choose.
+#[tauri::command]
+pub(crate) async fn az_disable_auto_merge(cwd: String, number: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || rest_disable_auto_merge(&cwd, number))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub(crate) async fn az_pr_ready(cwd: String, number: i64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || rest_pr_ready(&cwd, number))
@@ -2220,5 +2343,116 @@ mod tests {
         assert!(form_config(&[("code", "a\rb")]).is_err());
         // A normal opaque token value is accepted.
         assert!(form_config(&[("code", "AQABbase64url-_token")]).is_ok());
+    }
+}
+
+/// Per-PR auto-complete state from an Azure DevOps pull-request object.
+///
+/// `autoCompleteSetBy` carries the identity that armed it, so its presence
+/// is the armed flag. Azure refuses auto-complete on a draft.
+///
+/// `isDraft` is confirmed present on the **list** payload, not just detail:
+/// `json_to_pr`'s own `draft` field already reads `pr.get("isDraft")` off the
+/// exact same list-endpoint object this function receives.
+fn az_auto_merge_state(pr: &serde_json::Value) -> crate::types::AutoMergeState {
+    let is_draft = pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+    crate::types::AutoMergeState {
+        armed: pr.get("autoCompleteSetBy").is_some_and(|v| !v.is_null()),
+        available: !is_draft,
+        reason: if is_draft {
+            Some("A draft pull request cannot be set to auto-complete.".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+#[cfg(test)]
+mod az_auto_merge_tests {
+    use super::az_auto_merge_state;
+
+    #[test]
+    fn a_pr_with_auto_complete_set_is_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"pullRequestId": 4, "isDraft": false,
+                "autoCompleteSetBy": {"id": "11111111-2222-3333-4444-555555555555"}}"#,
+        )
+        .unwrap();
+        let s = az_auto_merge_state(&v);
+        assert!(s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn a_draft_pr_is_unavailable_with_a_reason() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"pullRequestId": 4, "isDraft": true}"#).unwrap();
+        let s = az_auto_merge_state(&v);
+        assert!(!s.available);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("A draft pull request cannot be set to auto-complete.")
+        );
+    }
+
+    #[test]
+    fn a_non_draft_pr_without_auto_complete_is_available_but_not_armed() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"pullRequestId": 4, "isDraft": false}"#).unwrap();
+        let s = az_auto_merge_state(&v);
+        assert!(!s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn a_missing_is_draft_field_reads_as_not_draft() {
+        // Azure omits `isDraft` on some API versions rather than sending false.
+        let v: serde_json::Value = serde_json::from_str(r#"{"pullRequestId": 4}"#).unwrap();
+        assert!(az_auto_merge_state(&v).available);
+    }
+}
+
+#[cfg(test)]
+mod az_auto_complete_body_tests {
+    use super::az_auto_complete_body;
+
+    #[test]
+    fn arming_sets_the_identity_and_the_merge_strategy() {
+        let b = az_auto_complete_body(Some("11111111-2222-3333-4444-555555555555"), "squash");
+        assert_eq!(
+            b["autoCompleteSetBy"]["id"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(b["completionOptions"]["mergeStrategy"], "squash");
+    }
+
+    #[test]
+    fn disarming_sends_an_explicit_null_identity() {
+        // Azure clears auto-complete by nulling the identity. Omitting the
+        // key would leave it armed, which is the silent failure to avoid.
+        let b = az_auto_complete_body(None, "merge");
+        let obj = b.as_object().expect("body is a JSON object");
+        assert!(
+            obj.contains_key("autoCompleteSetBy"),
+            "the key must be PRESENT with a null value: Azure reads an absent \
+             field as 'do not change', so omitting it would leave auto-complete \
+             armed while the call reported success"
+        );
+        assert!(obj["autoCompleteSetBy"].is_null());
+    }
+
+    #[test]
+    fn disarming_never_sends_completion_options_alongside_the_null_identity() {
+        // completionOptions.mergeStrategy alongside a null identity silently
+        // rewrites the PR's merge strategy as a side effect of cancelling.
+        let b = az_auto_complete_body(None, "squash");
+        let obj = b.as_object().expect("body is a JSON object");
+        assert!(!obj.contains_key("completionOptions"));
+    }
+
+    #[test]
+    fn an_unknown_method_falls_back_to_no_fast_forward() {
+        let b = az_auto_complete_body(Some("id"), "nonsense");
+        assert_eq!(b["completionOptions"]["mergeStrategy"], "noFastForward");
     }
 }

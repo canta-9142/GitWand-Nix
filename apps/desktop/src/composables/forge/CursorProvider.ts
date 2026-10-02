@@ -132,6 +132,14 @@ export class CursorProvider implements ForgeProvider {
     this.unsupported("mergePR");
   }
 
+  enableAutoMerge(_cwd: string, _number: number, _method?: "merge" | "squash" | "rebase"): Promise<void> {
+    this.unsupported("enableAutoMerge");
+  }
+
+  disableAutoMerge(_cwd: string, _number: number): Promise<void> {
+    this.unsupported("disableAutoMerge");
+  }
+
   checkoutPR(_cwd: string, _number: number): Promise<void> {
     this.unsupported("checkoutPR");
   }

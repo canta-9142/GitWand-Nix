@@ -224,8 +224,267 @@ pub fn git_log_parity(
     ))
 }
 
+/// Parity entry point for `git_diff`. Exercises the shipped implementation,
+/// libgit2 fast path and directory branch included, both of which have drifted
+/// from the Node dev-server before: the directory branch (an untracked folder,
+/// or a nested repo) lived only in the dev-server for several releases with
+/// nothing comparing the two (issue #183), and the v3.10.0 libgit2 fast path
+/// has to stay indistinguishable from the CLI output that route produces.
+pub fn git_diff_parity(cwd: String, path: String, staged: bool) -> Result<types::GitDiff, String> {
+    tauri::async_runtime::block_on(commands::read::git_diff(cwd, path, staged))
+}
+
 pub fn git_branches_parity(cwd: String) -> Result<Vec<types::GitBranch>, String> {
     tauri::async_runtime::block_on(commands::ops::git_branches(cwd, None))
+}
+
+/// Parity entry point for `git_blame`. Same reasoning as `git_diff_parity`.
+pub fn git_blame_parity(
+    cwd: String,
+    path: String,
+    algorithm: Option<String>,
+) -> Result<Vec<types::BlameLine>, String> {
+    tauri::async_runtime::block_on(commands::read::git_blame(cwd, path, algorithm))
+}
+
+/// Parity entry point for `read_file`. Exposed for the *failure* case above
+/// all: `read_file` is `std::fs::read_to_string`, which rejects a file that is
+/// not valid UTF-8, while the dev-server used to substitute U+FFFD and return
+/// success. That divergence hid a bug where one such file made every conflict
+/// in a repository unresolvable in the packaged app, while `pnpm dev:web`
+/// loaded it fine, so QA could not reproduce it (issue #188).
+pub fn read_file_parity(cwd: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::block_on(commands::files::read_file(cwd, path))
+}
+
+/// Parity entry points for the three Conflict Predictor commands. Until
+/// v3.11.0 the dev-server had no route for any of them: `previewMerge` POSTed
+/// to a path that did not exist and swallowed the failure into `[]`, and the
+/// other two were Tauri-only stubs returning `[]`. The whole predictor was
+/// therefore invisible under `pnpm dev:web`, reporting every merge as clean.
+/// Parity entry point for `git_rebase_onto` (v3.11). Destructive, so its
+/// parity test drives two independent fixture clones rather than comparing two
+/// runs against one working tree.
+pub fn git_rebase_onto_parity(cwd: String, onto: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::block_on(commands::ops::git_rebase_onto(cwd, onto))
+        .map(|r| serde_json::json!({ "conflict": r.conflict }))
+}
+
+/// Parity entry point for `git_operation_action`. Destructive, so its parity
+/// test drives two independent fixture repos rather than comparing two runs
+/// against one working tree.
+pub fn git_operation_action_parity(
+    cwd: String,
+    operation: String,
+    action: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::block_on(commands::ops::git_operation_action(cwd, operation, action))
+        .map(|r| serde_json::json!({ "halted": r.halted }))
+}
+
+/// Collapse any success payload to a marker.
+///
+/// A closure cannot do this job: it would be monomorphised on its first use,
+/// and these commands return several different `Ok` types — `()` for some,
+/// `Option<SnapshotMeta>` for the ones that can take a snapshot. The tests
+/// assert on the repository, never on the payload.
+fn parity_ok_marker<T>(_: T) -> serde_json::Value {
+    serde_json::json!({ "ok": true })
+}
+
+/// Parity entry point for commands that would otherwise each need their own
+/// wrapper and probe arm.
+///
+/// The probe already takes JSON on stdin, so one dispatcher keyed on the
+/// command name covers many commands with short arms instead of as many
+/// wrapper-plus-arm pairs. Only commands the parity suite actually drives are
+/// listed; an unknown name is an error, never a silent no-op, because a test
+/// that quietly exercises nothing is worse than a missing test.
+pub fn command_parity(
+    command: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let s = |key: &str| -> Result<String, String> {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .ok_or_else(|| format!("missing required arg '{}' for {}", key, command))
+    };
+
+    // Signatures verified against commands/ops.rs. `snapshots_enabled` is
+    // forced to Some(false) everywhere it exists: a snapshot writes into the
+    // repository, and two independently built repositories would then differ
+    // for a reason that has nothing to do with the refusal under test.
+    match command.as_str() {
+        "git_merge" => tauri::async_runtime::block_on(commands::ops::git_merge(
+            s("cwd")?,
+            s("branch")?,
+            Some(false),
+        ))
+        .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
+        "git_cherry_pick" => tauri::async_runtime::block_on(commands::ops::git_cherry_pick(
+            s("cwd")?,
+            vec![s("hash")?],
+        ))
+        .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
+        "git_revert_commit" => tauri::async_runtime::block_on(commands::ops::git_revert_commit(
+            s("cwd")?,
+            s("hash")?,
+            None,
+        ))
+        .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
+        "git_reset_to_commit" => tauri::async_runtime::block_on(
+            commands::ops::git_reset_to_commit(s("cwd")?, s("hash")?, s("mode")?, Some(false)),
+        )
+        .map(parity_ok_marker),
+        "git_discard" => tauri::async_runtime::block_on(commands::ops::git_discard(
+            s("cwd")?,
+            vec![s("path")?],
+            false,
+            Some(false),
+        ))
+        .map(parity_ok_marker),
+        "git_stash" => tauri::async_runtime::block_on(commands::ops::git_stash(s("cwd")?, None))
+            .map(parity_ok_marker),
+        // Takes no index, unlike git_stash_apply.
+        "git_stash_pop" => tauri::async_runtime::block_on(commands::ops::git_stash_pop(s("cwd")?))
+            .map(parity_ok_marker),
+        "git_stash_apply" => tauri::async_runtime::block_on(commands::ops::git_stash_apply(
+            s("cwd")?,
+            args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        ))
+        .map(parity_ok_marker),
+        "git_checkout_commit" => tauri::async_runtime::block_on(
+            commands::ops::git_checkout_commit(s("cwd")?, s("hash")?, Some(false)),
+        )
+        .map(parity_ok_marker),
+        "git_switch_branch" => tauri::async_runtime::block_on(commands::ops::git_switch_branch(
+            s("cwd")?,
+            s("branch")?,
+            Some(false),
+        ))
+        .map(parity_ok_marker),
+        "git_add_to_gitignore" => tauri::async_runtime::block_on(
+            commands::ops::git_add_to_gitignore(s("cwd")?, s("path")?),
+        )
+        .map(parity_ok_marker),
+        "git_amend_commit" => tauri::async_runtime::block_on(commands::ops::git_amend_commit(
+            s("cwd")?,
+            s("message")?,
+        ))
+        .map(parity_ok_marker),
+        "git_commit" => tauri::async_runtime::block_on(commands::ops::git_commit(
+            s("cwd")?,
+            s("message")?,
+            None,
+            None,
+        ))
+        .map(parity_ok_marker),
+        "git_create_branch" => tauri::async_runtime::block_on(commands::ops::git_create_branch(
+            s("cwd")?,
+            s("name")?,
+            false,
+            None,
+        ))
+        .map(parity_ok_marker),
+        "git_delete_branch" => tauri::async_runtime::block_on(commands::ops::git_delete_branch(
+            s("cwd")?,
+            s("name")?,
+            false,
+        ))
+        .map(parity_ok_marker),
+        "git_interactive_rebase" => tauri::async_runtime::block_on(
+            commands::ops::git_interactive_rebase(s("cwd")?, s("base")?, vec![]),
+        )
+        .map(|r| serde_json::json!({ "conflict": r.conflict })),
+        "git_pull" => tauri::async_runtime::block_on(commands::ops::git_pull(
+            s("cwd")?,
+            s("strategy")?,
+            Some(false),
+        ))
+        .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
+        "git_stage" => {
+            tauri::async_runtime::block_on(commands::ops::git_stage(s("cwd")?, vec![s("path")?]))
+                .map(parity_ok_marker)
+        }
+        "git_unstage" => {
+            tauri::async_runtime::block_on(commands::ops::git_unstage(s("cwd")?, vec![s("path")?]))
+                .map(parity_ok_marker)
+        }
+        "git_stage_patch" => {
+            tauri::async_runtime::block_on(commands::ops::git_stage_patch(s("cwd")?, s("patch")?))
+                .map(parity_ok_marker)
+        }
+        "git_unstage_patch" => {
+            tauri::async_runtime::block_on(commands::ops::git_unstage_patch(s("cwd")?, s("patch")?))
+                .map(parity_ok_marker)
+        }
+        "git_stash_clear" => {
+            tauri::async_runtime::block_on(commands::ops::git_stash_clear(s("cwd")?))
+                .map(parity_ok_marker)
+        }
+        "git_stash_drop" => tauri::async_runtime::block_on(commands::ops::git_stash_drop(
+            s("cwd")?,
+            args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        ))
+        .map(parity_ok_marker),
+        "git_submodule_add" => tauri::async_runtime::block_on(commands::ops::git_submodule_add(
+            s("cwd")?,
+            s("url")?,
+            s("path")?,
+        ))
+        .map(parity_ok_marker),
+        "git_submodule_init" => {
+            tauri::async_runtime::block_on(commands::ops::git_submodule_init(s("cwd")?))
+                .map(parity_ok_marker)
+        }
+        "git_submodule_update" => tauri::async_runtime::block_on(
+            commands::ops::git_submodule_update(s("cwd")?, false, false),
+        )
+        .map(parity_ok_marker),
+        "git_submodule_update_one" => tauri::async_runtime::block_on(
+            commands::ops::git_submodule_update_one(s("cwd")?, s("path")?),
+        )
+        .map(parity_ok_marker),
+        "snapshot_create" => tauri::async_runtime::block_on(commands::snapshots::snapshot_create(
+            s("cwd")?,
+            s("kind")?,
+            s("label")?,
+        ))
+        .map(parity_ok_marker),
+        // Read commands, reachable here so the two 404s below can be pinned at
+        // parity rather than merely fixed.
+        "git_commit_template_path" => {
+            tauri::async_runtime::block_on(commands::read::git_commit_template_path(s("cwd")?))
+                .map(|p| serde_json::json!({ "path": p }))
+        }
+        "git_config_identity" => {
+            tauri::async_runtime::block_on(commands::read::git_config_identity(s("cwd")?))
+                .map(|(name, email)| serde_json::json!([name, email]))
+        }
+        other => Err(format!("command-parity does not know '{}'", other)),
+    }
+}
+
+pub fn preview_merge_parity(
+    cwd: String,
+    source_branch: String,
+) -> Result<Vec<types::FileMergePreview>, String> {
+    tauri::async_runtime::block_on(commands::read::preview_merge(cwd, source_branch))
+}
+
+pub fn preview_rebase_parity(
+    cwd: String,
+    onto: String,
+) -> Result<Vec<types::FileMergePreview>, String> {
+    tauri::async_runtime::block_on(commands::read::preview_rebase(cwd, onto))
+}
+
+pub fn preview_cherry_pick_parity(
+    cwd: String,
+    commit: String,
+) -> Result<Vec<types::FileMergePreview>, String> {
+    tauri::async_runtime::block_on(commands::read::preview_cherry_pick(cwd, commit))
 }
 
 pub fn git_remote_info_parity(cwd: String) -> Result<types::RemoteInfo, String> {
@@ -234,6 +493,30 @@ pub fn git_remote_info_parity(cwd: String) -> Result<types::RemoteInfo, String> 
 
 pub fn git_stash_list_parity(cwd: String) -> Result<Vec<types::StashEntry>, String> {
     tauri::async_runtime::block_on(commands::ops::git_stash_list(cwd))
+}
+
+/// Parity entry point for `gh_enable_auto_merge`. Only a repo with no forge
+/// remote is checkable here (see the refusal test in `tests/parity/`): no
+/// test arms an auto-merge on a live PR.
+pub fn gh_enable_auto_merge_parity(cwd: String, number: i64, method: String) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gh::gh_enable_auto_merge(cwd, number, method))
+}
+
+/// Parity entry point for `gh_disable_auto_merge`.
+pub fn gh_disable_auto_merge_parity(cwd: String, number: i64) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gh::gh_disable_auto_merge(cwd, number))
+}
+
+/// Parity entry point for `gl_enable_auto_merge`. Only a repo with no forge
+/// remote is checkable here (see the refusal test in `tests/parity/`): no
+/// test arms an auto-merge on a live MR.
+pub fn gl_enable_auto_merge_parity(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gitlab::gl_enable_auto_merge(cwd, iid, method))
+}
+
+/// Parity entry point for `gl_disable_auto_merge`.
+pub fn gl_disable_auto_merge_parity(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::block_on(commands::gitlab::gl_disable_auto_merge(cwd, iid))
 }
 
 pub fn snapshot_list_parity(cwd: String) -> Result<Vec<git::snapshot::SnapshotMeta>, String> {
@@ -462,11 +745,11 @@ pub fn run() {
             commands::ops::git_pull,
             commands::ops::git_fetch,
             commands::ops::git_merge,
-            commands::ops::git_merge_abort,
-            commands::ops::git_merge_continue,
+            commands::ops::git_operation_action,
             commands::read::git_repo_state,
-            commands::ops::git_rebase_action,
             commands::ops::git_interactive_rebase,
+            commands::ops::git_rebase_onto,
+            commands::ops::git_add_to_gitignore,
             commands::ops::git_discard,
             commands::read::git_show,
             commands::ops::git_branches,
@@ -489,8 +772,6 @@ pub fn run() {
             commands::scratch::scratch_worktree_discard,
             commands::ops::git_conflict_check,
             commands::ops::git_cherry_pick,
-            commands::ops::git_cherry_pick_abort,
-            commands::ops::git_cherry_pick_continue,
             commands::ops::git_stash_list,
             commands::ops::git_stash_apply,
             commands::ops::git_stash_drop,
@@ -506,6 +787,8 @@ pub fn run() {
             commands::gh::gh_branches,
             commands::gh::gh_checkout_pr,
             commands::gh::gh_merge_pr,
+            commands::gh::gh_enable_auto_merge,
+            commands::gh::gh_disable_auto_merge,
             commands::gh::gh_pr_detail,
             commands::gh::gh_pr_diff,
             commands::gh::gh_pr_checks,
@@ -542,6 +825,8 @@ pub fn run() {
             commands::azure::az_branches,
             commands::azure::az_create_pr,
             commands::azure::az_merge_pr,
+            commands::azure::az_enable_auto_merge,
+            commands::azure::az_disable_auto_merge,
             commands::azure::az_pr_ready,
             commands::azure::az_checkout_pr,
             commands::azure::az_pr_comments,
@@ -634,6 +919,8 @@ pub fn run() {
             commands::gitlab::gl_mr_annotations,
             commands::gitlab::gl_create_mr,
             commands::gitlab::gl_merge_mr,
+            commands::gitlab::gl_enable_auto_merge,
+            commands::gitlab::gl_disable_auto_merge,
             commands::gitlab::gl_checkout_mr,
             commands::gitlab::gl_convert_draft_to_ready,
             commands::gitlab::gl_mr_notes,
@@ -677,6 +964,26 @@ pub fn run() {
             commands::bitbucket::bb_pr_ci_checks,
             commands::bitbucket::bb_pr_annotations,
             commands::bitbucket::bb_convert_draft_to_ready,
+            commands::gitea::gitea_current_user,
+            commands::gitea::gitea_validate_token,
+            commands::gitea::gitea_list_prs,
+            commands::gitea::gitea_pr_count,
+            commands::gitea::gitea_get_pr,
+            commands::gitea::gitea_pr_diff,
+            commands::gitea::gitea_pr_status,
+            commands::gitea::gitea_pr_files,
+            commands::gitea::gitea_pr_comments,
+            commands::gitea::gitea_create_comment,
+            commands::gitea::gitea_update_comment,
+            commands::gitea::gitea_delete_comment,
+            commands::gitea::gitea_list_reviews,
+            commands::gitea::gitea_list_issues,
+            commands::gitea::gitea_reviewer_candidates,
+            commands::gitea::gitea_branches,
+            commands::gitea::gitea_create_pr,
+            commands::gitea::gitea_merge_pr,
+            commands::gitea::gitea_checkout_pr,
+            commands::gitea::gitea_convert_draft_to_ready,
             // ── MCP catalog ──
             commands::mcp_catalog::mcp_detect_configs,
             commands::mcp_catalog::mcp_read_config,
@@ -694,10 +1001,25 @@ pub fn run() {
             commands::terminal::terminal_write,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_close,
+            // ── v3.10.0 Live Repo FS watcher ──
+            commands::watcher::watch_repo_start,
+            commands::watcher::watch_repo_stop,
         ])
-        .on_window_event(|_window, event| {
+        // A reload (Vite full reload in dev, location.reload(), a restored
+        // crashed webview) leaves the previous document's watcher
+        // subscriptions behind: its `onUnmounted` never runs, so nothing calls
+        // `watch_repo_stop`, and the channel keeps "sending" into a document
+        // whose callback registry is gone. Reap them the moment the new page
+        // starts loading, before it re-subscribes.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                commands::watcher::stop_all_for_webview(webview.label());
+            }
+        })
+        .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 commands::terminal::terminal_close_all();
+                commands::watcher::stop_all_for_webview(window.label());
             }
         })
         .run(tauri::generate_context!())
@@ -1182,5 +1504,35 @@ mod tests {
             extract(" M src/auth.ts\n?? ignored.ts\n"),
             vec!["src/auth.ts"]
         );
+    }
+}
+
+#[cfg(test)]
+mod command_parity_tests {
+    use super::command_parity;
+
+    #[test]
+    fn refuses_a_command_it_does_not_know() {
+        let err = command_parity(
+            "git_not_a_command".to_string(),
+            serde_json::json!({ "cwd": "/tmp" }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("git_not_a_command"),
+            "error names the command: {err}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_call_missing_a_required_argument() {
+        // `git_merge` needs a branch; the dispatcher must say so rather than
+        // passing an empty string to git.
+        let err = command_parity(
+            "git_merge".to_string(),
+            serde_json::json!({ "cwd": "/tmp" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("branch"), "error names the missing arg: {err}");
     }
 }

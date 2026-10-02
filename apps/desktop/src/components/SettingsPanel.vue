@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from "vue";
+import { clampHistoryBudget } from "@gitwand/core";
+import { mergeLlmFallbackForSave } from "../utils/llmFallbackRc";
 import { useI18n } from "../composables/useI18n";
 import type { LocaleKey } from "../locales/en";
 import { useTierStats } from "../composables/useTierStats";
@@ -157,6 +159,9 @@ interface Settings {
   aiModelByProvider: Partial<Record<AIProvider, string>>;
   aiOllamaUrl: string;
   aiOllamaModel: string;
+  // v3.11.1 — send commit history for the conflicting lines with AI prompts.
+  aiHistoryEnabled: boolean;
+  aiHistoryBudgetTokens: number;
   // Review AI (E3, v3.6.0) — opt-in pre-review pass + PR summary settings.
   reviewAiPreReview: boolean;
   reviewAiConfidenceThreshold: number;
@@ -186,6 +191,10 @@ interface Settings {
   dockUnlocked: boolean;
   dockPosition: { x: number; y: number } | null;
   dockOrder: DockEntryId[];
+  // v3.11 — numeric confidence bar shared by every apply path (see useSettings)
+  resolution: {
+    minConfidenceScore: number;
+  };
   // Automation settings (v2.8)
   automations: {
     autoResolve: { enabled: boolean };
@@ -238,6 +247,8 @@ interface Settings {
   snapshotMaxCount: number;
   /** Opt-in: one-line AI summaries for snapshots in the timeline. */
   snapshotAiLabels: boolean;
+  /** Live Repo (v3.10.0): subscribe to filesystem events instead of polling. */
+  liveRepoWatcher: boolean;
 }
 
 const defaultSettings: Settings = {
@@ -266,6 +277,8 @@ const defaultSettings: Settings = {
   aiModelByProvider: {},
   aiOllamaUrl: "http://localhost:11434",
   aiOllamaModel: "codellama",
+  aiHistoryEnabled: true,
+  aiHistoryBudgetTokens: 1500,
   reviewAiPreReview: false,
   reviewAiConfidenceThreshold: 60,
   reviewAiMaxFindings: 15,
@@ -290,6 +303,7 @@ const defaultSettings: Settings = {
   dockUnlocked: false,
   dockPosition: null,
   dockOrder: [...DEFAULT_DOCK_ORDER],
+  resolution: { minConfidenceScore: 0 },
   automations: {
     autoResolve: { enabled: false },
     nightlyPull: { enabled: false, hour: 8, minute: 0 },
@@ -331,6 +345,7 @@ const defaultSettings: Settings = {
   snapshotRetentionDays: 14,
   snapshotMaxCount: 200,
   snapshotAiLabels: false,
+  liveRepoWatcher: true,
 };
 
 function loadSettings(): Settings {
@@ -1059,13 +1074,14 @@ async function saveLlmFallback() {
     // the llmFallback key. Endpoint is never persisted (cf. §1.0).
     const next = {
       ...llmFallbackRcCache.value,
-      llmFallback: {
+      // Keep the keys this panel does not edit (history opt-out, model, …).
+      llmFallback: mergeLlmFallbackForSave(llmFallbackRcCache.value.llmFallback, {
         enabled: llmFallback.value.enabled,
         provider: llmFallback.value.provider,
         minPostMergeScore: llmFallback.value.minPostMergeScore,
         contextLines: llmFallback.value.contextLines,
         minMode: llmFallback.value.minMode,
-      },
+      }),
     };
     await writeGitwandrc(props.cwd!, next);
     llmFallbackRcCache.value = next;
@@ -1848,6 +1864,17 @@ function deleteReleaseNoteTemplate(id: string) {
               <span>{{ t('settings.commitSignature') }}</span>
             </label>
             <span class="sp-hint">{{ t('settings.commitSignatureHint') }}</span>
+          </div>
+
+          <!-- Live repo watcher (v3.10.0) -->
+          <div class="sp-row sp-row--checkbox">
+            <label class="sp-checkbox-label" for="setting-live-repo-watcher">
+              <input id="setting-live-repo-watcher" type="checkbox" class="sp-checkbox"
+                :checked="settings.liveRepoWatcher"
+                @change="updateSetting('liveRepoWatcher', ($event.target as HTMLInputElement).checked)" />
+              <span>{{ t('settings.liveRepoWatcher') }}</span>
+            </label>
+            <span class="sp-hint">{{ t('settings.liveRepoWatcherHint') }}</span>
           </div>
 
           <!-- Blame diff algorithm -->
@@ -2755,6 +2782,35 @@ function deleteReleaseNoteTemplate(id: string) {
               </div>
             </template>
 
+            <!-- ─── AI history (v3.11.1) ─────────────────── -->
+            <div class="sp-section-divider sp-section-divider--inner"></div>
+            <div class="sp-group">
+              <div class="sp-group__head">
+                <div class="sp-group__head-text">
+                  <span class="sp-group__label">{{ t('settings.aiHistory.title') }}</span>
+                  <span class="sp-group__sublabel">{{ t('settings.aiHistory.hint') }}</span>
+                </div>
+              </div>
+
+              <div class="sp-row sp-row--checkbox">
+                <label class="sp-checkbox-label" for="setting-ai-history-enabled">
+                  <input id="setting-ai-history-enabled" type="checkbox" class="sp-checkbox"
+                    :checked="settings.aiHistoryEnabled"
+                    @change="updateSetting('aiHistoryEnabled', ($event.target as HTMLInputElement).checked)" />
+                  <span>{{ t('settings.aiHistory.enabled') }}</span>
+                </label>
+                <span class="sp-hint">{{ t('settings.aiHistory.enabledHint') }}</span>
+              </div>
+
+              <div v-if="settings.aiHistoryEnabled" class="sp-row">
+                <label class="sp-label" for="setting-ai-history-budget">{{ t('settings.aiHistory.budget') }}</label>
+                <input id="setting-ai-history-budget" class="sp-input mono" type="number" min="200" max="8000" step="100"
+                  :value="settings.aiHistoryBudgetTokens"
+                  @change="updateSetting('aiHistoryBudgetTokens', clampHistoryBudget(Number(($event.target as HTMLInputElement).value)))" />
+                <span class="sp-hint">{{ t('settings.aiHistory.budgetHint') }}</span>
+              </div>
+            </div>
+
             <!-- ─── Review AI (E3, v3.6.0) ─────────────────── -->
             <div class="sp-section-divider sp-section-divider--inner"></div>
             <div class="sp-group">
@@ -2841,6 +2897,36 @@ function deleteReleaseNoteTemplate(id: string) {
                   <span>{{ t('settings.commitReview.autoReReview') }}</span>
                 </label>
                 <span class="sp-hint">{{ t('settings.commitReview.autoReReviewHint') }}</span>
+              </div>
+            </div>
+
+            <!-- ─── Resolution confidence bar (v3.11) ──────── -->
+            <div class="sp-section-divider sp-section-divider--inner"></div>
+            <div class="sp-group">
+              <div class="sp-group__head">
+                <div class="sp-group__head-text">
+                  <span class="sp-group__label">{{ t('settings.resolution.title') }}</span>
+                  <span class="sp-group__sublabel">{{ t('settings.resolution.subtitle') }}</span>
+                </div>
+              </div>
+
+              <div class="sp-row">
+                <label class="sp-label" for="setting-min-confidence-score">
+                  {{ t('settings.resolution.minConfidenceScore') }}
+                </label>
+                <select
+                  id="setting-min-confidence-score"
+                  class="sp-select"
+                  :value="String(settings.resolution.minConfidenceScore)"
+                  @change="updateSetting('resolution', { minConfidenceScore: Number(($event.target as HTMLSelectElement).value) })"
+                >
+                  <option value="0">{{ t('settings.resolution.barOff') }}</option>
+                  <option value="60">60%</option>
+                  <option value="75">75%</option>
+                  <option value="90">90%</option>
+                  <option value="95">95%</option>
+                </select>
+                <span class="sp-hint">{{ t('settings.resolution.minConfidenceScoreHint') }}</span>
               </div>
             </div>
 

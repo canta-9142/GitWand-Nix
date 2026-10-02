@@ -33,6 +33,7 @@ import {
 
 import { c, printBanner, WAND } from "../ui.js";
 import { getConflictedFiles, detectMergeContext } from "../git.js";
+import { makeCliGitRunner, repoRelativePath } from "../git-runner.js";
 import { parseConcurrency, runPool } from "../concurrency.js";
 import { buildPartialContent } from "../partial-content.js";
 import { buildCIReport } from "../reporting.js";
@@ -42,6 +43,7 @@ import {
   buildResolveLlmOptions,
   findGitRoot,
   loadGitwandrcResolveGeneratedFiles,
+  loadGitwandrcMinConfidenceScore,
 } from "../llm-config.js";
 import {
   runRegeneration,
@@ -54,6 +56,22 @@ import { loadPersistedConventions } from "./conventions.js";
  * l'installeur (ou un ré-échantillonnage malheureux) — même garde que celle
  * appliquée en pass 1 avant toute écriture. */
 const RESIDUAL_MARKER_RE = /^(?:<{7}|={7}|>{7})/m;
+
+/**
+ * v3.11 — parse `--min-confidence-score`. Returns undefined for anything that
+ * is not a finite number in [0, 100], so an unusable value falls through to
+ * `.gitwandrc` and then to "bar off" rather than aborting the command.
+ */
+export function parseMinConfidenceScore(raw: unknown): number | undefined {
+  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
+  // `Number("")` is 0, which is in range and would read as a deliberate "off",
+  // silently overriding a bar the repo's .gitwandrc had set. A malformed flag
+  // must fall through to the config, not quietly beat it.
+  if (typeof raw === "string" && raw.trim() === "") return undefined;
+  const n = typeof raw === "number" ? raw : Number(raw.trim());
+  if (!Number.isFinite(n) || n < 0 || n > 100) return undefined;
+  return n;
+}
 
 export async function cmdResolve(
   files: string[],
@@ -79,6 +97,12 @@ export async function cmdResolve(
   // dépôt (`gitwand conventions`), si elles ont été dérivées. Jusqu'ici jamais
   // chargées ici : `options.conventions` restait toujours `undefined`, et la
   // précédence lot F de core ne pouvait donc jamais s'exercer depuis le CLI.
+  // v3.11 — numeric confidence bar. `--min-confidence-score` beats `.gitwandrc`,
+  // the same precedence `--resolve-generated` has. An unparsable or
+  // out-of-range flag value is ignored rather than fatal, so a typo leaves the
+  // bar off instead of silently setting it somewhere the user did not mean.
+  const minConfidenceScore: number | undefined =
+    parseMinConfidenceScore(flags["min-confidence-score"]) ?? loadGitwandrcMinConfidenceScore();
   const conventions = loadPersistedConventions(process.cwd());
   // accuracy lot C — contexte de merge : détecté depuis l'état .git ; null hors opération.
   // Rend déterministes les décisions qui en dépendent (versions modifiées des
@@ -86,6 +110,12 @@ export async function cmdResolve(
   const mergeContext = detectMergeContext();
   const concurrency = parseConcurrency(flags.concurrency);
   const llmFallbackEnabled = flags["llm-fallback"] === true;
+
+  // v3.11.1 — History queries (`git show :2:<path>`, `log -L …:<path>`) take
+  // repo-root-relative paths, so the runner runs from the root, not from the
+  // (possibly nested) directory the CLI was started in.
+  const historyRoot = llmFallbackEnabled ? (findGitRoot() ?? process.cwd()) : process.cwd();
+  const historyGitRunner = makeCliGitRunner(historyRoot);
 
   // v2.5 — LLM fallback opt-in. Bascule de `resolve()` vers `resolveAsync()`
   // et injecte un endpoint Node (fetch natif) qui wrap Claude / OpenAI / Ollama.
@@ -216,11 +246,13 @@ export async function cmdResolve(
     // — comportement v2.4 intact. Avec le flag, on passe par `resolveAsync()`
     // qui supporte le pattern `llm_proposed` (priorité 998 dans le core).
     const result: MergeResult = llmFallbackEnabled && llmCliConfig !== null
-      ? await resolveAsync(content, file, {
+      ? await resolveAsync(content, repoRelativePath(historyRoot, filePath) ?? file, {
           verbose: false,
           resolveWhitespace,
           resolveGeneratedFiles,
+          minConfidenceScore,
           mergeContext,
+          gitRunner: historyGitRunner,
           conventions,
           llmFallback: {
             ...buildResolveLlmOptions(llmCliConfig, llmFileConfig),
@@ -231,6 +263,7 @@ export async function cmdResolve(
           verbose: false,
           resolveWhitespace,
           resolveGeneratedFiles,
+          minConfidenceScore,
           mergeContext,
           conventions,
         });

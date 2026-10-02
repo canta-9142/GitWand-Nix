@@ -66,6 +66,37 @@ export async function ghPrFiles(repoPath: string, prNumber: number): Promise<str
   return res.json() as Promise<string[]>;
 }
 
+/**
+ * Forge-side auto-merge, v3.11.0. Two scopes: `AutoMergeSupport` is a
+ * property of the repository, `AutoMergeState` of one PR.
+ *
+ * `reason` is the forge's own text and is deliberately NOT translated: the
+ * i18n rule covers GitWand's copy, not messages a forge produces.
+ */
+export interface AutoMergeSupport {
+  supported: boolean;
+  reason: string | null;
+}
+
+export interface AutoMergeState {
+  armed: boolean;
+  available: boolean;
+  reason: string | null;
+}
+
+/** Fails closed: an absent descriptor never offers the action. */
+export const CLOSED_AUTO_MERGE: AutoMergeState = {
+  armed: false,
+  available: false,
+  reason: null,
+};
+
+/** Fails closed: an absent repo-level descriptor never offers the action. */
+export const UNSUPPORTED_AUTO_MERGE: AutoMergeSupport = {
+  supported: false,
+  reason: null,
+};
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -95,6 +126,8 @@ export interface PullRequest {
    * path (v2.16, Launchpad notification diff); 0 on the light sidebar list.
    */
   commentCount: number;
+  /** Forge-side auto-merge state for this PR (v3.11.0). */
+  autoMerge: AutoMergeState;
 }
 
 /**
@@ -142,6 +175,7 @@ export async function ghListPrs(
         merge_state_status: string;
         checks_rollup: string;
         comment_count: number;
+        autoMerge?: AutoMergeState;
       }>
     >("gh_list_prs", { cwd, state, limit, offset });
     return raw.map((pr) => ({
@@ -164,6 +198,7 @@ export async function ghListPrs(
       mergeStateStatus: pr.merge_state_status ?? "",
       checksRollup: pr.checks_rollup ?? "",
       commentCount: pr.comment_count ?? 0,
+      autoMerge: pr.autoMerge ?? CLOSED_AUTO_MERGE,
     }));
   }
   // Browser dev mode — call dev server. The dev-server endpoint doesn't
@@ -194,6 +229,7 @@ export async function ghListPrs(
     mergeStateStatus: pr.merge_state_status ?? "",
     checksRollup: pr.checks_rollup ?? "",
     commentCount: pr.comment_count ?? 0,
+    autoMerge: pr.autoMerge ?? CLOSED_AUTO_MERGE,
   }));
 }
 
@@ -356,6 +392,7 @@ export async function ghCreatePr(
       review_decision: string;
       merge_state_status: string;
       checks_rollup: string;
+      autoMerge?: AutoMergeState;
     }>("gh_create_pr", { cwd, title, body, base, baseRepo: baseRepo || null, draft, reviewers });
     return {
       number: raw.number,
@@ -377,6 +414,7 @@ export async function ghCreatePr(
       mergeStateStatus: raw.merge_state_status ?? "",
       checksRollup: raw.checks_rollup ?? "",
       commentCount: 0,
+      autoMerge: raw.autoMerge ?? CLOSED_AUTO_MERGE,
     };
   }
   // Browser dev mode — call dev server (uses GitHub REST API directly)
@@ -409,6 +447,7 @@ export async function ghCreatePr(
     mergeStateStatus: raw.merge_state_status ?? "",
     checksRollup: raw.checks_rollup ?? "",
     commentCount: raw.comment_count ?? 0,
+    autoMerge: raw.autoMerge ?? CLOSED_AUTO_MERGE,
   };
 }
 
@@ -472,6 +511,43 @@ export async function ghMergePr(cwd: string, number: number, method: string = "m
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ cwd, number, method }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
+/**
+ * Queue a PR to merge automatically once its required checks pass.
+ * @param method - "merge", "squash", or "rebase"
+ */
+export async function ghEnableAutoMerge(
+  cwd: string,
+  number: number,
+  method: string = "merge",
+): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gh_enable_auto_merge", { cwd, number, method });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gh-enable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number, method }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error);
+}
+
+/** Cancel a queued auto-merge on a PR. */
+export async function ghDisableAutoMerge(cwd: string, number: number): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gh_disable_auto_merge", { cwd, number });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gh-disable-auto-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, number }),
   });
   const data = await resp.json();
   if (data.error) throw new Error(data.error);
@@ -558,6 +634,14 @@ export interface PullRequestDetail {
    * and skip head-keyed invalidation/caching gracefully (v3.6.0).
    */
   headSha: string;
+  /** Forge-side auto-merge state for this PR (v3.11.0). */
+  autoMerge: AutoMergeState;
+  /**
+   * Repository-level auto-merge capability (v3.11.0). Detail-only: it is a
+   * per-repo administrative setting, not a per-PR fact, so the list view
+   * (`PullRequest`) has no reason to pay for it per row.
+   */
+  autoMergeSupport: AutoMergeSupport;
 }
 
 export interface CICheck {
@@ -650,6 +734,8 @@ export async function ghPrDetail(cwd: string, number: number): Promise<PullReque
       checks_status: string;
       can_merge: boolean | null;
       head_sha?: string;
+      autoMerge?: AutoMergeState;
+      autoMergeSupport?: AutoMergeSupport;
     }>("gh_pr_detail", { cwd, number });
     return {
       number: raw.number,
@@ -675,6 +761,8 @@ export async function ghPrDetail(cwd: string, number: number): Promise<PullReque
       checksStatus: raw.checks_status,
       canMerge: raw.can_merge ?? null,
       headSha: raw.head_sha ?? "",
+      autoMerge: raw.autoMerge ?? CLOSED_AUTO_MERGE,
+      autoMergeSupport: raw.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
     };
   }
   // Browser dev mode
@@ -691,6 +779,8 @@ export async function ghPrDetail(cwd: string, number: number): Promise<PullReque
     labels: raw.labels, reviewers: raw.reviewers, mergeable: raw.mergeable, checksStatus: raw.checks_status,
     canMerge: raw.can_merge ?? null,
     headSha: raw.head_sha ?? "",
+    autoMerge: raw.autoMerge ?? CLOSED_AUTO_MERGE,
+    autoMergeSupport: raw.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
   };
 }
 
@@ -1196,6 +1286,7 @@ function mapRawPr(pr: any): PullRequest {
     mergeStateStatus: pr.merge_state_status ?? "",
     checksRollup: pr.checks_rollup ?? "",
     commentCount: pr.comment_count ?? 0,
+    autoMerge: pr.autoMerge ?? CLOSED_AUTO_MERGE,
   };
 }
 
@@ -1249,6 +1340,8 @@ export async function azPrDetail(cwd: string, number: number): Promise<PullReque
       checksStatus: raw.checks_status,
       canMerge: raw.can_merge ?? null,
       headSha: raw.head_sha ?? "",
+      autoMerge: raw.autoMerge ?? CLOSED_AUTO_MERGE,
+      autoMergeSupport: raw.autoMergeSupport ?? UNSUPPORTED_AUTO_MERGE,
     };
   }
   throw new Error(AZURE_WEB_ONLY);
@@ -1307,6 +1400,22 @@ export async function azCreatePr(
 
 export async function azMergePr(cwd: string, number: number, method: string = "merge"): Promise<void> {
   if (isTauri()) return tauriInvoke<void>("az_merge_pr", { cwd, number, method });
+  throw new Error(AZURE_WEB_ONLY);
+}
+
+/** Queue this PR to merge once its checks pass (Azure "auto-complete"). */
+export async function azEnableAutoMerge(
+  cwd: string,
+  number: number,
+  method: string = "merge",
+): Promise<void> {
+  if (isTauri()) return tauriInvoke<void>("az_enable_auto_merge", { cwd, number, method });
+  throw new Error(AZURE_WEB_ONLY);
+}
+
+/** Cancel a queued auto-complete on a PR. */
+export async function azDisableAutoMerge(cwd: string, number: number): Promise<void> {
+  if (isTauri()) return tauriInvoke<void>("az_disable_auto_merge", { cwd, number });
   throw new Error(AZURE_WEB_ONLY);
 }
 

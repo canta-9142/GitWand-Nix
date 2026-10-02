@@ -29,6 +29,8 @@ import {
   azBranches,
   azCreatePr,
   azMergePr,
+  azEnableAutoMerge,
+  azDisableAutoMerge,
   azPrReady,
   azCheckoutPr,
   azPrComments,
@@ -137,6 +139,14 @@ export class AzureProvider implements ForgeProvider {
 
   mergePR(cwd: string, number: number, method: "merge" | "squash" | "rebase" = "merge"): Promise<void> {
     return azMergePr(cwd, number, method);
+  }
+
+  enableAutoMerge(cwd: string, number: number, method: "merge" | "squash" | "rebase" = "merge"): Promise<void> {
+    return azEnableAutoMerge(cwd, number, method);
+  }
+
+  disableAutoMerge(cwd: string, number: number): Promise<void> {
+    return azDisableAutoMerge(cwd, number);
   }
 
   checkoutPR(cwd: string, number: number): Promise<void> {

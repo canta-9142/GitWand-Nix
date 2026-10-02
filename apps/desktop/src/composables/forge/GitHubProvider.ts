@@ -24,6 +24,8 @@ import {
   ghCheckAnnotations,
   ghCreatePr,
   ghMergePr,
+  ghEnableAutoMerge,
+  ghDisableAutoMerge,
   ghCheckoutPr,
   ghPrComments,
   ghPrIssueComments,
@@ -135,6 +137,14 @@ export class GitHubProvider implements ForgeProvider {
 
   mergePR(cwd: string, number: number, method: "merge" | "squash" | "rebase" = "merge"): Promise<void> {
     return ghMergePr(cwd, number, method);
+  }
+
+  enableAutoMerge(cwd: string, number: number, method: "merge" | "squash" | "rebase" = "merge"): Promise<void> {
+    return ghEnableAutoMerge(cwd, number, method);
+  }
+
+  disableAutoMerge(cwd: string, number: number): Promise<void> {
+    return ghDisableAutoMerge(cwd, number);
   }
 
   checkoutPR(cwd: string, number: number): Promise<void> {

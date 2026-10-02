@@ -336,6 +336,11 @@ fn bb_pr_to_pr(pr: &serde_json::Value) -> PullRequest {
         merge_state_status: String::new(),
         checks_rollup: String::new(),
         comment_count: ji(pr, "comment_count"),
+        // Bitbucket has no forge-side merge-when-checks-pass, so there is no
+        // per-PR armed/available to derive (see `bb_auto_merge_support`,
+        // wired into `PullRequestDetail::auto_merge_support` below, for the
+        // repo-level "why not" the UI shows instead). Not a wiring gap.
+        auto_merge: Default::default(),
     }
 }
 
@@ -393,6 +398,9 @@ fn bb_pr_to_detail(pr: &serde_json::Value) -> PullRequestDetail {
         // unknown ⇒ UI gates on errors only.
         can_merge: None,
         head_sha: jdeep(pr, "source", "commit", "hash"),
+        // Same rationale as `bb_pr_to_pr`: no per-PR auto-merge state exists.
+        auto_merge: Default::default(),
+        auto_merge_support: bb_auto_merge_support(),
     }
 }
 
@@ -1434,5 +1442,33 @@ mod bb_list_issues_tests {
         assert_eq!(i.url, "https://bitbucket.org/o/r/issues/5");
         assert!(i.labels.is_empty());
         assert_eq!(i.milestone, "");
+    }
+}
+
+/// Bitbucket has no forge-side auto-merge. Static, and stated rather than
+/// inferred from an absent field, so the UI can explain instead of hiding.
+pub(crate) fn bb_auto_merge_support() -> crate::types::AutoMergeSupport {
+    crate::types::AutoMergeSupport {
+        supported: false,
+        reason: Some(
+            "Bitbucket has no merge-when-checks-pass equivalent. Merging immediately still works."
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod bb_auto_merge_tests {
+    use super::bb_auto_merge_support;
+
+    #[test]
+    fn bitbucket_is_unsupported_and_says_what_still_works() {
+        let s = bb_auto_merge_support();
+        assert!(!s.supported);
+        let reason = s.reason.expect("a reason, not a silent false");
+        assert!(
+            reason.contains("Merging immediately still works"),
+            "the message must say what DOES work, per the forgeUnsupported precedent"
+        );
     }
 }

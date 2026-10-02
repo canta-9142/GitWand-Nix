@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   parseGitwandrc,
+  DEFAULT_HISTORY_CONFIG,
   type GitWandrcConfig,
   type LlmFallbackConfig,
 } from "@gitwand/core";
@@ -78,6 +79,31 @@ export function loadGitwandrcLlmConfig(): GitWandrcConfig["llmFallback"] | null 
  * convention `generatedFiles` mesurée — voir `resolver/index.ts`, précédence
  * lot F). Même contrat tolérant que `loadGitwandrcLlmConfig` : ne throw jamais.
  */
+/**
+ * v3.11 — the repo's numeric confidence bar from `.gitwandrc`, if it sets one.
+ *
+ * `--min-confidence-score` on the command line wins over this, the same
+ * precedence `--resolve-generated` has over `resolveGeneratedFiles`.
+ */
+export function loadGitwandrcMinConfidenceScore(): number | undefined {
+  const repoRoot = findGitRoot();
+  if (repoRoot === null) return undefined;
+
+  for (const filename of [".gitwandrc", ".gitwandrc.json"]) {
+    const path = join(repoRoot, filename);
+    let content: string;
+    try {
+      content = readFileSync(path, "utf-8");
+    } catch {
+      continue;
+    }
+    const parsed = parseGitwandrc(content);
+    if (parsed === null) continue;
+    return parsed.minConfidenceScore;
+  }
+  return undefined;
+}
+
 export function loadGitwandrcResolveGeneratedFiles(): boolean | undefined {
   const repoRoot = findGitRoot();
   if (repoRoot === null) return undefined;
@@ -188,6 +214,9 @@ export function buildResolveLlmOptions(
   if (fileConfig?.contextLines !== undefined) out.contextLines = fileConfig.contextLines;
   if (fileConfig?.minPostMergeScore !== undefined) out.minPostMergeScore = fileConfig.minPostMergeScore;
   if (fileConfig?.minMode !== undefined) out.minMode = fileConfig.minMode;
+
+  // v3.11.1 — history-aware prompts: on by default, `.gitwandrc` may turn off / resize.
+  out.history = { ...DEFAULT_HISTORY_CONFIG, ...(fileConfig?.history ?? {}) };
 
   return out;
 }

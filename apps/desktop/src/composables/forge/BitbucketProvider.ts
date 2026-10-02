@@ -48,6 +48,7 @@ import {
 } from "../../utils/backend";
 import { ghPrConflictPreview, ghPrHotspots } from "../../utils/backend";
 
+import { ForgeNotImplementedError } from "./types";
 import type {
   ForgeProvider,
   ForgeName,
@@ -160,6 +161,22 @@ export class BitbucketProvider implements ForgeProvider {
     method: "merge" | "squash" | "rebase" = "merge",
   ): Promise<void> {
     return bbMergePr(cwd, number, method);
+  }
+
+  /** Single throw site for capabilities Bitbucket's API has no equivalent
+   *  for, mirrors CursorProvider's `unsupported()`. */
+  private unsupported(method: string): never {
+    throw new ForgeNotImplementedError("bitbucket", method);
+  }
+
+  /** Bitbucket Cloud has no forge-side "merge when checks pass": its PR
+   *  API has no auto-merge/merge-on-pipeline-success equivalent. */
+  enableAutoMerge(_cwd: string, _number: number, _method?: "merge" | "squash" | "rebase"): Promise<void> {
+    this.unsupported("enableAutoMerge");
+  }
+
+  disableAutoMerge(_cwd: string, _number: number): Promise<void> {
+    this.unsupported("disableAutoMerge");
   }
 
   checkoutPR(cwd: string, number: number): Promise<void> {

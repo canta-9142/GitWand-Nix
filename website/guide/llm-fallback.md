@@ -90,6 +90,74 @@ A repo administrator who wants to **forbid** the fallback across the team can sh
 
 ---
 
+## Commit history in the prompt (v3.11.1)
+
+Since v3.11.1, the core `llm_proposed` fallback and the desktop's "Resolve with AI" / "Resolve All with AI" send the model more than the hunk itself: for each side of the conflict, GitWand looks at the commits **since the merge base** that touched the conflicting lines, and includes their messages — and, budget allowing, the diff of the range those commits cover. The idea is to let the model argue from *why* each side changed the code, not just from the code as it stands. Blaming the conflicted working tree is not useful (every line comes back "Not Committed Yet"), so this runs revision-scoped `git log` queries instead, entirely locally.
+
+This is on by default and adds itself as a new section between "Context" and "Conflict hunk to resolve" in the prompt, right above the conflict itself:
+
+```
+## Why each side changed these lines (since merge-base abc1234):
+### ours (HEAD)
+- def5678 2026-09-10 Alice: Extract retry policy
+  <commit body>
+  <range diff>
+### theirs (MERGE_HEAD)
+History unavailable: no commit changed these lines since the merge base.
+```
+
+For a cherry-pick, "theirs" is not compared against the merge base — git itself doesn't — but against the parent of the commit being applied, so the section shows exactly that one commit, the one actually being cherry-picked. For a revert, "theirs" is the commit being reverted: the section shows its message, without a range diff (the version of the file git stages for that side is the one from before that commit, so a line-range query could not be aligned with it).
+
+A commit that only moved or re-indented the lines is left out, since its diff says nothing about intent. If such reformatting is all a side did to those lines, the section keeps the newest of those commits — its subject, without the diff — rather than claiming that nothing changed them.
+
+### Turning it off or tuning the budget
+
+Both the master `llmFallback.enabled` switch and the history behaviour live in the same `.gitwandrc` block:
+
+```jsonc
+{
+  "llmFallback": {
+    "enabled": true,
+    "history": {
+      "enabled": true,       // default true
+      "budgetTokens": 1500   // default 1500, clamped to 200–8000
+    }
+  }
+}
+```
+
+`budgetTokens` is an estimate (roughly `chars / 4`, there is no tokenizer in the repo) of how much of the prompt this section is allowed to occupy. Any value outside 200–8000 is clamped to the nearest bound.
+
+The desktop app exposes the same two knobs under **Settings → AI** (`aiHistoryEnabled`, `aiHistoryBudgetTokens`), for when you'd rather not hand-edit `.gitwandrc`. **Precedence:** if `.gitwandrc` sets `"history": {"enabled": false}`, that wins over the desktop setting — a repository can forbid sending its history to an AI provider even for developers who have the desktop toggle on. Otherwise the desktop Settings value applies, and a `budgetTokens` present in `.gitwandrc` also overrides the app's value. The CLI only reads `.gitwandrc` — it has no separate setting.
+
+### Truncation order
+
+When the rendered section would exceed `budgetTokens`, GitWand trims it in this order, stopping as soon as it fits:
+
+1. Drop each commit's range diff, oldest commit first — the newest commit's diff on each side is the last one dropped.
+2. Drop commit bodies, oldest first.
+3. Drop whole commits, oldest first.
+
+The newest commit's short SHA and subject line on each side that has history are never dropped, and neither is an "unavailable" line — those alone are at most a few dozen tokens, and are still sent even if that pushes the section over budget (the trace then reports it as truncated).
+
+### When history is unavailable
+
+Not every conflict has useful history to offer — a brand-new file, an unrelated-histories merge, a side that only deleted the block, or a git query that timed out (2 seconds per hunk). Rather than sending nothing and pretending the history simply wasn't checked, GitWand says so explicitly on that side with a **"History unavailable: …"** line naming the reason, one of:
+
+- "no commit changed these lines since the merge base"
+- "the two sides share no merge base"
+- "this side removed these lines, and no commit since the merge base explains it"
+- "these lines could not be located in this side's version of the file"
+- "the commits of the operation could not be identified"
+- "git did not answer in time"
+- "git could not read this side's history"
+
+If neither side has usable history, the whole section still appears, made up only of these lines, so the model knows the omission was deliberate rather than an oversight.
+
+The [audit trail](#audit-trail)'s `LlmTrace` gains a `history` field summarising what was sent (commit count, estimated tokens, whether it was truncated, or why it's unavailable), and in the desktop app the `LlmTracePanel` above each `llm_proposed` hunk shows a one-line summary, for example "History: 4 commits (≈900 tokens), truncated" or "History: not sent" when the feature is disabled.
+
+---
+
 ## Supported providers
 
 `@gitwand/core` itself is agnostic — it calls a single `endpoint.call(prompt): Promise<string>` injected by the consumer. The matrix below describes what each provider needs to work and where the traffic goes.
@@ -155,7 +223,7 @@ The LLM is wrong sometimes. GitWand assumes you will catch it before commit.
 
 ### Will my code be sent to Anthropic, OpenAI, or anyone else?
 
-Only if you pick one of those as your provider, and only the hunks that GitWand could not resolve with deterministic patterns. The payload is the conflict (base, ours, theirs) plus ±50 lines of surrounding context. No file paths outside the hunk, no other files in the repo, no Git history, no credentials. If you pick Ollama or self-hosted MCP, nothing leaves your machine.
+Only if you pick one of those as your provider, and only the hunks that GitWand could not resolve with deterministic patterns. The payload is the conflict (base, ours, theirs) plus ±50 lines of surrounding context. No file paths outside the hunk, no other files in the repo, no credentials. Since v3.11.1 it also includes, for each side, the messages (and, budget allowing, the range diffs) of the commits since the merge base that touched the conflicting lines — see [Commit history in the prompt](#commit-history-in-the-prompt-v3-11-1) to turn that off. If you pick Ollama or self-hosted MCP, nothing leaves your machine.
 
 ### How much does it cost?
 
