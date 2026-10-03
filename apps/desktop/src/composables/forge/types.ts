@@ -26,6 +26,8 @@ import type {
   PrFileHistory,
   ReviewerCandidate,
   Issue,
+  AutoMergeState,
+  AutoMergeSupport,
 } from "../../utils/backend";
 import type { Account } from "../useAccounts";
 
@@ -45,6 +47,8 @@ export type {
   ReviewerCandidate,
   Issue,
   Account,
+  AutoMergeState,
+  AutoMergeSupport,
 };
 
 // ─── Options / Inputs ───────────────────────────────────────────────────────
@@ -89,7 +93,7 @@ export interface SubmitReviewOptions {
 
 // ─── Forge name discriminant ────────────────────────────────────────────────
 
-export type ForgeName = "github" | "gitlab" | "bitbucket" | "azure" | "cursor" | "unknown";
+export type ForgeName = "github" | "gitlab" | "bitbucket" | "azure" | "cursor" | "gitea" | "unknown";
 
 // ─── Forge web bases ────────────────────────────────────────────────────────
 
@@ -202,6 +206,19 @@ export interface ForgeProvider {
   createPR(cwd: string, input: CreatePRInput): Promise<PullRequest>;
 
   mergePR(cwd: string, number: number, method?: "merge" | "squash" | "rebase"): Promise<void>;
+
+  /**
+   * Queue this PR to merge automatically once its required checks pass
+   * (v3.11.0): GitHub "auto-merge", GitLab "merge when pipeline succeeds",
+   * Azure "auto-complete". `method` mirrors `mergePR`'s and defaults the same
+   * way. Providers with no forge-side equivalent (Bitbucket, Cursor) throw
+   * `ForgeNotImplementedError`.
+   */
+  enableAutoMerge(cwd: string, number: number, method?: "merge" | "squash" | "rebase"): Promise<void>;
+
+  /** Cancel a previously queued auto-merge. Same unsupported contract as
+   *  `enableAutoMerge`. */
+  disableAutoMerge(cwd: string, number: number): Promise<void>;
 
   checkoutPR(cwd: string, number: number): Promise<void>;
 

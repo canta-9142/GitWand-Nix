@@ -169,6 +169,7 @@ fn gl_mr_to_pr(mr: &serde_json::Value) -> PullRequest {
         merge_state_status: js(mr, "merge_status"),
         checks_rollup: String::new(),
         comment_count: ji(mr, "user_notes_count"),
+        auto_merge: gl_auto_merge_state_from_list(mr),
     }
 }
 
@@ -262,6 +263,15 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
             .and_then(|s| s.as_str())
             .map(String::from)
             .unwrap_or_else(|| js(mr, "sha")),
+        auto_merge: gl_auto_merge_state(mr),
+        // GitLab has no repository-level auto-merge gate (unlike GitHub's
+        // "Allow auto-merge" repo setting): any MR can request it, subject
+        // only to the per-MR pipeline precondition `gl_auto_merge_state`
+        // already checks.
+        auto_merge_support: crate::types::AutoMergeSupport {
+            supported: true,
+            reason: None,
+        },
     }
 }
 
@@ -1091,21 +1101,44 @@ pub(crate) async fn gl_create_mr(
     .map_err(|e| e.to_string())?
 }
 
-/// Merge a MR using `glab mr merge`.
+/// Build the `glab mr merge` argument vector for `gl_merge_mr_inner`.
 ///
 /// `method` accepts "merge" (default), "squash", "rebase".
-#[tauri::command]
-fn gl_merge_mr_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+///
+/// Uses `--remove-source-branch`, not `--delete-source-branch`: the latter is
+/// not a recognised `glab` flag at all (verified against the installed
+/// `glab` 1.117.0: `glab mr merge --delete-source-branch 1` fails with
+/// "ERROR Unknown flag: --delete-source-branch." before doing anything, while
+/// `glab mr merge --help` lists `-d, --remove-source-branch`). Every GitLab
+/// merge from GitWand failed on this until fixed. Pulled out of
+/// `gl_merge_mr_inner` so the argument list can be pinned by a test, the same
+/// shape as `gl_state_flag` (issue #138).
+///
+/// Also passes `--auto-merge=false`: `glab mr merge --help` on the installed
+/// 1.117.0 binary states "When a pipeline is running, auto-merge is enabled
+/// by default. Pass `--auto-merge=false` to merge immediately", and lists
+/// `--auto-merge (true)`. This is the immediate-merge path, distinct from
+/// `gl_enable_auto_merge_args`'s schedule-merge path above, so without this
+/// flag a MR with a running pipeline would silently defer instead of merge,
+/// indistinguishable from scheduling it.
+fn gl_merge_args(iid: i64, method: &str) -> Vec<String> {
     let mut args: Vec<String> = vec!["mr".to_string(), "merge".to_string(), iid.to_string()];
 
-    match method.as_str() {
+    match method {
         "squash" => args.push("--squash".to_string()),
         "rebase" => args.push("--rebase".to_string()),
         _ => {} // default merge
     }
 
     args.push("--yes".to_string());
-    args.push("--delete-source-branch".to_string());
+    args.push("--remove-source-branch".to_string());
+    args.push("--auto-merge=false".to_string());
+    args
+}
+
+#[tauri::command]
+fn gl_merge_mr_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    let args = gl_merge_args(iid, &method);
 
     let mut cmd = hidden_cmd("glab");
     cmd.args(&args).current_dir(&cwd);
@@ -1124,6 +1157,126 @@ fn gl_merge_mr_inner(cwd: String, iid: i64, method: String) -> Result<(), String
 #[tauri::command]
 pub(crate) async fn gl_merge_mr(cwd: String, iid: i64, method: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || gl_merge_mr_inner(cwd, iid, method))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Queue this MR to merge when its pipeline succeeds.
+///
+/// `--when-pipeline-succeeds` is deprecated in current `glab` (renamed to
+/// `--auto-merge`, verified against the installed 1.117.0 binary's `glab mr
+/// merge --help`), but it is still accepted, and it is the only spelling that
+/// also works on the older `glab` releases that never got the `--auto-merge`
+/// rename, so it stays the safer choice here given this module does not pin
+/// a `glab` version. It is a no-op without a running pipeline, which is why
+/// `gl_auto_merge_state` reports `available: false` in that case: the button
+/// is hidden rather than offered and refused.
+///
+/// Unlike `gh_enable_auto_merge_inner`, there is no token/REST path: like
+/// `gl_merge_mr_inner` above, this is `glab`-only.
+///
+/// Uses `--remove-source-branch`, the same flag `gl_merge_mr_inner` now
+/// builds via `gl_merge_args`: `--delete-source-branch` is not a recognised
+/// `glab` flag at all, verified against the installed `glab` 1.117.0, which
+/// rejects it with "Unknown flag" before even reaching remote resolution.
+///
+/// Extracted into `gl_enable_auto_merge_args` so the exact flag order can be
+/// pinned by a test rather than only exercised at runtime, the same shape as
+/// `gl_merge_args` (commit 5425a10).
+fn gl_enable_auto_merge_args(iid: i64, method: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "mr".to_string(),
+        "merge".to_string(),
+        iid.to_string(),
+        "--when-pipeline-succeeds".to_string(),
+    ];
+    match method {
+        "squash" => args.push("--squash".to_string()),
+        "rebase" => args.push("--rebase".to_string()),
+        _ => {} // default merge
+    }
+    args.push("--yes".to_string());
+    args.push("--remove-source-branch".to_string());
+    args
+}
+
+fn gl_enable_auto_merge_inner(cwd: String, iid: i64, method: String) -> Result<(), String> {
+    let args = gl_enable_auto_merge_args(iid, &method);
+
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
+        .map_err(|e| format!("glab mr merge --when-pipeline-succeeds: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "glab mr merge --when-pipeline-succeeds failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn gl_enable_auto_merge(
+    cwd: String,
+    iid: i64,
+    method: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_enable_auto_merge_inner(cwd, iid, method))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Cancel a queued merge-when-pipeline-succeeds.
+///
+/// `glab mr update` has no unset-auto-merge flag in any version checked
+/// (confirmed against the installed 1.117.0 binary's `glab mr update --help`:
+/// only `--remove-source-branch`/`--squash-before-merge` toggles exist, no
+/// auto-merge equivalent). GitLab does not expose this as an attribute of the
+/// merge request update endpoint either: `merge_when_pipeline_succeeds=false`
+/// on `PUT projects/:id/merge_requests/:iid` is silently ignored, since that
+/// attribute does not exist there. GitLab's own docs give it a dedicated
+/// route instead: `POST
+/// projects/:id/merge_requests/:merge_request_iid/cancel_merge_when_pipeline_succeeds`,
+/// which returns 201 on success and 406 when the MR cannot be cancelled (no
+/// pending auto-merge to cancel). No request body, so no `-f` flag.
+///
+/// Extracted so the exact route (and the absence of a `-f` body flag) can be
+/// pinned by a test rather than only exercised at runtime, the same shape as
+/// `gl_merge_args`.
+fn gl_disable_auto_merge_args(iid: i64) -> Vec<String> {
+    let endpoint = format!(
+        "projects/:fullpath/merge_requests/{}/cancel_merge_when_pipeline_succeeds",
+        iid
+    );
+    vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        endpoint,
+    ]
+}
+
+fn gl_disable_auto_merge_inner(cwd: String, iid: i64) -> Result<(), String> {
+    let args = gl_disable_auto_merge_args(iid);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(&args).current_dir(&cwd);
+    let output = output_with_timeout(cmd, GLAB_TIMEOUT)
+        .map_err(|e| format!("glab api cancel_merge_when_pipeline_succeeds: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "glab api cancel_merge_when_pipeline_succeeds failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn gl_disable_auto_merge(cwd: String, iid: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_disable_auto_merge_inner(cwd, iid))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -2172,5 +2325,391 @@ mod gl_mr_diff_args_tests {
     #[test]
     fn includes_the_raw_flag() {
         assert_eq!(gl_mr_diff_args(42), vec!["mr", "diff", "42", "--raw"]);
+    }
+}
+
+/// Whether an auto-merge is queued on a GitLab merge-request JSON object.
+///
+/// Two spellings of the same flag: `merge_when_pipeline_succeeds` is the
+/// historical name, `auto_merge_enabled` the 17.x one. Either arms.
+///
+/// Shared by `gl_auto_merge_state` (detail) and `gl_auto_merge_state_from_list`
+/// (list) so the two can never disagree on this one fact even though they
+/// disagree on `available`: factored out rather than copied so the OR
+/// expression can't drift between the two call sites.
+fn gl_auto_merge_armed(mr: &serde_json::Value) -> bool {
+    mr.get("merge_when_pipeline_succeeds")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || mr
+            .get("auto_merge_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+}
+
+/// Per-MR auto-merge state from a GitLab **single-MR** (detail) response.
+///
+/// The precondition is a pipeline: merge-when-pipeline-succeeds has nothing
+/// to wait for without one, and GitLab refuses the call. `pipeline` /
+/// `head_pipeline` are confirmed present on this endpoint (verified against
+/// gitlab-org/gitlab, inkscape/inkscape and gitlab-org/cli, 2026-09-14):
+/// this is the ONLY of the two entry points allowed to read that key, see
+/// `gl_auto_merge_state_from_list` for the list endpoint's answer.
+fn gl_auto_merge_state(mr: &serde_json::Value) -> crate::types::AutoMergeState {
+    let armed = gl_auto_merge_armed(mr);
+    let has_pipeline = mr.get("pipeline").is_some_and(|v| !v.is_null())
+        || mr.get("head_pipeline").is_some_and(|v| !v.is_null());
+    crate::types::AutoMergeState {
+        armed,
+        available: has_pipeline,
+        reason: if has_pipeline {
+            None
+        } else {
+            Some("No pipeline is running for this merge request.".to_string())
+        },
+    }
+}
+
+/// Per-MR auto-merge state from a GitLab merge-requests **list** response.
+///
+/// GitLab's `/merge_requests` list payload carries `merge_when_pipeline_succeeds`
+/// but NOT `pipeline` or `head_pipeline` (verified 2026-09-14 against three
+/// public projects: gitlab-org/gitlab, inkscape/inkscape, gitlab-org/cli),
+/// so the pipeline precondition `gl_auto_merge_state` checks is unknowable
+/// here. Reporting `available: false` with "no pipeline running" would be a
+/// false statement about the MR (a pipeline may well be running); instead
+/// this reports the real cause; still fails closed (no button offered) so no
+/// surface promises an action it cannot complete from list data alone.
+fn gl_auto_merge_state_from_list(mr: &serde_json::Value) -> crate::types::AutoMergeState {
+    crate::types::AutoMergeState {
+        armed: gl_auto_merge_armed(mr),
+        available: false,
+        reason: Some("Open this merge request to check whether it can be scheduled.".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod gl_auto_merge_tests {
+    use super::{gl_auto_merge_state, gl_auto_merge_state_from_list};
+
+    #[test]
+    fn an_mr_with_merge_when_pipeline_succeeds_is_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": true,
+                "pipeline": {"id": 9, "status": "running"}}"#,
+        )
+        .unwrap();
+        let s = gl_auto_merge_state(&v);
+        assert!(s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn an_mr_with_a_running_pipeline_is_available_but_not_armed() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": false,
+                "pipeline": {"id": 9, "status": "running"}}"#,
+        )
+        .unwrap();
+        let s = gl_auto_merge_state(&v);
+        assert!(!s.armed);
+        assert!(s.available);
+    }
+
+    #[test]
+    fn an_mr_with_no_pipeline_is_unavailable_with_a_reason() {
+        // GitLab's merge-when-pipeline-succeeds needs a pipeline to succeed.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"iid": 3, "merge_when_pipeline_succeeds": false}"#).unwrap();
+        let s = gl_auto_merge_state(&v);
+        assert!(!s.available);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("No pipeline is running for this merge request.")
+        );
+    }
+
+    #[test]
+    fn a_null_pipeline_reads_the_same_as_an_absent_one() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": false, "pipeline": null}"#,
+        )
+        .unwrap();
+        assert!(!gl_auto_merge_state(&v).available);
+    }
+
+    #[test]
+    fn the_newer_auto_merge_enabled_field_is_honoured_when_present() {
+        // GitLab 17.x renamed the flag. Both spellings must arm.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "auto_merge_enabled": true, "pipeline": {"status": "running"}}"#,
+        )
+        .unwrap();
+        assert!(gl_auto_merge_state(&v).armed);
+    }
+
+    #[test]
+    fn the_newer_field_arms_even_when_the_legacy_field_is_false() {
+        // GitLab's 17.x deprecation window can send both spellings on the
+        // same MR, with the old one explicitly false. `Option::or_else`
+        // only substitutes on `None`, never on `Some(false)`, so a naive
+        // fallback would let the legacy `false` mask the new `true` and
+        // read the MR as not armed. Either spelling being true must arm.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": false, "auto_merge_enabled": true,
+                "pipeline": {"status": "running"}}"#,
+        )
+        .unwrap();
+        assert!(gl_auto_merge_state(&v).armed);
+    }
+
+    #[test]
+    fn the_list_variant_reports_unavailable_with_the_real_reason_not_no_pipeline() {
+        // GitLab's list endpoint carries `merge_when_pipeline_succeeds` but not
+        // `pipeline`/`head_pipeline` (verified 2026-09-14). Claiming "no
+        // pipeline is running" here would be a false statement about the MR.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"iid": 3, "merge_when_pipeline_succeeds": true}"#).unwrap();
+        let s = gl_auto_merge_state_from_list(&v);
+        assert!(s.armed);
+        assert!(!s.available);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("Open this merge request to check whether it can be scheduled.")
+        );
+    }
+
+    #[test]
+    fn the_list_and_detail_variants_agree_on_armed_for_the_same_input() {
+        // Pins the shared gl_auto_merge_armed helper against drift: whatever
+        // the two variants disagree on (`available`), `armed` must always
+        // match between them for identical input.
+        let armed_input: serde_json::Value = serde_json::from_str(
+            r#"{"iid": 3, "merge_when_pipeline_succeeds": true, "pipeline": {"status": "running"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gl_auto_merge_state(&armed_input).armed,
+            gl_auto_merge_state_from_list(&armed_input).armed
+        );
+        assert!(gl_auto_merge_state_from_list(&armed_input).armed);
+
+        let not_armed_input: serde_json::Value =
+            serde_json::from_str(r#"{"iid": 3, "merge_when_pipeline_succeeds": false}"#).unwrap();
+        assert_eq!(
+            gl_auto_merge_state(&not_armed_input).armed,
+            gl_auto_merge_state_from_list(&not_armed_input).armed
+        );
+        assert!(!gl_auto_merge_state_from_list(&not_armed_input).armed);
+    }
+}
+
+/// Regression coverage for `gl_merge_args`: `glab mr merge` has no
+/// `--delete-source-branch` flag at all. `glab` rejects it outright with
+/// "Unknown flag: --delete-source-branch." before doing anything, so every
+/// GitLab merge from GitWand failed until this was caught. The correct flag
+/// is `--remove-source-branch` (`glab mr merge --help`'s `-d,
+/// --remove-source-branch  Remove source branch on merge.`).
+#[cfg(test)]
+mod gl_merge_args_tests {
+    use super::gl_merge_args;
+
+    #[test]
+    fn default_merge_uses_the_remove_source_branch_flag() {
+        assert_eq!(
+            gl_merge_args(7, "merge"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--yes",
+                "--remove-source-branch",
+                "--auto-merge=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn squash_adds_the_squash_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_merge_args(7, "squash"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--squash",
+                "--yes",
+                "--remove-source-branch",
+                "--auto-merge=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn rebase_adds_the_rebase_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_merge_args(7, "rebase"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--rebase",
+                "--yes",
+                "--remove-source-branch",
+                "--auto-merge=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_method_falls_back_to_a_plain_merge() {
+        assert_eq!(
+            gl_merge_args(7, "bogus"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--yes",
+                "--remove-source-branch",
+                "--auto-merge=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn never_emits_the_delete_source_branch_flag_glab_rejects_outright() {
+        let args = gl_merge_args(7, "merge");
+        assert!(!args.iter().any(|a| a == "--delete-source-branch"));
+        assert!(args.iter().any(|a| a == "--remove-source-branch"));
+    }
+
+    /// `glab mr merge --help` on 1.117.0: "When a pipeline is running,
+    /// auto-merge is enabled by default. Pass `--auto-merge=false` to merge
+    /// immediately", flag list shows `--auto-merge (true)`. Without this
+    /// flag, "Merge" on a MR with a running pipeline silently defers instead
+    /// of merging, indistinguishable from "Schedule merge".
+    #[test]
+    fn passes_auto_merge_false_so_merge_is_immediate_even_with_a_running_pipeline() {
+        assert_eq!(
+            gl_merge_args(7, "merge"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--yes",
+                "--remove-source-branch",
+                "--auto-merge=false",
+            ]
+        );
+    }
+}
+
+/// Regression coverage for `gl_enable_auto_merge_args`: pins the exact
+/// `glab mr merge --when-pipeline-succeeds` argument vector per merge
+/// method, the same precedent as `gl_merge_args_tests` above (issue: this
+/// argv used to be built inline with no test at all).
+#[cfg(test)]
+mod gl_enable_auto_merge_args_tests {
+    use super::gl_enable_auto_merge_args;
+
+    #[test]
+    fn default_merge_uses_when_pipeline_succeeds_and_remove_source_branch() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "merge"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn squash_adds_the_squash_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "squash"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--squash",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn rebase_adds_the_rebase_flag_before_yes_and_remove_source_branch() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "rebase"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--rebase",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_method_falls_back_to_a_plain_merge() {
+        assert_eq!(
+            gl_enable_auto_merge_args(7, "bogus"),
+            vec![
+                "mr",
+                "merge",
+                "7",
+                "--when-pipeline-succeeds",
+                "--yes",
+                "--remove-source-branch",
+            ]
+        );
+    }
+
+    #[test]
+    fn never_emits_the_delete_source_branch_flag_glab_rejects_outright() {
+        let args = gl_enable_auto_merge_args(7, "merge");
+        assert!(!args.iter().any(|a| a == "--delete-source-branch"));
+        assert!(args.iter().any(|a| a == "--remove-source-branch"));
+    }
+}
+
+/// Regression coverage for `gl_disable_auto_merge_args`: GitLab has no
+/// `merge_when_pipeline_succeeds` attribute on the merge request update
+/// endpoint, only a dedicated `cancel_merge_when_pipeline_succeeds` route,
+/// with no request body.
+#[cfg(test)]
+mod gl_disable_auto_merge_args_tests {
+    use super::gl_disable_auto_merge_args;
+
+    #[test]
+    fn posts_to_the_dedicated_cancel_route_with_no_body_flag() {
+        assert_eq!(
+            gl_disable_auto_merge_args(7),
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "projects/:fullpath/merge_requests/7/cancel_merge_when_pipeline_succeeds",
+            ]
+        );
+    }
+
+    #[test]
+    fn never_sends_the_nonexistent_update_attribute() {
+        let args = gl_disable_auto_merge_args(7);
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("merge_when_pipeline_succeeds=")));
+        assert!(!args.iter().any(|a| a == "-f"));
+        assert!(!args.iter().any(|a| a == "PUT"));
     }
 }

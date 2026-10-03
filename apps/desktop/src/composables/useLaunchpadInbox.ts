@@ -37,13 +37,13 @@ export type InboxCase =
 
 export type InboxAction =
   | "merge"
+  | "auto-merge" // queue the forge-side merge for once checks/reviews clear (v3.11.0)
   | "review"
   | "seeFailure"
   | "reply"
   | "resolve"
   | "follow"
   | "nudge"
-  | "autoMerge"
   | "view";       // open an issue / dep / assigned PR
 
 /** Discriminated union of items that can appear in the unified inbox. */
@@ -86,6 +86,22 @@ function isDependencyBump(pr: PrWithRepo): boolean {
   return botPattern.test(pr.author) || pr.labels.some((l) => l.toLowerCase() === "dependencies");
 }
 
+/** A PR awaiting review is "stale" past this age with no reviewer activity. */
+const NUDGE_STALE_MS = 3 * 24 * 60 * 60 * 1000;
+
+/**
+ * A PR is nudge-worthy when it still has reviewers explicitly requested (the
+ * requested reviewers clear from this list the moment they submit a review,
+ * so a non-empty list means none of them has acted yet) and `updatedAt` (the
+ * best available proxy for "last activity") hasn't moved in `NUDGE_STALE_MS`.
+ */
+function isStaleAwaitingReview(pr: PrWithRepo): boolean {
+  if (pr.reviewRequested.length === 0) return false;
+  const updated = Date.parse(pr.updatedAt);
+  if (Number.isNaN(updated)) return false;
+  return Date.now() - updated >= NUDGE_STALE_MS;
+}
+
 /**
  * Classify a single PR into a tier + case + action from the viewpoint of `me`.
  * Returns `null` when the PR needs no action from `me` (so it stays out of the inbox).
@@ -103,7 +119,25 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
   // classified as kind:"dep" if they surface to me at all — i.e.
   // if I own the PR, my review was requested, or I am an assignee.
   if (isDependencyBump(pr) && (isMine || reviewRequested || isAssigned)) {
-    return { tier: "later", case: "merge", action: "autoMerge", kind: "dep" };
+    // Forge-side auto-merge shipped in v3.11.0 (Task 4/8), so a dep-bump PR
+    // that is not yet mergeable is exactly the "schedule it and forget it"
+    // case. Guarded the same way as the sibling branch below: only offer it
+    // while `mergeStateStatus` is BLOCKED, never on an already-mergeable PR,
+    // matching the binding rule that auto-merge is never offered in place of
+    // an immediate merge that is already available. A forge without an
+    // equivalent (Bitbucket) reports `available: false`, and that PR keeps
+    // the older honest immediate merge: the button opens the merge dialog
+    // like always, which still correctly refuses while
+    // `openLaunchpadMergePr`'s `mergeBlocked` guard is true. GitLab is
+    // excluded for a different reason: it DOES support auto-merge, and the
+    // PR detail panel offers it there, but its list payload lacks the
+    // pipeline status needed to know whether arming makes sense, so
+    // `available` is false here specifically (not absent capability, an
+    // unknowable precondition from a list).
+    if (pr.mergeStateStatus === "BLOCKED" && pr.autoMerge.available && !pr.autoMerge.armed) {
+      return { tier: "later", case: "merge", action: "auto-merge", kind: "dep" };
+    }
+    return { tier: "later", case: "merge", action: "merge", kind: "dep" };
   }
 
   // My own PR — what's the next thing I owe it?
@@ -123,6 +157,15 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
       return { tier: "now", case: "ci", action: "seeFailure", kind: "pr" };
     }
 
+    // 3.5. Blocked on required checks/reviews the forge can pick back up on
+    // its own once satisfied, offer scheduling instead of just "follow".
+    // Never reached once the PR is already mergeable (see the CLEAN branch
+    // below): computeAutoMergeOffer's rule that auto-merge is redundant on an
+    // already-ready PR holds here too.
+    if (pr.mergeStateStatus === "BLOCKED" && pr.autoMerge.available && !pr.autoMerge.armed) {
+      return { tier: "now", case: "merge", action: "auto-merge", kind: "pr" };
+    }
+
     // 4. Approved — ready to merge (or blocked / dirty)
     if (pr.reviewDecision === "APPROVED") {
       // Blocked by branch protection → waiting
@@ -138,8 +181,12 @@ export function classifyInboxPr(pr: PrWithRepo, me: string): InboxClassification
       return { tier: "waiting", case: "ciRunning", action: "follow", kind: "pr" };
     }
 
-    // 6. Awaiting review from others
+    // 6. Awaiting review from others — nudge once it's gone stale with no
+    // response from the requested reviewers, otherwise just keep following.
     if (pr.reviewDecision === "REVIEW_REQUIRED") {
+      if (isStaleAwaitingReview(pr)) {
+        return { tier: "waiting", case: "waiting", action: "nudge", kind: "pr" };
+      }
       return { tier: "waiting", case: "waiting", action: "follow", kind: "pr" };
     }
 

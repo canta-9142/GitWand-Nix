@@ -31,6 +31,8 @@ import {
   glMrAnnotations,
   glCreateMr,
   glMergeMr,
+  glEnableAutoMerge,
+  glDisableAutoMerge,
   glCheckoutMr,
   glConvertDraftToReady,
   glMrNotes,
@@ -173,6 +175,14 @@ export class GitLabProvider implements ForgeProvider {
 
   mergePR(cwd: string, number: number, method: "merge" | "squash" | "rebase" = "merge"): Promise<void> {
     return glMergeMr(cwd, number, method);
+  }
+
+  enableAutoMerge(cwd: string, number: number, method: "merge" | "squash" | "rebase" = "merge"): Promise<void> {
+    return glEnableAutoMerge(cwd, number, method);
+  }
+
+  disableAutoMerge(cwd: string, number: number): Promise<void> {
+    return glDisableAutoMerge(cwd, number);
   }
 
   checkoutPR(cwd: string, number: number): Promise<void> {

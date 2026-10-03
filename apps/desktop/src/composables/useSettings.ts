@@ -162,6 +162,14 @@ export interface AppSettings {
   /** Ollama model name. */
   aiOllamaModel: string;
   /**
+   * v3.11.1 — Send the commits that changed the conflicting lines to the AI
+   * provider with every conflict prompt. `.gitwandrc` `llmFallback.history.enabled: false`
+   * overrides this to off for that repository.
+   */
+  aiHistoryEnabled: boolean;
+  /** v3.11.1 — Token budget for that history (200–8000). */
+  aiHistoryBudgetTokens: number;
+  /**
    * Review AI settings (E3, v3.6.0) — provider is inherited from the
    * existing `aiProvider`/`aiEnabled` fields above; these four control the
    * opt-in pre-review pass (C) and PR summary (D). All opt-in — false/off
@@ -250,6 +258,20 @@ export interface AppSettings {
    * rendered.
    */
   dockOrder: DockEntryId[];
+
+  /**
+   * v3.11 — resolution policy shared by every apply path.
+   *
+   * `minConfidenceScore` is a numeric bar, 0-100, on the engine's per-hunk
+   * confidence. 0 disables it. It sits here rather than under
+   * `automations.autoResolve` on purpose: it governs the merge editor's
+   * "Resolve auto", the Conflict Predictor's apply and the MERGE_HEAD
+   * automation alike. One bar everywhere, or "apply only above 90%" would mean
+   * three different things in three places.
+   */
+  resolution: {
+    minConfidenceScore: number;
+  };
 
   /** Automation settings (v2.8). */
   automations: {
@@ -417,6 +439,12 @@ export interface AppSettings {
   snapshotMaxCount: number;
   /** Opt-in: one-line AI summaries for snapshots in the timeline. */
   snapshotAiLabels: boolean;
+  /**
+   * Live Repo (v3.10.0): subscribe to filesystem events instead of relying on
+   * the 2 s status poll. Off falls back to the pre-v3.10 polling behavior,
+   * which is what network mounts and FUSE filesystems need.
+   */
+  liveRepoWatcher: boolean;
 }
 
 export type TerminalMode = "floating" | "fullscreen" | "bottom";
@@ -450,6 +478,8 @@ export const defaultAppSettings: AppSettings = {
   aiModelByProvider: {},
   aiOllamaUrl: "http://localhost:11434",
   aiOllamaModel: "codellama",
+  aiHistoryEnabled: true,
+  aiHistoryBudgetTokens: 1500,
   reviewAiPreReview: false,
   reviewAiConfidenceThreshold: 60,
   reviewAiMaxFindings: 15,
@@ -474,6 +504,7 @@ export const defaultAppSettings: AppSettings = {
   dockUnlocked: false,
   dockPosition: null,
   dockOrder: [...DEFAULT_DOCK_ORDER],
+  resolution: { minConfidenceScore: 0 },
   automations: {
     autoResolve:    { enabled: false },
     nightlyPull:    { enabled: false, hour: 8, minute: 0 },
@@ -515,6 +546,7 @@ export const defaultAppSettings: AppSettings = {
   snapshotRetentionDays:             14,
   snapshotMaxCount:                  200,
   snapshotAiLabels:                  false,
+  liveRepoWatcher:                   true,
 };
 
 const SETTINGS_KEY = "gitwand-settings";

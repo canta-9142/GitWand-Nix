@@ -105,6 +105,19 @@ pub struct GitDiff {
     pub old_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "truncatedFromBytes")]
     pub truncated_from_bytes: Option<u64>,
+    /// Set when the requested path is a directory rather than a file (an
+    /// untracked directory entry from `git status`). There is no diff to show;
+    /// the UI renders a folder panel instead. See issue #183.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "isDirectory")]
+    pub is_directory: Option<bool>,
+    /// The untracked files inside that directory, repo-relative.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "newFiles")]
+    pub new_files: Option<Vec<String>>,
+    /// Set when the directory carries its own `.git`. Git never looks inside
+    /// such a directory, so `new_files` is empty and the UI shows a dedicated
+    /// panel rather than a file list that leads nowhere.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "nestedRepo")]
+    pub nested_repo: Option<bool>,
 }
 
 // ─── Git log types ─────────────────────────────────────────────────
@@ -245,7 +258,7 @@ pub struct GitBranch {
 
 // ─── Blame types ───────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct BlameLine {
     pub hash: String,
     pub hash_full: String,
@@ -328,6 +341,34 @@ pub struct RemoteInfo {
     pub repo: String,
 }
 
+// ─── Forge-side auto-merge (v3.11.0) ───────────────────────────────
+//
+// Two scopes, deliberately separate. `supported` is an administrative
+// setting of the repository and does not vary per PR, so resolving it per
+// PR would ask N times for one answer. `armed` / `available` are per PR and
+// come from payloads each forge module already parses.
+
+#[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoMergeSupport {
+    /// This forge, on this repository, can queue a merge at all.
+    pub supported: bool,
+    /// When it cannot, why, in the forge's own words. Not translated: this
+    /// is forge data, not GitWand copy.
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoMergeState {
+    /// An auto-merge is queued on this PR right now.
+    pub armed: bool,
+    /// This PR meets the forge's preconditions for queueing one.
+    pub available: bool,
+    /// When it does not, why. Forge text, untranslated.
+    pub reason: Option<String>,
+}
+
 // ─── PR types ──────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -350,6 +391,8 @@ pub struct PullRequest {
     pub review_decision: String,
     pub merge_state_status: String,
     pub checks_rollup: String,
+    #[serde(rename = "autoMerge", default)]
+    pub auto_merge: AutoMergeState,
     /// Number of issue-comments on the PR. Populated by the enriched
     /// workspace_prs_all path (v2.16) for the Launchpad notification diff;
     /// 0 on the light sidebar list path. `#[serde(default)]` so the
@@ -456,6 +499,13 @@ pub struct GhPrDetailRaw {
     pub mergeable: Option<String>,
     #[serde(rename = "statusCheckRollup", default)]
     pub status_check_rollup: Vec<GhPrStatusCheck>,
+    /// Present and non-null when a forge-side merge is queued on this PR.
+    /// `#[serde(default)]` reads as `Value::Null` (not armed) when the field
+    /// was never requested from `gh pr view --json`, so a caller that forgets
+    /// to add `autoMergeRequest` to its field list fails closed instead of
+    /// silently reporting "armed".
+    #[serde(rename = "autoMergeRequest", default)]
+    pub auto_merge_request: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -499,6 +549,9 @@ pub struct GhPrRaw {
     /// path (v2.16). Empty on the light sidebar list. We only need its length.
     #[serde(default)]
     pub comments: Vec<serde_json::Value>,
+    /// See `GhPrDetailRaw::auto_merge_request`: same fail-closed default.
+    #[serde(rename = "autoMergeRequest", default)]
+    pub auto_merge_request: serde_json::Value,
 }
 
 // ─── Pull Request Detail ───────────────────────────────────────────
@@ -536,6 +589,13 @@ pub struct PullRequestDetail {
     /// cheaply provide one (callers must treat "" as "unknown", v3.6.0).
     #[serde(default)]
     pub head_sha: String,
+    #[serde(rename = "autoMerge", default)]
+    pub auto_merge: AutoMergeState,
+    /// Repository-level auto-merge capability. Detail-only (not on
+    /// `PullRequest`): it's a per-repo administrative setting, not a per-PR
+    /// fact, so a list refresh has no reason to pay for it per row.
+    #[serde(rename = "autoMergeSupport", default)]
+    pub auto_merge_support: AutoMergeSupport,
 }
 
 // ─── Fork / PR target info ─────────────────────────────────────────
@@ -1059,4 +1119,29 @@ pub struct SecretFinding {
     pub severity: String,
     /// Middle-masked excerpt — NEVER the raw secret value.
     pub redacted_excerpt: String,
+}
+
+// ─── Live Repo watcher types (v3.10.0) ─────────────────────────────
+
+/// One coalesced batch of filesystem changes inside a watched repo.
+///
+/// `kinds` is the deduplicated, sorted set of change categories in the batch
+/// (see `commands::watcher::classify_path`). `paths` carries the repo-relative
+/// paths that changed, capped at `EVENT_PATH_CAP`; `truncated` is true when the
+/// batch exceeded the cap, in which case a consumer must assume "everything
+/// may have changed" rather than trusting `paths` as exhaustive.
+///
+/// `closed` is a terminal sentinel (v3.10.0 Phase C): true exactly once, on
+/// the final event a subscriber ever receives on a given `Channel`, when the
+/// underlying OS watch died unexpectedly (not via an explicit
+/// `watch_repo_stop`). `kinds`/`paths` are empty and `truncated` is false on a
+/// `closed` event; a consumer must treat it as "stop trusting this
+/// subscription", not as a change to react to.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoChangeEvent {
+    pub kinds: Vec<String>,
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    pub closed: bool,
 }

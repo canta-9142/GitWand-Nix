@@ -154,7 +154,10 @@ export type { RefMergeResult } from "./refactoring/index.js";
 
 // v2.5 — LLM fallback resolver (consommateurs souhaitant invoquer directement)
 export { tryLlmFallbackResolve } from "./resolvers/llm-fallback.js";
-export type { LlmResolveResult } from "./resolvers/llm-fallback.js";
+export type { LlmResolveResult, LlmPromptExtras } from "./resolvers/llm-fallback.js";
+
+// v3.11.1 — History-aware LLM fallback (pure; git reached via an injected GitRunner)
+export * from "./history/index.js";
 
 export type { JsonMergeResult } from "./resolvers/json.js";
 export type { MarkdownMergeResult, MarkdownSection } from "./resolvers/markdown.js";
@@ -172,6 +175,10 @@ export type { MergePolicy, PolicyConfig, GitWandrcConfig } from "./config.js";
 // v3.4 — "Recoverable-before-model" tier metric (derived, TS-only — see stats/tiers.ts)
 export { summarizeTiers } from "./stats/tiers.js";
 export type { ResolutionTier, TierSummary } from "./stats/tiers.js";
+
+// v3.11 — threshold query over an existing MergeResult (pure — see stats/threshold.ts)
+export { wouldApplyAtThreshold, summarizeAtThreshold } from "./stats/threshold.js";
+export type { ThresholdSummary } from "./stats/threshold.js";
 
 // v3.5.0 — Secrets scanner (pure, mirrored in Rust — see secrets/scanner.ts)
 export { scanSecrets, shannonEntropy, redact, isIgnored, DEFAULT_IGNORE_GLOBS } from "./secrets/scanner.js";

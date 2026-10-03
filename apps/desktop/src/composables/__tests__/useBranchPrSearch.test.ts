@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { effectScope, nextTick, ref } from "vue";
 import { useBranchPrSearch } from "../useBranchPrSearch";
 import type { PullRequest } from "../../utils/backend";
+import { CLOSED_AUTO_MERGE } from "../../utils/backend";
 
 function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
   return {
@@ -24,6 +25,7 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     mergeStateStatus: "",
     checksRollup: "",
     commentCount: 0,
+    autoMerge: CLOSED_AUTO_MERGE,
     ...overrides,
   };
 }

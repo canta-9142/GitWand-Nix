@@ -305,6 +305,11 @@ function setUserFilter(mode: 'all' | 'assigned' | 'reviews') {
             {{ stateInfo(pr.state).label }}
           </span>
           <span v-if="pr.draft" class="pls-draft-chip">{{ t('pr.list.draft') }}</span>
+          <span
+            v-if="pr.autoMerge?.armed"
+            class="pls-draft-chip pls-automerge-chip"
+            :title="t('pr.detail.autoMergeArmed')"
+          >{{ t('pr.list.autoMergeBadge') }}</span>
           <span class="pls-time">{{ panel.timeAgo(pr.updatedAt || pr.createdAt) }}</span>
         </div>
 
@@ -762,6 +767,14 @@ function setUserFilter(mode: 'all' | 'assigned' | 'reviews') {
   color: var(--color-text-muted);
   border: 1px dashed var(--color-border-strong);
   line-height: 1.5;
+}
+
+/* Forge-side auto-merge armed (v3.11.0): same chip shape as draft, own colour. */
+.pls-automerge-chip {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  border-style: solid;
+  border-color: transparent;
 }
 
 .pls-time {

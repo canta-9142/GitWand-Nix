@@ -36,6 +36,8 @@
  * Ou dans `package.json` sous la clé `"gitwand"`.
  */
 
+import { normalizeHistoryConfig } from "./history/types.js";
+
 // ─── ValidationLevel ──────────────────────────────────────
 
 /**
@@ -252,6 +254,20 @@ export interface GitWandrcConfig {
    */
   resolveGeneratedFiles?: boolean;
   /**
+   * v3.11 — Barre de confiance numérique, 0-100, combinée en ET avec le seuil
+   * de label de la politique. Absente = désactivée.
+   *
+   * Convention de dépôt plutôt que réglage d'application : « à partir de quel
+   * score ce dépôt accepte une auto-résolution » se décide par projet, comme
+   * `policy`. L'app desktop a son propre réglage équivalent pour l'utilisateur
+   * qui n'édite pas `.gitwandrc`.
+   *
+   * ```json
+   * { "minConfidenceScore": 90 }
+   * ```
+   */
+  minConfidenceScore?: number;
+  /**
    * v2.4 — Validation post-merge.
    * - `level: "balanced"` (défaut) : marqueurs résiduels + syntaxe + parse-tree
    * - `level: "strict"` : + tsc --noEmit et/ou eslint (Node.js uniquement, opt-in)
@@ -281,7 +297,8 @@ export interface GitWandrcConfig {
    *     "temperature": 0.0,
    *     "contextLines": 50,
    *     "minPostMergeScore": 80,
-   *     "minMode": "strict"
+   *     "minMode": "strict",
+   *     "history": { "enabled": true, "budgetTokens": 1500 }
    *   }
    * }
    * ```
@@ -294,6 +311,8 @@ export interface GitWandrcConfig {
     contextLines?: number;
     minPostMergeScore?: number;
     minMode?: ValidationLevel;
+    /** v3.11.1 — `{ enabled?: boolean, budgetTokens?: number }` (budget clamped to 200–8000). */
+    history?: Partial<import("./history/types.js").HistoryConfig>;
   };
   /**
    * v2.6 — Moteur RefMerge (expérimental, opt-in).
@@ -408,6 +427,19 @@ export function parseGitwandrc(json: string): GitWandrcConfig | null {
       }
     }
 
+    // v3.11 — barre de confiance numérique. Tolérant comme le reste du parser :
+    // une valeur hors bornes ou non numérique est ignorée, pas fatale, donc une
+    // faute de frappe laisse la barre désactivée plutôt que de la placer
+    // silencieusement à un endroit non voulu.
+    if (
+      typeof parsed.minConfidenceScore === "number" &&
+      Number.isFinite(parsed.minConfidenceScore) &&
+      parsed.minConfidenceScore >= 0 &&
+      parsed.minConfidenceScore <= 100
+    ) {
+      result.minConfidenceScore = parsed.minConfidenceScore;
+    }
+
     // Valider les patterns de fichiers auto-générés (P2.4).
     // On accepte un tableau de strings non vides ; on skip tout ce qui n'est pas
     // une string pour rester tolérant aux configs « presque valides ».
@@ -464,6 +496,9 @@ export function parseGitwandrc(json: string): GitWandrcConfig | null {
         fallback.minPostMergeScore = llm.minPostMergeScore;
       }
       if (validLevels.includes(llm.minMode)) fallback.minMode = llm.minMode as ValidationLevel;
+
+      const history = normalizeHistoryConfig(llm.history);
+      if (history) fallback.history = history;
 
       if (Object.keys(fallback).length > 0) {
         result.llmFallback = fallback;

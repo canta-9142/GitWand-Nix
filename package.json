@@ -1,6 +1,6 @@
 {
   "name": "gitwand",
-  "version": "3.9.1",
+  "version": "3.11.1",
   "private": true,
   "description": "Git's magic wand \u2014 automatic conflict resolution and smart merge tools",
   "author": "Laurent Guitton <lb.guitton@gmail.com>",
@@ -18,7 +18,7 @@
     "postinstall": "node scripts/fix-spawn-helper.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/cli": "^2.12.0",
     "smol-toml": "^1.8.0",
     "yaml": "^2.9.0"
   }

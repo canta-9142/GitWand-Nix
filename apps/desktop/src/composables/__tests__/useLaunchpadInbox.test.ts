@@ -3,6 +3,11 @@ import { ref } from "vue";
 import type { PrWithRepo } from "../useLaunchpadPrs";
 import type { IssueWithRepo } from "../useLaunchpadIssues";
 
+// Not imported from "../../utils/backend": that module is mocked below
+// (vi.mock), so pulling the real CLOSED_AUTO_MERGE constant from it would
+// resolve to undefined at runtime instead. Inline the same closed-descriptor shape.
+const CLOSED_AUTO_MERGE = { armed: false, available: false, reason: null };
+
 vi.mock("../../utils/backend", () => ({
   ghCurrentUser: vi.fn(),
 }));
@@ -38,6 +43,7 @@ function pr(overrides: Partial<PrWithRepo>): PrWithRepo {
     mergeStateStatus: "CLEAN",
     checksRollup: "",
     commentCount: 0,
+    autoMerge: CLOSED_AUTO_MERGE,
     repoName: "repo",
     repoPath: "/repo",
     ...overrides,
@@ -159,6 +165,36 @@ describe("classifyInboxPr", () => {
     ).toEqual({ tier: "waiting", case: "waiting", action: "follow", kind: "pr" });
   });
 
+  it("classifies my PR awaiting review as nudge once stale with no response from requested reviewers", () => {
+    expect(
+      classifyInboxPr(
+        pr({
+          author: ME,
+          reviewDecision: "REVIEW_REQUIRED",
+          checksRollup: "SUCCESS",
+          reviewRequested: ["bob"],
+          updatedAt: "2020-01-01T00:00:00Z",
+        }),
+        ME
+      )
+    ).toEqual({ tier: "waiting", case: "waiting", action: "nudge", kind: "pr" });
+  });
+
+  it("does not nudge a PR awaiting review with requested reviewers that is still fresh", () => {
+    expect(
+      classifyInboxPr(
+        pr({
+          author: ME,
+          reviewDecision: "REVIEW_REQUIRED",
+          checksRollup: "SUCCESS",
+          reviewRequested: ["bob"],
+          updatedAt: new Date().toISOString(),
+        }),
+        ME
+      )
+    ).toEqual({ tier: "waiting", case: "waiting", action: "follow", kind: "pr" });
+  });
+
   it("prioritises changes-requested over conflicts (DIRTY) on my own PR", () => {
     // CHANGES_REQUESTED wins over mergeStateStatus=DIRTY (same as the old
     // priority: changes > ci > merge ordering is preserved).
@@ -177,18 +213,18 @@ describe("classifyInboxPr", () => {
     expect(result?.case).toBe("changes");
   });
 
-  it("classifies dependabot-labelled PR as { tier:'later', kind:'dep', action:'autoMerge' }", () => {
+  it("classifies dependabot-labelled PR as { tier:'later', kind:'dep', action:'merge' }", () => {
     expect(
       classifyInboxPr(pr({ author: ME, reviewDecision: "APPROVED", mergeStateStatus: "CLEAN", labels: ["dependencies"] }), ME)
-    ).toEqual({ tier: "later", case: "merge", action: "autoMerge", kind: "dep" });
+    ).toEqual({ tier: "later", case: "merge", action: "merge", kind: "dep" });
   });
 
-  it("classifies renovate[bot] author PR (review requested of me) as { tier:'later', kind:'dep', action:'autoMerge' }", () => {
+  it("classifies renovate[bot] author PR (review requested of me) as { tier:'later', kind:'dep', action:'merge' }", () => {
     // Renovate bot PRs where my review is requested are classified as dep bumps
     // regardless of author — the dep check fires before the isMine gate.
     expect(
       classifyInboxPr(pr({ author: "renovate[bot]", reviewRequested: [ME], reviewDecision: "APPROVED", mergeStateStatus: "CLEAN" }), ME)
-    ).toEqual({ tier: "later", case: "merge", action: "autoMerge", kind: "dep" });
+    ).toEqual({ tier: "later", case: "merge", action: "merge", kind: "dep" });
   });
 
   it("returns null for a bot dep-bump PR where neither I'm the author nor my review is requested", () => {

@@ -212,6 +212,13 @@ export interface LlmFallbackConfig {
    * Défaut : `"strict"`.
    */
   minMode?: import("./config.js").ValidationLevel;
+  /**
+   * v3.11.1 — History-aware prompts: the commits that changed the conflicting
+   * lines on each side since the merge base, within `budgetTokens`.
+   * Defaults: `{ enabled: true, budgetTokens: 1500 }`. Effective only when a
+   * `GitWandOptions.gitRunner` is injected.
+   */
+  history?: Partial<import("./history/types.js").HistoryConfig>;
 }
 
 /**
@@ -235,6 +242,8 @@ export interface LlmTrace {
   validationScore: number;
   /** La résolution LLM a-t-elle été acceptée ? (`false` = fallback sur `complex`) */
   accepted: boolean;
+  /** v3.11.1 — What history went into the prompt (absent on pre-v3.11.1 traces). */
+  history?: import("./history/types.js").HistoryStats;
 }
 
 // ─── Phase v2.6 — Refactoring-aware merge ────────────────────
@@ -529,6 +538,17 @@ export interface MergeContext {
   /** Noms de refs, pour les traces et explications uniquement — jamais parsés pour décider. */
   oursRef?: string;
   theirsRef?: string;
+  /**
+   * v3.11.1 — SHA of HEAD (the "ours" side). Used by the history-aware LLM
+   * fallback to query `git log` on the right commits. Never parsed to decide
+   * a resolution.
+   */
+  oursSha?: string;
+  /**
+   * v3.11.1 — SHA of the operation head (MERGE_HEAD / REBASE_HEAD /
+   * CHERRY_PICK_HEAD / REVERT_HEAD), the "theirs" side.
+   */
+  theirsSha?: string;
 }
 
 /**
@@ -552,6 +572,19 @@ export interface GitWandOptions {
   resolveNonOverlapping?: boolean;
   /** Niveau de confiance minimum pour auto-résolution (défaut: "high") */
   minConfidence?: Confidence;
+  /**
+   * v3.11 — Barre de confiance NUMÉRIQUE supplémentaire, 0-100, combinée en ET
+   * avec `minConfidence`. `null`/absent = désactivée.
+   *
+   * Ne relâche jamais la barrière de label : un hunk doit passer les DEUX.
+   * C'est délibéré et structurel. `complex` score 60 (`makeScore(100, 100, 0)`
+   * → `100 - 100*0.40`), pas 0 : une barre numérique qui *remplacerait* la
+   * barrière de label appliquerait donc les hunks `complex` en silence sous
+   * tout seuil inférieur à 60, exactement la garantie que v3.9.0 a établie.
+   * Étant purement soustractive, aucune valeur ne peut appliquer plus que le
+   * moteur n'applique barre désactivée.
+   */
+  minConfidenceScore?: number | null;
   /** Mode verbose pour le logging (défaut: false) */
   verbose?: boolean;
   /**
@@ -598,6 +631,12 @@ export interface GitWandOptions {
    * cible gagne. Sans lui, ces cas sont proposés au lieu d'être appliqués.
    */
   mergeContext?: MergeContext | null;
+  /**
+   * v3.11.1 — Git access for the history-aware LLM fallback, injected by the
+   * caller (desktop: `gitExec`; CLI: `execFile`). Core never spawns git
+   * itself. `null`/absent: prompts carry no history.
+   */
+  gitRunner?: import("./history/types.js").GitRunner | null;
   /**
    * accuracy lot D — État des autres fichiers de ce merge (source de vérité
    * d'un fichier régénérable, ex: package.json pour package-lock.json).

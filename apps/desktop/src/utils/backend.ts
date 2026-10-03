@@ -21,15 +21,25 @@
  */
 
 // ─── Infrastructure (shared with sub-modules via backend-core.ts) ────────────
-import { isTauri, tauriInvoke, devFetch, DEV_SERVER, IPC_TIMEOUT, devTerminalOpen } from './backend-core';
+import { isTauri, tauriInvoke, devFetch, DEV_SERVER, IPC_TIMEOUT, devTerminalOpen, devWatchRepoOpen, devWatchRepoClose, devGitClone, devGitFetch } from './backend-core';
 export { isTauri };
 // ─── Cross-module type imports for workspace helpers ─────────────────────────
 // PullRequest is defined in backend-pr.ts but used by workspacePrsAll here.
-import type { PullRequest } from './backend-pr';
+import type { PullRequest, AutoMergeState } from './backend-pr';
+import { CLOSED_AUTO_MERGE } from './backend-pr';
 // v3.5.0 — Secrets scanner IPC shapes, imported from @gitwand/core to avoid drift
 // between the frontend, the Rust command, and the dev-server route.
 import type { SecretFinding, SecretsScanConfig } from '@gitwand/core';
 export type { SecretFinding, SecretsScanConfig };
+// Detection layer 2 for Gitea (self-hosted, neutral hostname): resolved by
+// matching configured account hosts rather than the URL. Static import is
+// safe here: forge/types.ts only imports types from backend.ts, so there is
+// no runtime cycle. useAccounts' module body does read localStorage at
+// import time (it initialises a module-level ref via loadAccounts()), which
+// is safe in every environment this code runs in: the Tauri webview and
+// every browser provide localStorage synchronously, and src/test-setup.ts
+// shims it for the node test environment.
+import { useAccounts } from '../composables/useAccounts';
 
 /** Open a native folder picker (Tauri only). */
 async function tauriOpenFolder(): Promise<string | null> {
@@ -171,7 +181,14 @@ export async function readFile(cwd: string, path: string): Promise<string> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ cwd, path }),
   });
-  if (!res.ok) throw new Error(`Failed to read ${path}`);
+  if (!res.ok) {
+    // Surface the server's reason instead of a generic message: the Rust
+    // backend rejects a non-UTF-8 file with "…: stream did not contain valid
+    // UTF-8", and callers (and the parity suite) need the two paths to fail
+    // the same way, not merely to succeed the same way (issue #188).
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to read ${path}`);
+  }
   const data = await res.json();
   return data.content;
 }
@@ -515,6 +532,12 @@ export interface GitDiff {
   isDirectory?: boolean;
   /** List of new files inside the directory (when isDirectory=true) */
   newFiles?: string[];
+  /**
+   * True when the directory carries its own `.git`. Git never looks inside
+   * one, so `newFiles` is empty and the UI shows a dedicated panel rather
+   * than a file list that leads back to this same directory (issue #183).
+   */
+  nestedRepo?: boolean;
   /**
    * P2.4 — When set, the raw `git diff` output exceeded the backend's
    * truncation threshold (5 MB). Hunks were parsed from the truncated
@@ -919,18 +942,19 @@ export async function gitPull(
 }
 
 /**
- * Fetch from remote (updates tracking info without merging).
+ * Fetch from remote (updates tracking info without merging). `onProgress`,
+ * if given, receives live updates over a scoped IPC channel (v3.10.0) —
+ * pass it only for user-initiated fetches; the background poller omits it
+ * so the UI never flickers on an automatic tick.
  */
-export async function gitFetch(cwd: string): Promise<GitPushPullResult> {
+export async function gitFetch(cwd: string, onProgress?: (p: CloneProgress) => void): Promise<GitPushPullResult> {
   if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_fetch", { cwd }, IPC_TIMEOUT.NETWORK);
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<CloneProgress>();
+    if (onProgress) channel.onmessage = onProgress;
+    return tauriInvoke<GitPushPullResult>("git_fetch", { cwd, onProgress: channel }, IPC_TIMEOUT.NETWORK);
   }
-  const res = await devFetch(`${DEV_SERVER}/api/git-fetch`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd }),
-  });
-  return res.json();
+  return devGitFetch(cwd, onProgress);
 }
 
 /**
@@ -949,37 +973,51 @@ export async function gitMerge(cwd: string, branch: string, noFf: boolean = fals
   return res.json();
 }
 
-/**
- * Abort an in-progress merge.
- */
-export async function gitMergeAbort(cwd: string): Promise<GitPushPullResult> {
-  if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_merge_abort", { cwd });
-  }
-  const res = await devFetch(`${DEV_SERVER}/api/git-merge-abort`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd }),
-  });
-  return res.json();
-}
 
-/**
- * Continue a merge after all conflicts are resolved.
- */
-export async function gitMergeContinue(cwd: string): Promise<GitPushPullResult> {
-  if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_merge_continue", { cwd });
-  }
-  const res = await devFetch(`${DEV_SERVER}/api/git-merge-continue`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd }),
-  });
-  return res.json();
-}
 
 // ─── Git repo operation state ─────────────────────────────────
+
+/** The operations that can be in progress in a repository. */
+export type OperationKind = "merge" | "cherry_pick" | "revert" | "rebase";
+/** What can be done to the operation in progress. */
+export type OperationActionKind = "continue" | "abort" | "skip";
+
+/** Outcome of an operation action. See design §3: three outcomes, not two. */
+export interface OperationActionResult {
+  /** git did its work and stopped on a further conflict. Progress, not failure. */
+  halted: boolean;
+}
+
+/**
+ * Continue, abort or skip the operation in progress.
+ *
+ * Replaces the five per-operation wrappers, which disagreed on how failure was
+ * reported. Rejects only when git actually refused; a halt on a further
+ * conflict resolves with `halted: true`.
+ */
+export async function gitOperationAction(
+  cwd: string,
+  operation: OperationKind,
+  action: OperationActionKind,
+): Promise<OperationActionResult> {
+  if (isTauri()) {
+    return tauriInvoke<OperationActionResult>("git_operation_action", {
+      cwd,
+      operation,
+      action,
+    });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-operation-action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, operation, action }),
+  });
+  const body = (await res.json()) as { halted?: boolean; error?: string };
+  if (!res.ok) {
+    throw new Error(body.error || "operation action failed");
+  }
+  return { halted: body.halted === true };
+}
 
 export interface RepoOperationState {
   /** "clean" | "rebase" | "rebase_interactive" | "merge" | "cherry_pick" | "revert" */
@@ -1012,25 +1050,32 @@ export async function gitRepoState(cwd: string): Promise<RepoOperationState> {
   return res.json();
 }
 
+
 /**
- * Run `git rebase --continue`, `--abort`, or `--skip`.
+ * Rebase the current branch onto `onto`, non-interactively.
+ *
+ * v3.11 — apply-from-preview needs to actually run the operation the Conflict
+ * Predictor simulated. Returns `{ conflict }`, true when the rebase halted on
+ * a conflict, so the caller drives continue/skip/abort exactly as it does
+ * after `gitInteractiveRebase`.
  */
-export async function gitRebaseAction(
+export async function gitRebaseOnto(
   cwd: string,
-  action: 'continue' | 'abort' | 'skip'
-): Promise<void> {
+  onto: string,
+): Promise<{ conflict: boolean }> {
   if (isTauri()) {
-    return tauriInvoke<void>("git_rebase_action", { cwd, action });
+    return tauriInvoke<{ conflict: boolean }>("git_rebase_onto", { cwd, onto });
   }
-  const res = await devFetch(`${DEV_SERVER}/api/git-rebase-action`, {
+  const res = await devFetch(`${DEV_SERVER}/api/git-rebase-onto`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, action }),
+    body: JSON.stringify({ cwd, onto }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error ?? "git rebase action failed");
+    throw new Error(err.error ?? `git rebase onto ${onto} failed`);
   }
+  return res.json();
 }
 
 /**
@@ -1677,35 +1722,7 @@ export async function gitCherryPick(cwd: string, hashes: string[]): Promise<GitP
   return res.json();
 }
 
-/**
- * Abort an in-progress cherry-pick.
- */
-export async function gitCherryPickAbort(cwd: string): Promise<void> {
-  if (isTauri()) {
-    await tauriInvoke("git_cherry_pick_abort", { cwd });
-    return;
-  }
-  await devFetch(`${DEV_SERVER}/api/git-cherry-pick-abort`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd }),
-  });
-}
 
-/**
- * Continue a cherry-pick after resolving conflicts.
- */
-export async function gitCherryPickContinue(cwd: string): Promise<GitPushPullResult> {
-  if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_cherry_pick_continue", { cwd });
-  }
-  const res = await devFetch(`${DEV_SERVER}/api/git-cherry-pick-continue`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd }),
-  });
-  return res.json();
-}
 
 // ─── Commit context-menu operations (v1.9) ─────────────────
 
@@ -2158,25 +2175,38 @@ export async function getGitBranchTopAuthors(
 }
 
 // ─── Clone & Fork (v2.0) ───────────────────────────────────
-// Synchronous on both backends — no real-time progress events. The caller
-// (CloneModal / ForkModal) shows a spinner while the promise settles.
+// Fork (gh_fork) stays synchronous on both backends — no real-time progress
+// events; the caller shows a spinner while the promise settles. Clone
+// (v2.11) and fetch (v3.10.0) stream live progress over a scoped IPC
+// channel — see CloneProgress below.
+
+/** One progress update from `git clone --progress` / `git fetch --progress`. */
+export interface CloneProgress {
+  /** init | counting | compressing | receiving | resolving | info | done */
+  stage: string;
+  percent: number;
+  message: string;
+}
 
 /**
  * Run `git clone <url> <dest>`. Returns the destination path on success.
  * `dest` must be absolute and not yet exist; git refuses otherwise.
+ * `onProgress` receives live updates over a scoped IPC channel (v3.10.0),
+ * replacing the app-wide `clone-progress` broadcast: two concurrent clones
+ * no longer share one event stream.
  */
-export async function gitClone(url: string, dest: string): Promise<string> {
+export async function gitClone(
+  url: string,
+  dest: string,
+  onProgress?: (p: CloneProgress) => void,
+): Promise<string> {
   if (isTauri()) {
-    return tauriInvoke<string>("git_clone", { url, dest }, IPC_TIMEOUT.NETWORK);
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<CloneProgress>();
+    if (onProgress) channel.onmessage = onProgress;
+    return tauriInvoke<string>("git_clone", { url, dest, onProgress: channel }, IPC_TIMEOUT.NETWORK);
   }
-  const res = await devFetch(`${DEV_SERVER}/api/git-clone`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url, dest }),
-  });
-  const body = (await res.json()) as { dest?: string; error?: string };
-  if (!res.ok || body.error) throw new Error(body.error ?? `git clone failed: ${res.status}`);
-  return body.dest ?? dest;
+  return devGitClone(url, dest, onProgress);
 }
 
 /**
@@ -2381,9 +2411,43 @@ export async function gitAutocomplete(cwd: string, partial: string): Promise<str
 export interface RemoteInfo {
   name: string;
   url: string;
-  provider: "github" | "gitlab" | "bitbucket" | "azure" | "cursor" | "unknown";
+  provider: "github" | "gitlab" | "bitbucket" | "azure" | "cursor" | "gitea" | "unknown";
   owner: string;
   repo: string;
+}
+
+/**
+ * Whether `remoteUrl`'s host is one of `hosts`.
+ *
+ * Detection layer 2 for Gitea: a self-hosted instance on a neutral hostname is
+ * unrecognisable from the URL alone, so the configured accounts are the
+ * evidence. Exported for its unit test.
+ *
+ * Lowercases the extracted host before comparing: `hosts` (from
+ * `useAccounts.giteaHosts()`) is always lowercase, since the account form
+ * derives it via `giteaHostFromUrl`, which runs `URL.hostname` (itself always
+ * lowercase). Without this, a remote typed or cloned with mixed-case casing
+ * (`git@Git.ACME.io:...`) would silently miss a configured account.
+ */
+export function giteaProviderHostMatches(remoteUrl: string, hosts: string[]): boolean {
+  if (hosts.length === 0) return false;
+  const host = (
+    remoteUrl.startsWith("git@")
+      ? remoteUrl.slice(4).split(":")[0]
+      : remoteUrl.split("://")[1]?.split("/")[0]?.split("@").pop()?.split(":")[0] ?? ""
+  ).toLowerCase();
+  return host.length > 0 && hosts.includes(host);
+}
+
+/**
+ * Rewrites `provider: "unknown"` to `"gitea"` when the remote's host matches a
+ * configured Gitea account. Applied at both `gitRemoteInfo` return sites so
+ * the Tauri and dev:web paths behave identically.
+ */
+function applyGiteaAccountOverride(info: RemoteInfo): RemoteInfo {
+  if (info.provider !== "unknown" || !info.url) return info;
+  const hosts = useAccounts().giteaHosts();
+  return giteaProviderHostMatches(info.url, hosts) ? { ...info, provider: "gitea" } : info;
 }
 
 /**
@@ -2391,7 +2455,7 @@ export interface RemoteInfo {
  */
 export async function gitRemoteInfo(cwd: string): Promise<RemoteInfo> {
   if (isTauri()) {
-    return tauriInvoke<RemoteInfo>("git_remote_info", { cwd });
+    return applyGiteaAccountOverride(await tauriInvoke<RemoteInfo>("git_remote_info", { cwd }));
   }
   try {
     const res = await fetch(
@@ -2400,7 +2464,7 @@ export async function gitRemoteInfo(cwd: string): Promise<RemoteInfo> {
     if (!res.ok) {
       return { name: "origin", url: "", provider: "unknown", owner: "", repo: "" };
     }
-    return (await res.json()) as RemoteInfo;
+    return applyGiteaAccountOverride((await res.json()) as RemoteInfo);
   } catch {
     return { name: "origin", url: "", provider: "unknown", owner: "", repo: "" };
   }
@@ -2553,18 +2617,19 @@ export async function previewMerge(
       sourceBranch,
     });
   }
-  // Dev mode: endpoint optionnel (pas critique pour le dev)
-  try {
-    const res = await devFetch(`${DEV_SERVER}/api/preview-merge`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd, sourceBranch }),
-    });
-    if (res.ok) return await res.json();
-  } catch {
-    // Pas de serveur dev → retourner un tableau vide
+  // Never swallow the failure into `[]`: an empty preview reads as "this merge
+  // is clean", which is the most misleading answer possible. `useMergePreview`
+  // already catches into `error.value`, so a real message reaches the user.
+  const res = await devFetch(`${DEV_SERVER}/api/preview-merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, sourceBranch }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview merge of ${sourceBranch}`);
   }
-  return [];
+  return res.json();
 }
 
 // ─── Conflict Predictor — rebase & cherry-pick (v2.20.0) ────
@@ -2580,8 +2645,16 @@ export async function previewRebase(
   if (isTauri()) {
     return tauriInvoke<FileMergePreview[]>("preview_rebase", { cwd, onto });
   }
-  // Dev mode: pas d'endpoint mock → aperçu vide (stub-safe).
-  return [];
+  const res = await devFetch(`${DEV_SERVER}/api/preview-rebase`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, onto }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview rebase onto ${onto}`);
+  }
+  return res.json();
 }
 
 /**
@@ -2595,8 +2668,16 @@ export async function previewCherryPick(
   if (isTauri()) {
     return tauriInvoke<FileMergePreview[]>("preview_cherry_pick", { cwd, commit });
   }
-  // Dev mode: pas d'endpoint mock → aperçu vide (stub-safe).
-  return [];
+  const res = await devFetch(`${DEV_SERVER}/api/preview-cherry-pick`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, commit }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview cherry-pick of ${commit}`);
+  }
+  return res.json();
 }
 
 // ─── Scratch worktree (v2.20.0) ─────────────────────────────
@@ -2944,6 +3025,9 @@ function mapRawPr(pr: Record<string, unknown>): PullRequest {
     mergeStateStatus: (pr.merge_state_status as string) ?? "",
     checksRollup: (pr.checks_rollup as string) ?? "",
     commentCount: (pr.comment_count as number) ?? 0,
+    // Fails closed: an absent descriptor (older backend, unwired path) must
+    // never offer the auto-merge action.
+    autoMerge: (pr.autoMerge as AutoMergeState) ?? CLOSED_AUTO_MERGE,
   };
 }
 
@@ -3335,6 +3419,71 @@ export async function terminalClose(id: number): Promise<void> {
     return;
   }
   await devFetch(`${DEV_SERVER}/api/terminal-close`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+}
+
+// ─── Live Repo watcher (v3.10.0) ──────────────────────────
+
+/** One coalesced batch of filesystem changes inside a watched repo. */
+export interface RepoChangeEvent {
+  /** Deduplicated, sorted change categories: head | index | refs | config | mergeState | stash | worktree. */
+  kinds: string[];
+  /** Repo-relative paths that changed, capped at 512 entries. */
+  paths: string[];
+  /** True when the batch exceeded the cap: treat `paths` as non-exhaustive. */
+  truncated: boolean;
+  /**
+   * Terminal sentinel: true on the final event a subscription ever receives,
+   * sent when the OS-level watch died unexpectedly. Never surfaced to
+   * `onChange` — `watchRepoStart` intercepts it and calls `onClose` instead.
+   */
+  closed?: boolean;
+}
+
+/**
+ * Subscribe to filesystem changes in `cwd`. Returns a subscription id for
+ * `watchRepoStop`. Multiple subscriptions on the same repo share one OS
+ * watcher on the backend.
+ *
+ * `onClose`, if given, fires once if the subscription dies unexpectedly after
+ * starting (as opposed to a rejected Promise, which means it never started).
+ * Dev mode (`pnpm dev:web`) detects this via the underlying SSE connection
+ * dropping. The Tauri backend (v3.10.0 Phase C) detects it via a terminal
+ * `closed: true` `RepoChangeEvent` sent on the same `Channel` right before the
+ * backend tears down its watcher state for that repo (see
+ * `commands::watcher::spawn_coalescer`'s `Disconnected` arm).
+ */
+export async function watchRepoStart(
+  cwd: string,
+  onChange: (ev: RepoChangeEvent) => void,
+  onClose?: () => void,
+): Promise<number> {
+  if (isTauri()) {
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<RepoChangeEvent>();
+    channel.onmessage = (ev) => {
+      if (ev.closed) {
+        onClose?.();
+        return;
+      }
+      onChange(ev);
+    };
+    return tauriInvoke<number>("watch_repo_start", { cwd, onChange: channel });
+  }
+  return devWatchRepoOpen(cwd, onChange, onClose);
+}
+
+/** Drop a subscription. Idempotent: an unknown id is a no-op. */
+export async function watchRepoStop(id: number): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("watch_repo_stop", { id });
+    return;
+  }
+  devWatchRepoClose(id);
+  await devFetch(`${DEV_SERVER}/api/watch-repo-stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id }),
@@ -3821,5 +3970,6 @@ export async function gitCommitTemplatePath(cwd: string): Promise<string | null>
 export * from './backend-pr';
 export * from './backend-gitlab';
 export * from './backend-bitbucket';
+export * from './backend-gitea';
 export * from './backend-ai';
 

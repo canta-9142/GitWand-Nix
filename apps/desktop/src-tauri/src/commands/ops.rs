@@ -463,29 +463,63 @@ pub(crate) async fn git_push(
     })
 }
 
+/// Fetch from remote, streaming `git fetch --progress`'s stderr over
+/// `on_progress` (v3.10.0). Reuses `CloneProgress`/`parse_clone_progress`
+/// from the clone path rather than a second shape — see the doc comment on
+/// `CloneProgress`. Callers that don't need live updates (the background
+/// poller) pass a `Channel` whose `onmessage` handler is a no-op; either way
+/// the fetch itself still runs and returns the same `GitPushPullResult`.
+///
+/// stdout is discarded (`Stdio::null()`), mirroring `git_clone`: `git fetch`
+/// writes its summary to stderr, not stdout, and piping both without
+/// draining them concurrently risks a deadlock once stderr's OS pipe buffer
+/// fills with progress lines.
 #[tauri::command]
-pub(crate) async fn git_fetch(cwd: String) -> Result<GitPushPullResult, String> {
+pub(crate) async fn git_fetch(
+    cwd: String,
+    on_progress: tauri::ipc::Channel<CloneProgress>,
+) -> Result<GitPushPullResult, String> {
     let _repo = repo_lock::write(&cwd);
     let _t0 = Instant::now();
-    let output = git_cmd()
-        .args(["fetch", "--prune"])
+
+    let mut child = git_cmd()
+        .args(["fetch", "--prune", "--progress"])
         .current_dir(&cwd)
-        .output()
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
         .map_err(|e| format!("Failed to run git fetch: {}", e))?;
+
+    let all_stderr = if let Some(mut stderr) = child.stderr.take() {
+        stream_progress(&mut stderr, &on_progress)
+    } else {
+        Vec::new()
+    };
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for git fetch: {}", e))?;
     record_cmd(
-        "git fetch --prune",
+        "git fetch --prune --progress",
         &cwd,
         _t0.elapsed().as_millis() as u64,
-        output.status.code().unwrap_or(-1),
+        status.code().unwrap_or(-1),
     );
 
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&all_stderr).to_string();
+
+    if status.success() {
+        let _ = on_progress.send(CloneProgress {
+            stage: "done".into(),
+            percent: 100.0,
+            message: "Fetch complete".to_string(),
+        });
+    }
 
     Ok(GitPushPullResult {
-        success: output.status.success(),
-        message: if output.status.success() {
-            stdout.trim().to_string()
+        success: status.success(),
+        message: if status.success() {
+            String::new()
         } else {
             stderr.trim().to_string()
         },
@@ -535,67 +569,6 @@ pub(crate) async fn git_merge(
             stderr.trim().to_string()
         },
         conflicts: if is_conflict { Some(true) } else { None },
-    })
-}
-
-#[tauri::command]
-pub(crate) async fn git_merge_abort(cwd: String) -> Result<GitPushPullResult, String> {
-    let _repo = repo_lock::write(&cwd);
-    let _t0 = Instant::now();
-    let output = git_cmd()
-        .args(["merge", "--abort"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("Failed to run git merge --abort: {}", e))?;
-    record_cmd(
-        "git merge --abort",
-        &cwd,
-        _t0.elapsed().as_millis() as u64,
-        output.status.code().unwrap_or(-1),
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    Ok(GitPushPullResult {
-        success: output.status.success(),
-        message: if output.status.success() {
-            "Merge aborted".to_string()
-        } else {
-            stderr.trim().to_string()
-        },
-        conflicts: None,
-    })
-}
-
-#[tauri::command]
-pub(crate) async fn git_merge_continue(cwd: String) -> Result<GitPushPullResult, String> {
-    let _repo = repo_lock::write(&cwd);
-    let _t0 = Instant::now();
-    let output = git_cmd()
-        .args(["-c", "core.editor=true", "merge", "--continue"])
-        .current_dir(&cwd)
-        .env("GIT_MERGE_AUTOEDIT", "no")
-        .env("GIT_EDITOR", "true")
-        .output()
-        .map_err(|e| format!("Failed to run git merge --continue: {}", e))?;
-    record_cmd(
-        "git merge --continue",
-        &cwd,
-        _t0.elapsed().as_millis() as u64,
-        output.status.code().unwrap_or(-1),
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    Ok(GitPushPullResult {
-        success: output.status.success(),
-        message: if output.status.success() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        },
-        conflicts: None,
     })
 }
 
@@ -651,34 +624,93 @@ pub(crate) async fn git_pull(
 
 // ─── Git rebase ────────────────────────────────────────────────
 
-#[tauri::command]
-pub(crate) async fn git_rebase_action(cwd: String, action: String) -> Result<(), String> {
-    let arg = match action.as_str() {
-        "continue" | "abort" | "skip" => action.as_str(),
-        _ => return Err(format!("Unknown rebase action '{}'", action)),
+/// Result of an operation action. `halted` is true when git did its work and
+/// stopped on a further conflict — progress, not failure (design §3).
+#[derive(serde::Serialize)]
+pub(crate) struct OperationActionResult {
+    pub halted: bool,
+}
+
+/// Map an (operation, action) pair to git's argument vector.
+///
+/// Pure and separately tested: it is the whitelist, so nothing reaches git that
+/// is not one of these exact strings. `merge` has no `--skip` — git answers
+/// "unknown option" — so that pair is refused here rather than producing a
+/// confusing error from git itself.
+fn operation_action_args(operation: &str, action: &str) -> Result<Vec<&'static str>, String> {
+    let op = match operation {
+        "merge" => "merge",
+        "cherry_pick" => "cherry-pick",
+        "revert" => "revert",
+        "rebase" => "rebase",
+        _ => return Err(format!("Unknown operation '{}'", operation)),
     };
+    let act = match action {
+        "continue" => "--continue",
+        "abort" => "--abort",
+        "skip" => "--skip",
+        _ => return Err(format!("Unknown action '{}'", action)),
+    };
+    if op == "merge" && act == "--skip" {
+        return Err("git merge has no --skip".to_string());
+    }
+    Ok(vec![op, act])
+}
+
+/// Continue, abort or skip the operation in progress.
+///
+/// Replaces `git_merge_abort`, `git_merge_continue`, `git_cherry_pick_abort`,
+/// `git_cherry_pick_continue` and `git_rebase_action`, which carried three
+/// different error conventions between them (design §1).
+///
+/// Three outcomes, not two: `Ok(halted: false)` when the operation finished,
+/// `Ok(halted: true)` when git stopped on a further conflict, `Err` only when
+/// git actually refused. `LC_ALL=C` is pinned because the halted check matches
+/// git's own words, and whether git translates them depends on how it was
+/// built (design §3).
+#[tauri::command]
+pub(crate) async fn git_operation_action(
+    cwd: String,
+    operation: String,
+    action: String,
+) -> Result<OperationActionResult, String> {
+    let args = operation_action_args(&operation, &action)?;
+    let label = format!("git {} {}", args[0], args[1]);
+
     let _repo = repo_lock::write(&cwd);
     let _t0 = Instant::now();
     let output = git_cmd()
-        .args(["rebase", &format!("--{}", arg)])
+        .args(&args)
         .env("GIT_EDITOR", "true")
+        .env("EDITOR", "true")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "")
         .current_dir(&cwd)
         .output()
-        .map_err(|e| format!("Failed to run git rebase --{}: {}", arg, e))?;
+        .map_err(|e| format!("Failed to run {}: {}", label, e))?;
     record_cmd(
-        &format!("git rebase --{}", arg),
+        &label,
         &cwd,
         _t0.elapsed().as_millis() as u64,
         output.status.code().unwrap_or(-1),
     );
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let msg = if stderr.is_empty() { stdout } else { stderr };
-        return Err(format!("git rebase --{} failed: {}", arg, msg));
+
+    if output.status.success() {
+        return Ok(OperationActionResult { halted: false });
     }
-    Ok(())
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stderr.contains("CONFLICT")
+        || stderr.contains("could not apply")
+        || stdout.contains("CONFLICT")
+        || stdout.contains("could not apply")
+    {
+        return Ok(OperationActionResult { halted: true });
+    }
+    let msg = if stderr.is_empty() { stdout } else { stderr };
+    Err(format!("{} failed: {}", label, msg))
 }
 
 /// Result of starting an interactive rebase. `conflict` is true when the rebase
@@ -769,6 +801,112 @@ pub(crate) async fn git_interactive_rebase(
     }
     let msg = if stderr.is_empty() { stdout } else { stderr };
     Err(format!("git rebase -i failed: {}", msg))
+}
+
+/// Rebase the current branch onto `onto`, non-interactively.
+///
+/// v3.11 — added for apply-from-preview, which needs to run the operation the
+/// Conflict Predictor simulated. `ops.rs` already had `git_pull` (which can
+/// rebase), `git_rebase_action` (continue/skip/abort on an *in-progress*
+/// rebase) and `git_interactive_rebase`, but no plain `git rebase <onto>`.
+///
+/// Returns `conflict: true` when the rebase halts on a conflict, exactly like
+/// `git_interactive_rebase`, so the frontend drives continue/skip/abort
+/// through the same path afterwards.
+///
+/// `GIT_EDITOR=true` keeps git from opening an editor on a halt, and
+/// `GIT_TERMINAL_PROMPT=0` makes a credential prompt fail fast instead of
+/// hanging a headless process forever.
+#[tauri::command]
+pub(crate) async fn git_rebase_onto(
+    cwd: String,
+    onto: String,
+) -> Result<InteractiveRebaseResult, String> {
+    let target = onto.trim().to_string();
+    if target.is_empty() {
+        return Err("rebase target must not be empty".to_string());
+    }
+    // A ref starting with `-` would be read by git as an option. Every other
+    // argument is passed positionally, never interpolated into a shell string.
+    if target.starts_with('-') {
+        return Err(format!("invalid rebase target: {}", target));
+    }
+
+    let _repo = repo_lock::write(&cwd);
+    let _t0 = Instant::now();
+    let output = git_cmd()
+        .args(["rebase", &target])
+        .env("GIT_EDITOR", "true")
+        .env("EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // The conflict check below matches git's own words; pin the locale so
+        // it does not depend on how git was built (design §3).
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "")
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| format!("Failed to run git rebase: {}", e))?;
+    record_cmd(
+        "git rebase",
+        &cwd,
+        _t0.elapsed().as_millis() as u64,
+        output.status.code().unwrap_or(-1),
+    );
+
+    if output.status.success() {
+        return Ok(InteractiveRebaseResult { conflict: false });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stderr.contains("CONFLICT")
+        || stderr.contains("could not apply")
+        || stdout.contains("CONFLICT")
+        || stdout.contains("could not apply")
+    {
+        return Ok(InteractiveRebaseResult { conflict: true });
+    }
+    let msg = if stderr.is_empty() { stdout } else { stderr };
+    Err(format!("git rebase failed: {}", msg))
+}
+
+// ─── .gitignore ────────────────────────────────────────────────
+
+/// Append `path` to the repo's `.gitignore`, once.
+///
+/// `backend.ts` has invoked this command since the context-menu action
+/// shipped, but only the Node dev-server route existed, so the action worked
+/// under `dev:web` and threw in the packaged app (issue #183). Semantics
+/// mirror `/api/git-gitignore`: create the file if absent, skip an entry that
+/// is already there, and always leave a trailing newline.
+#[tauri::command]
+pub(crate) async fn git_add_to_gitignore(cwd: String, path: String) -> Result<(), String> {
+    let entry = path.trim().to_string();
+    if entry.is_empty() {
+        return Err("gitignore entry must not be empty".to_string());
+    }
+    // The entry becomes one line of a config file. A newline inside it would
+    // silently add rules the user never asked for.
+    if entry.contains('\n') || entry.contains('\r') {
+        return Err("gitignore entry must be a single line".to_string());
+    }
+
+    let _repo = repo_lock::write(&cwd);
+    let file = safe_repo_path(&cwd, ".gitignore")?;
+    let existing = std::fs::read_to_string(&file).unwrap_or_default();
+
+    if existing.lines().any(|l| l == entry) {
+        return Ok(());
+    }
+
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&entry);
+    next.push('\n');
+
+    std::fs::write(&file, next).map_err(|e| format!("Failed to write .gitignore: {}", e))
 }
 
 // ─── Git discard ───────────────────────────────────────────────
@@ -1391,60 +1529,6 @@ pub(crate) async fn git_cherry_pick(
             stderr
         },
         conflicts: Some(has_conflicts),
-    })
-}
-
-#[tauri::command]
-pub(crate) async fn git_cherry_pick_abort(cwd: String) -> Result<(), String> {
-    let _t0 = Instant::now();
-    let output = git_cmd()
-        .args(["cherry-pick", "--abort"])
-        .current_dir(&cwd)
-        .output()
-        .map_err(|e| format!("Failed to abort cherry-pick: {}", e))?;
-    record_cmd(
-        "git cherry-pick --abort",
-        &cwd,
-        _t0.elapsed().as_millis() as u64,
-        output.status.code().unwrap_or(-1),
-    );
-    if !output.status.success() {
-        return Err(format!(
-            "cherry-pick --abort failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub(crate) async fn git_cherry_pick_continue(cwd: String) -> Result<GitPushPullResult, String> {
-    let _repo = repo_lock::write(&cwd);
-    let _t0 = Instant::now();
-    let output = git_cmd()
-        .args(["cherry-pick", "--continue"])
-        .current_dir(&cwd)
-        .env("GIT_EDITOR", "true") // skip editor for commit message
-        .output()
-        .map_err(|e| format!("Failed to continue cherry-pick: {}", e))?;
-    record_cmd(
-        "git cherry-pick --continue",
-        &cwd,
-        _t0.elapsed().as_millis() as u64,
-        output.status.code().unwrap_or(-1),
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    Ok(GitPushPullResult {
-        success: output.status.success(),
-        message: if output.status.success() {
-            stdout
-        } else {
-            stderr
-        },
-        conflicts: None,
     })
 }
 
@@ -2654,16 +2738,23 @@ pub(crate) async fn git_worktree_repair(cwd: String, paths: Vec<String>) -> Resu
 
 // ─── Clone progress helpers ──────────────────────────────────
 //
-// `git clone --progress` writes progress lines to stderr, mostly
-// terminated by \r (carriage return) for in-place updates, not \n.
-// We read stderr in raw chunks, split on both \r and \n, and emit a
-// `clone-progress` Tauri event for each meaningful line so the
-// CloneModal.vue can render a live progress bar.
+// `git clone --progress` (and, since v3.10.0, `git fetch --progress`) writes
+// progress lines to stderr, mostly terminated by \r (carriage return) for
+// in-place updates, not \n. We read stderr in raw chunks, split on both \r
+// and \n, and forward each meaningful line over a per-invoke
+// `tauri::ipc::Channel<CloneProgress>` (v3.10.0) so CloneModal.vue and the
+// header's fetch indicator can render a live progress bar. This replaced a
+// global `app_handle.emit("clone-progress", ...)` broadcast, which had no
+// way to tell two concurrent operations' streams apart.
 
-/// One progress update emitted as a Tauri event.
+/// One progress update sent over an IPC `Channel`. Shared by `git_clone` and
+/// `git_fetch`: `git fetch --progress` emits the same "Receiving objects /
+/// Resolving deltas" vocabulary as clone, so `parse_clone_progress` handles
+/// both without a second shape.
 #[derive(serde::Serialize, Clone)]
-struct CloneProgress {
-    stage: String, // "init" | "counting" | "compressing" | "receiving" | "resolving" | "done"
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CloneProgress {
+    stage: String, // "init" | "counting" | "compressing" | "receiving" | "resolving" | "done" | "info"
     percent: f32,  // 0 – 100
     message: String, // raw trimmed line
 }
@@ -2736,15 +2827,59 @@ fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
     })
 }
 
+/// Reads a child process's piped stderr to completion, parsing each
+/// progress line via `parse_clone_progress` and forwarding it over
+/// `on_progress`. Splits on both `\r` and `\n` because git rewrites
+/// progress lines in place with `\r`. Returns the raw stderr bytes so the
+/// caller can build an error message if the process fails.
+///
+/// Buffers raw bytes (not decoded strings) across reads: a multi-byte UTF-8
+/// character can land right on a chunk boundary, and decoding each chunk
+/// independently via `from_utf8_lossy` before concatenating would mangle
+/// both halves into replacement characters even though the full byte
+/// sequence is valid once assembled. `\r`/`\n` are single-byte ASCII values
+/// that can never appear inside a multi-byte sequence, so splitting on raw
+/// bytes here never itself corrupts a character — only a complete line's
+/// bytes are ever decoded, as a whole.
+fn stream_progress(
+    stderr: &mut impl std::io::Read,
+    on_progress: &tauri::ipc::Channel<CloneProgress>,
+) -> Vec<u8> {
+    let mut all_stderr: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 512];
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                all_stderr.extend_from_slice(&buf[..n]);
+                carry.extend_from_slice(&buf[..n]);
+                let mut line_start = 0;
+                for i in 0..carry.len() {
+                    if carry[i] == b'\r' || carry[i] == b'\n' {
+                        let line = String::from_utf8_lossy(&carry[line_start..i]);
+                        if let Some(prog) = parse_clone_progress(&line) {
+                            let _ = on_progress.send(prog);
+                        }
+                        line_start = i + 1;
+                    }
+                }
+                carry.drain(..line_start);
+            }
+        }
+    }
+    if let Some(prog) = parse_clone_progress(&String::from_utf8_lossy(&carry)) {
+        let _ = on_progress.send(prog);
+    }
+    all_stderr
+}
+
 #[tauri::command]
 pub(crate) async fn git_clone(
     url: String,
     dest: String,
-    app_handle: tauri::AppHandle,
+    on_progress: tauri::ipc::Channel<CloneProgress>,
 ) -> Result<String, String> {
-    use std::io::Read;
-    use tauri::Emitter;
-
     let url_trim = url.trim().to_string();
     let dest_trim = dest.trim().to_string();
     if url_trim.is_empty() {
@@ -2753,46 +2888,30 @@ pub(crate) async fn git_clone(
     if dest_trim.is_empty() {
         return Err("Empty destination".to_string());
     }
+    // A URL starting with `-` lands in an argv slot git parses as an option
+    // (`--upload-pack=<cmd>` executes a command for the local and ssh
+    // transports). `--` below closes option parsing; this rejects the input
+    // outright so a mistyped or pasted `-`-prefixed URL can never reach it.
+    if url_trim.starts_with('-') {
+        return Err("Invalid URL".to_string());
+    }
 
     let _t0 = Instant::now();
 
     // --progress forces git to emit progress even when stderr is not a tty.
+    // `--` keeps a `-`-prefixed URL or destination positional.
     let mut child = git_cmd()
-        .args(["clone", "--progress", &url_trim, &dest_trim])
+        .args(["clone", "--progress", "--", &url_trim, &dest_trim])
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to spawn git clone: {}", e))?;
 
-    // Stream stderr → parse progress lines → emit Tauri events.
-    // Split on both \r and \n because git uses \r for in-place rewrites.
-    let mut all_stderr: Vec<u8> = Vec::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let mut buf = [0u8; 512];
-        let mut carry = String::new();
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    all_stderr.extend_from_slice(&buf[..n]);
-                    let chunk = String::from_utf8_lossy(&buf[..n]);
-                    let combined = carry.clone() + &chunk;
-                    let parts: Vec<&str> = combined.split(['\r', '\n']).collect();
-                    let carry_idx = parts.len().saturating_sub(1);
-                    carry = parts[carry_idx].to_string();
-                    for part in &parts[..carry_idx] {
-                        if let Some(prog) = parse_clone_progress(part) {
-                            let _ = app_handle.emit("clone-progress", prog);
-                        }
-                    }
-                }
-            }
-        }
-        // Flush carry
-        if let Some(prog) = parse_clone_progress(&carry) {
-            let _ = app_handle.emit("clone-progress", prog);
-        }
-    }
+    let all_stderr = if let Some(mut stderr) = child.stderr.take() {
+        stream_progress(&mut stderr, &on_progress)
+    } else {
+        Vec::new()
+    };
 
     let status = child
         .wait()
@@ -2813,17 +2932,307 @@ pub(crate) async fn git_clone(
         });
     }
 
-    // Emit final "done" event
-    let _ = app_handle.emit(
-        "clone-progress",
-        CloneProgress {
-            stage: "done".into(),
-            percent: 100.0,
-            message: "Clone complete".to_string(),
-        },
-    );
+    // Send final "done" event
+    let _ = on_progress.send(CloneProgress {
+        stage: "done".into(),
+        percent: 100.0,
+        message: "Clone complete".to_string(),
+    });
 
     Ok(dest_trim)
+}
+
+#[cfg(test)]
+mod clone_fetch_channel_tests {
+    use super::*;
+    use crate::git::cmd::git_binary;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    impl TempRepo {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "gitwand-clone-fetch-channel-test-{}-{}-{}",
+                pid, n, nanos
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = TempRepo { path: dir };
+            repo.git_ok(&["init", "-q", "-b", "main"]);
+            repo.git_ok(&["config", "user.name", "Test"]);
+            repo.git_ok(&["config", "user.email", "test@example.com"]);
+            repo.git_ok(&["config", "commit.gpgsign", "false"]);
+            repo
+        }
+        fn cwd(&self) -> String {
+            self.path.to_str().unwrap().to_string()
+        }
+        fn git(&self, args: &[&str]) -> std::process::Output {
+            Command::new(git_binary())
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} spawn: {}", args, e))
+        }
+        fn git_ok(&self, args: &[&str]) {
+            let out = self.git(args);
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fn write(&self, rel: &str, content: &str) {
+            let p = self.path.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+        fn commit_all(&self, msg: &str) {
+            self.git_ok(&["add", "-A"]);
+            self.git_ok(&["commit", "-q", "-m", msg]);
+        }
+    }
+
+    fn make_bare_remote() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gitwand-clone-fetch-channel-bare-{}-{}-{}",
+            pid, n, nanos
+        ));
+        let out = Command::new(git_binary())
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .arg(&dir)
+            .output()
+            .expect("git init --bare spawn");
+        assert!(
+            out.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    /// Collects every `CloneProgress` sent over a Channel into a shared Vec,
+    /// decoding via `serde_json::Value` rather than adding a test-only
+    /// `Deserialize` impl to the production struct.
+    fn collecting_channel() -> (
+        tauri::ipc::Channel<CloneProgress>,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(s) = body {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    received_clone.lock().unwrap().push(v);
+                }
+            }
+            Ok(())
+        });
+        (channel, received)
+    }
+
+    #[test]
+    fn git_fetch_streams_progress_and_advances_remote_tracking_ref() {
+        let bare = make_bare_remote();
+
+        let repo = TempRepo::new();
+        repo.write("a.txt", "1");
+        repo.commit_all("c1");
+        repo.git_ok(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        repo.git_ok(&["push", "-q", "origin", "main"]);
+
+        // A second working copy pushes a new commit to the shared remote so
+        // `repo`'s upcoming fetch has objects to transfer.
+        let pusher = TempRepo::new();
+        pusher.git_ok(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        pusher.git_ok(&["fetch", "-q", "origin", "main"]);
+        pusher.git_ok(&["reset", "-q", "--hard", "origin/main"]);
+        pusher.write("b.txt", "2");
+        pusher.commit_all("c2");
+        pusher.git_ok(&["push", "-q", "origin", "main"]);
+        let expected_sha = String::from_utf8_lossy(&pusher.git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+
+        let (channel, received) = collecting_channel();
+        let result = tauri::async_runtime::block_on(git_fetch(repo.cwd(), channel))
+            .expect("git_fetch failed");
+        assert!(result.success, "fetch should succeed: {}", result.message);
+
+        let new_sha = String::from_utf8_lossy(&repo.git(&["rev-parse", "origin/main"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            new_sha, expected_sha,
+            "origin/main must advance to the pushed commit after fetch"
+        );
+
+        let msgs = received.lock().unwrap();
+        assert!(
+            !msgs.is_empty(),
+            "expected at least the synthetic 'done' progress event"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.get("stage").and_then(|s| s.as_str()) == Some("done")),
+            "expected a 'done' stage event on success, got {:?}",
+            *msgs
+        );
+
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// A `Read` impl that yields exactly one caller-supplied chunk per
+    /// `read()` call — used to force `stream_progress` to see a multi-byte
+    /// UTF-8 character split across two separate reads, which a real pipe
+    /// can do at any byte offset regardless of character boundaries.
+    struct ChunkedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    /// Regression for the multi-byte UTF-8 chunk-boundary corruption
+    /// (adversarial review of PR #178, Minor 2): decoding each raw chunk
+    /// independently via `String::from_utf8_lossy` before concatenating with
+    /// the carry buffer mangles a character split across the boundary into
+    /// replacement characters, even though the full byte sequence is valid
+    /// UTF-8 once assembled.
+    #[test]
+    fn stream_progress_handles_multibyte_utf8_split_across_chunks() {
+        let line = "remote: 日本語ブランチ\n";
+        let bytes = line.as_bytes();
+        // "remote: " is 8 ASCII bytes; "日" is E6 97 A5. Split after the
+        // second byte of that 3-byte sequence, mid-character.
+        let split_at = 8 + 2;
+        let (first, second) = bytes.split_at(split_at);
+
+        let mut reader = ChunkedReader {
+            chunks: std::collections::VecDeque::from(vec![first.to_vec(), second.to_vec()]),
+        };
+        let (channel, received) = collecting_channel();
+
+        stream_progress(&mut reader, &channel);
+
+        let msgs = received.lock().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| { m.get("message").and_then(|s| s.as_str()) == Some(line.trim()) }),
+            "expected the multi-byte line to decode intact, got {:?}",
+            *msgs
+        );
+        assert!(
+            !msgs.iter().any(|m| {
+                m.get("message")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s.contains('\u{FFFD}'))
+            }),
+            "no message should contain a UTF-8 replacement character, got {:?}",
+            *msgs
+        );
+    }
+
+    #[test]
+    fn git_fetch_reports_failure_without_a_done_event() {
+        let repo = TempRepo::new();
+        // A remote pointing at a path that isn't a git repository — `git
+        // fetch` must fail cleanly rather than hang, and must not claim
+        // success via a "done" event. (An unconfigured `origin` is not
+        // enough to exercise this: `git fetch` with no remotes at all is a
+        // silent no-op that exits 0.)
+        repo.git_ok(&["remote", "add", "origin", "/no/such/path"]);
+        let (channel, received) = collecting_channel();
+        let result = tauri::async_runtime::block_on(git_fetch(repo.cwd(), channel))
+            .expect("git_fetch command itself should not error");
+        assert!(!result.success, "fetch with no remote must fail");
+        assert!(!result.message.is_empty(), "failure must carry a message");
+
+        let msgs = received.lock().unwrap();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.get("stage").and_then(|s| s.as_str()) == Some("done")),
+            "a failed fetch must not send a 'done' event, got {:?}",
+            *msgs
+        );
+    }
+
+    #[test]
+    fn git_clone_streams_progress_and_returns_dest() {
+        let bare = make_bare_remote();
+        let seed = TempRepo::new();
+        seed.write("a.txt", "1");
+        seed.commit_all("c1");
+        seed.git_ok(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        seed.git_ok(&["push", "-q", "origin", "main"]);
+
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dest = std::env::temp_dir().join(format!(
+            "gitwand-clone-fetch-channel-dest-{}-{}",
+            std::process::id(),
+            n
+        ));
+
+        let (channel, received) = collecting_channel();
+        let result = tauri::async_runtime::block_on(git_clone(
+            bare.to_str().unwrap().to_string(),
+            dest.to_str().unwrap().to_string(),
+            channel,
+        ));
+        assert!(result.is_ok(), "git_clone failed: {:?}", result.err());
+        assert_eq!(result.unwrap(), dest.to_str().unwrap());
+        assert!(
+            dest.join("a.txt").exists(),
+            "cloned repo should contain a.txt"
+        );
+
+        let msgs = received.lock().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.get("stage").and_then(|s| s.as_str()) == Some("done")),
+            "expected a 'done' stage event, got {:?}",
+            *msgs
+        );
+
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 }
 
 #[tauri::command]
@@ -4458,6 +4867,68 @@ mod tree_conflict_tests {
         let _ = repo.git(&["merge", "--no-edit", "main"]);
     }
 
+    // ── .gitignore append (issue #183) ────────────────────────
+    //
+    // `backend.ts` has invoked a `git_add_to_gitignore` Tauri command since
+    // the context-menu action shipped, but no such command existed: only the
+    // Node dev-server had the route. The action therefore worked under
+    // dev:web and threw in the packaged app. Semantics mirror
+    // `/api/git-gitignore`: append once, keep a trailing newline, never
+    // duplicate an entry.
+
+    #[test]
+    fn gitignore_append_creates_the_file_when_absent() {
+        let repo = TempRepo::new();
+        tauri::async_runtime::block_on(git_add_to_gitignore(repo.cwd(), "build/".to_string()))
+            .expect("git_add_to_gitignore failed");
+
+        let content = std::fs::read_to_string(repo.path.join(".gitignore")).unwrap();
+        assert_eq!(content, "build/\n");
+    }
+
+    #[test]
+    fn gitignore_append_does_not_duplicate_an_existing_entry() {
+        let repo = TempRepo::new();
+        repo.write(".gitignore", "node_modules/\nbuild/\n");
+
+        tauri::async_runtime::block_on(git_add_to_gitignore(repo.cwd(), "build/".to_string()))
+            .expect("git_add_to_gitignore failed");
+
+        let content = std::fs::read_to_string(repo.path.join(".gitignore")).unwrap();
+        assert_eq!(content, "node_modules/\nbuild/\n", "entry already present");
+    }
+
+    #[test]
+    fn gitignore_append_separates_from_a_file_with_no_trailing_newline() {
+        let repo = TempRepo::new();
+        repo.write(".gitignore", "node_modules/");
+
+        tauri::async_runtime::block_on(git_add_to_gitignore(repo.cwd(), "build/".to_string()))
+            .expect("git_add_to_gitignore failed");
+
+        let content = std::fs::read_to_string(repo.path.join(".gitignore")).unwrap();
+        assert_eq!(content, "node_modules/\nbuild/\n");
+    }
+
+    #[test]
+    fn gitignore_append_rejects_a_path_carrying_a_newline() {
+        let repo = TempRepo::new();
+        let err = tauri::async_runtime::block_on(git_add_to_gitignore(
+            repo.cwd(),
+            "build/\n*.key".to_string(),
+        ))
+        .expect_err("a multi-line entry must be refused");
+        assert!(
+            err.contains("single line"),
+            "error should explain the constraint, got: {}",
+            err
+        );
+        assert!(
+            !repo.path.join(".gitignore").exists(),
+            "nothing should be written on refusal"
+        );
+    }
+
     #[test]
     fn detects_modify_delete_as_tree_conflict() {
         let repo = TempRepo::new();
@@ -5486,5 +5957,51 @@ mod merge_no_ff_tests {
             1,
             "default merge must fast-forward (1 parent) when possible"
         );
+    }
+}
+
+#[cfg(test)]
+mod operation_action_tests {
+    use super::operation_action_args;
+
+    #[test]
+    fn builds_args_for_each_supported_pair() {
+        assert_eq!(
+            operation_action_args("merge", "abort").unwrap(),
+            vec!["merge", "--abort"]
+        );
+        assert_eq!(
+            operation_action_args("merge", "continue").unwrap(),
+            vec!["merge", "--continue"]
+        );
+        assert_eq!(
+            operation_action_args("cherry_pick", "abort").unwrap(),
+            vec!["cherry-pick", "--abort"]
+        );
+        assert_eq!(
+            operation_action_args("cherry_pick", "skip").unwrap(),
+            vec!["cherry-pick", "--skip"]
+        );
+        assert_eq!(
+            operation_action_args("revert", "continue").unwrap(),
+            vec!["revert", "--continue"]
+        );
+        assert_eq!(
+            operation_action_args("rebase", "skip").unwrap(),
+            vec!["rebase", "--skip"]
+        );
+    }
+
+    #[test]
+    fn refuses_merge_skip_because_git_has_no_such_option() {
+        assert!(operation_action_args("merge", "skip").is_err());
+    }
+
+    #[test]
+    fn refuses_unknown_operation_or_action() {
+        assert!(operation_action_args("bisect", "abort").is_err());
+        assert!(operation_action_args("merge", "quit").is_err());
+        // An argument that would be read as an option must never reach git.
+        assert!(operation_action_args("--upload-pack=evil", "abort").is_err());
     }
 }

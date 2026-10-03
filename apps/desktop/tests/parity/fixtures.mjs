@@ -111,10 +111,43 @@ export function fixtureCursorOriginRemote() {
 }
 
 /**
+ * Fixture « remote Gitea » : un commit, plus un remote `origin` pointant sur
+ * un host Gitea reconnaissable depuis l'URL seule (codeberg.org).
+ */
+export function fixtureGiteaRemote() {
+  const cwd = mkTempRepo("gw-gitea-remote-");
+  commitFile(cwd, "README.md", "# Parity Fixture\n", "initial commit", 0);
+  execFileSync("git", [
+    "-C", cwd, "remote", "add", "origin",
+    "https://codeberg.org/acme/checkout.git",
+  ]);
+  return cwd;
+}
+
+/**
+ * Fixture « remote Azure DevOps nommé forgejo-mirror » : un commit, plus un
+ * remote `origin` pointant sur `dev.azure.com`, dont le nom de dépôt contient
+ * "forgejo". Verrouille que la branche gitea (qui matche "gitea"/"forgejo" en
+ * sous-chaîne n'importe où dans l'URL) reste ordonnée après la branche azure
+ * des deux côtés, sinon ce remote misdétecte en `gitea` au lieu de `azure`.
+ */
+export function fixtureAzureForgejoMirrorRemote() {
+  const cwd = mkTempRepo("gw-azure-forgejo-remote-");
+  commitFile(cwd, "README.md", "# Parity Fixture\n", "initial commit", 0);
+  execFileSync("git", [
+    "-C", cwd, "remote", "add", "origin",
+    "https://dev.azure.com/acme/tools/_git/forgejo-mirror",
+  ]);
+  return cwd;
+}
+
+/**
  * Fixture « dirty » : 3 commits, un fichier modifié non stagé, un nouveau
- * fichier untracked, un fichier stagé.
+ * fichier untracked, un fichier stagé, et un *dossier* entièrement untracked.
  *
- * Couvre les sections `unstaged`, `staged`, `untracked` de git_status.
+ * Couvre les sections `unstaged`, `staged`, `untracked` de git_status, dont
+ * la récursion dans les dossiers jamais stagés (issue #181 : sans
+ * `--untracked-files=all`, git ne remonte que `newdir/`).
  */
 export function fixtureDirty() {
   const cwd = mkTempRepo("gw-dirty-");
@@ -129,6 +162,10 @@ export function fixtureDirty() {
   execFileSync("git", ["-C", cwd, "add", "--", "c.txt"]);
   // d.txt untracked
   writeFileSync(join(cwd, "d.txt"), "delta\n", "utf-8");
+  // newdir/ : dossier jamais stagé, avec un sous-dossier
+  mkdirSync(join(cwd, "newdir", "sub"), { recursive: true });
+  writeFileSync(join(cwd, "newdir", "e.txt"), "epsilon\n", "utf-8");
+  writeFileSync(join(cwd, "newdir", "sub", "f.txt"), "zeta\n", "utf-8");
 
   return cwd;
 }
@@ -219,4 +256,196 @@ export function fixtureSubmodule() {
   execFileSync("git", ["-C", cwd, "commit", "-m", "add submodule libs/inner", "--quiet"], { env });
 
   return { cwd, subPath: "libs/inner" };
+}
+
+/**
+ * Repo with one tracked file carrying an unstaged edit AND a staged edit on a
+ * second file, so git-diff parity covers both `staged` values.
+ */
+export function fixtureDiff() {
+  const cwd = mkTempRepo("gw-parity-diff-");
+  commitFile(cwd, "a.txt", "one\ntwo\nthree\n", "init a", 0);
+  commitFile(cwd, "b.txt", "alpha\nbeta\n", "init b", 1);
+  writeFileSync(join(cwd, "a.txt"), "one\nTWO\nthree\n");
+  writeFileSync(join(cwd, "b.txt"), "alpha\nBETA\n");
+  execFileSync("git", ["-C", cwd, "add", "--", "b.txt"]);
+  return cwd;
+}
+
+/** Repo whose single file was authored across three commits, for blame parity. */
+export function fixtureBlame() {
+  const cwd = mkTempRepo("gw-parity-blame-");
+  commitFile(cwd, "a.txt", "one\ntwo\nthree\n", "c1", 0);
+  commitFile(cwd, "a.txt", "one\ntwo\nTHREE\n", "c2", 1);
+  commitFile(cwd, "a.txt", "one\nTWO\nTHREE\nfour\n", "c3", 2);
+  return cwd;
+}
+
+/**
+ * Fixture "untracked dirs": one never-staged folder with a subfolder, plus a
+ * nested git repo living inside the working tree.
+ *
+ * Covers the two shapes `git_diff` can be handed a directory path for
+ * (issue #183): a plain folder, whose files git lists, and a nested repo,
+ * which git refuses to look inside.
+ */
+export function fixtureUntrackedDirs() {
+  const cwd = mkTempRepo("gw-untracked-dirs-");
+  commitFile(cwd, "README.md", "# Parity Fixture\n", "initial commit", 0);
+  commitFile(cwd, "tracked.txt", "tracked\n", "add tracked.txt", 1);
+
+  // README.md modified, unstaged: a real diff to compare against.
+  // tracked.txt is left untouched: tracked with nothing to show.
+  writeFileSync(join(cwd, "README.md"), "# Parity Fixture\nmodified\n", "utf-8");
+
+  // newdir/: plain untracked folder, one level of nesting.
+  mkdirSync(join(cwd, "newdir", "sub"), { recursive: true });
+  writeFileSync(join(cwd, "newdir", "e.txt"), "epsilon\n", "utf-8");
+  writeFileSync(join(cwd, "newdir", "sub", "f.txt"), "zeta\n", "utf-8");
+
+  // inner/: an independent repo. git never lists its contents from here.
+  const inner = join(cwd, "inner");
+  mkdirSync(inner, { recursive: true });
+  execFileSync("git", ["init", "--initial-branch=main", "--quiet", inner]);
+  writeFileSync(join(inner, "c.txt"), "gamma\n", "utf-8");
+
+  return cwd;
+}
+
+/**
+ * Fixture "read-file": one ordinary UTF-8 text file, and one file whose bytes
+ * are not valid UTF-8 (a lone 0xFF, as a minified bundle or a Latin-1 source
+ * would produce).
+ *
+ * The invalid one is the point. Rust's `read_to_string` rejects it while
+ * `readFileSync(path, "utf-8")` used to substitute U+FFFD and succeed, and
+ * that gap hid a real bug from `pnpm dev:web` QA entirely (issue #188).
+ */
+export function fixtureReadFile() {
+  const cwd = mkTempRepo("gw-read-file-");
+  commitFile(cwd, "ok.txt", "héllo wörld\n", "add ok.txt", 0);
+
+  // Deliberately raw bytes, not a string: 0xFF is never a valid UTF-8 lead byte.
+  writeFileSync(join(cwd, "bad.bin"), Buffer.from([0x61, 0xff, 0xfe, 0x62, 0x0a]));
+
+  return cwd;
+}
+
+// ─── Conflict Predictor fixtures (v3.11.0) ─────────────────────────────────
+
+/**
+ * A repo where `main` and `topic` both edit the same file, plus a file each
+ * side touched alone, plus one added on `topic` and deleted on `main`.
+ *
+ * `paths.dotted` and `paths.slashed` both collapsed to the scratch prefix
+ * `a_b_ts` under the pre-v3.11 naming scheme, so they are here deliberately.
+ */
+export function fixturePreviewMerge() {
+  const cwd = mkTempRepo("gw-preview-merge-");
+  commitFile(cwd, "shared.txt", "base line\n", "base", 0);
+  commitFile(cwd, "a/b.ts", "slashed base\n", "add a/b.ts", 1);
+  commitFile(cwd, "a.b.ts", "dotted base\n", "add a.b.ts", 2);
+  commitFile(cwd, "doomed.txt", "delete me on main\n", "add doomed.txt", 3);
+
+  execFileSync("git", ["-C", cwd, "checkout", "-b", "topic", "--quiet"]);
+  commitFile(cwd, "shared.txt", "topic line\n", "topic edits shared", 4);
+  commitFile(cwd, "a/b.ts", "slashed topic\n", "topic edits a/b.ts", 5);
+  commitFile(cwd, "a.b.ts", "dotted topic\n", "topic edits a.b.ts", 6);
+  commitFile(cwd, "topic-only.txt", "only topic\n", "topic adds its own file", 7);
+  commitFile(cwd, "doomed.txt", "topic keeps editing it\n", "topic edits doomed", 8);
+
+  execFileSync("git", ["-C", cwd, "checkout", "main", "--quiet"]);
+  commitFile(cwd, "shared.txt", "main line\n", "main edits shared", 9);
+  commitFile(cwd, "a/b.ts", "slashed main\n", "main edits a/b.ts", 10);
+  commitFile(cwd, "a.b.ts", "dotted main\n", "main edits a.b.ts", 11);
+  commitFile(cwd, "main-only.txt", "only main\n", "main adds its own file", 12);
+  execFileSync("git", ["-C", cwd, "rm", "--quiet", "--", "doomed.txt"]);
+  execFileSync("git", ["-C", cwd, "commit", "-m", "main deletes doomed", "--quiet"], {
+    env: { ...process.env, ...commitEnv(13) },
+  });
+
+  return cwd;
+}
+
+/**
+ * A 3-commit topic stack where two of the commits touch the same file, so the
+ * per-file deduplication across replayed commits is actually exercised.
+ */
+export function fixturePreviewRebase() {
+  const cwd = mkTempRepo("gw-preview-rebase-");
+  commitFile(cwd, "shared.txt", "base\n", "base", 0);
+  commitFile(cwd, "other.txt", "other base\n", "add other.txt", 1);
+
+  execFileSync("git", ["-C", cwd, "checkout", "-b", "topic", "--quiet"]);
+  commitFile(cwd, "shared.txt", "topic step 1\n", "topic 1 edits shared", 2);
+  commitFile(cwd, "other.txt", "other topic\n", "topic 2 edits other", 3);
+  commitFile(cwd, "shared.txt", "topic step 3\n", "topic 3 edits shared again", 4);
+
+  execFileSync("git", ["-C", cwd, "checkout", "main", "--quiet"]);
+  commitFile(cwd, "shared.txt", "main moved on\n", "main edits shared", 5);
+
+  execFileSync("git", ["-C", cwd, "checkout", "topic", "--quiet"]);
+  return cwd;
+}
+
+/**
+ * A repo whose first commit is a root commit with no parent, used for the
+ * cherry-pick failure path, plus a normal conflicting commit on a side branch.
+ */
+export function fixturePreviewCherryPick() {
+  const cwd = mkTempRepo("gw-preview-cherry-");
+  commitFile(cwd, "shared.txt", "base\n", "root commit", 0);
+  const root = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+  execFileSync("git", ["-C", cwd, "checkout", "-b", "topic", "--quiet"]);
+  commitFile(cwd, "shared.txt", "topic\n", "topic edits shared", 1);
+  const topic = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+  commitFile(cwd, "fresh.txt", "brand new\n", "topic adds a new file", 2);
+  const clean = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+  execFileSync("git", ["-C", cwd, "checkout", "main", "--quiet"]);
+  commitFile(cwd, "shared.txt", "main\n", "main edits shared", 3);
+
+  return { cwd, root, topic, clean };
+}
+
+/**
+ * A topic branch that rebases onto `main` cleanly, or conflicts, depending on
+ * `conflicting`. Returned fresh each call: `git_rebase_onto` is destructive,
+ * so the two backends each need their own clone rather than sharing one cwd.
+ */
+export function fixtureRebaseOnto(conflicting) {
+  const cwd = mkTempRepo("gw-rebase-onto-");
+  commitFile(cwd, "shared.txt", "base\n", "base", 0);
+  commitFile(cwd, "side.txt", "side base\n", "add side.txt", 1);
+
+  execFileSync("git", ["-C", cwd, "checkout", "-b", "topic", "--quiet"]);
+  commitFile(cwd, conflicting ? "shared.txt" : "topic.txt", "topic work\n", "topic work", 2);
+
+  execFileSync("git", ["-C", cwd, "checkout", "main", "--quiet"]);
+  commitFile(cwd, conflicting ? "shared.txt" : "side.txt", "main work\n", "main work", 3);
+
+  execFileSync("git", ["-C", cwd, "checkout", "topic", "--quiet"]);
+  return cwd;
+}
+
+/**
+ * A merge that conflicts in two files at once: one the engine resolves on its
+ * own (whitespace-only), one it must refuse (two incompatible rewrites).
+ * Exactly the mixed case apply-from-preview has to stop halfway through.
+ */
+export function fixtureApplyFromPreview() {
+  const cwd = mkTempRepo("gw-apply-preview-");
+  commitFile(cwd, "spacing.ts", "const a = 1;\n", "base spacing", 0);
+  commitFile(cwd, "hard.ts", "export const mode = \"base\";\n", "base hard", 1);
+
+  execFileSync("git", ["-C", cwd, "checkout", "-b", "topic", "--quiet"]);
+  commitFile(cwd, "spacing.ts", "const a  = 1;\n", "topic respaces", 2);
+  commitFile(cwd, "hard.ts", "export const mode = \"topic\";\n", "topic rewrites", 3);
+
+  execFileSync("git", ["-C", cwd, "checkout", "main", "--quiet"]);
+  commitFile(cwd, "spacing.ts", "const   a = 1;\n", "main respaces", 4);
+  commitFile(cwd, "hard.ts", "export const mode = \"main\";\n", "main rewrites", 5);
+
+  return cwd;
 }

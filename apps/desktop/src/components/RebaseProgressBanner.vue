@@ -11,20 +11,30 @@
  * underneath stays fully reachable while conflicts are being resolved.
  */
 import { ref, computed } from "vue";
-import type { RepoOperationState } from "../utils/backend";
+import type { OperationKind, RepoOperationState } from "../utils/backend";
 import { t } from "../composables/useI18n";
 
 const props = defineProps<{
   repoState: RepoOperationState;
-  cwd: string;
   /** Driven by the parent while the whole-rebase auto-resolve loop runs. */
   autoResolving?: boolean;
+  /**
+   * v3.11 (#128 follow-up) — the halted commit was marked `split` in the
+   * interactive rebase. The parent resolves this; the banner only renders it.
+   */
+  pendingSplit?: boolean;
+  /**
+   * Runs the action and resolves when it is done. Supplied by App.vue so the
+   * confirmation, the error surface and the post-abort cleanup all live in one
+   * place instead of being split across this component.
+   */
+  onAction: (action: "continue" | "abort" | "skip") => Promise<void>;
 }>();
 
 const emit = defineEmits<{
-  (e: "action-done", action: "continue" | "abort" | "skip"): void;
   (e: "auto-resolve"): void;
-  (e: "error", msg: string): void;
+  /** v3.11 — open the split modal for the commit this rebase is halted on. */
+  (e: "split"): void;
 }>();
 
 const busy = ref(false);
@@ -39,21 +49,73 @@ const shortHead = computed(() =>
     : ""
 );
 
+/**
+ * Which operation this banner is driving. `rebase_interactive` collapses to
+ * `rebase`: continue/abort/skip are the same git subcommand either way.
+ */
+const operation = computed<OperationKind>(() =>
+  props.repoState.state === "rebase_interactive"
+    ? "rebase"
+    : (props.repoState.state as OperationKind),
+);
+
+/** A rebase owns the extras: step counter, split-at-edit-stop, auto-resolve. */
+const isRebase = computed(() => operation.value === "rebase");
+
+/** git has no `merge --skip`, so the button must not exist for a merge. */
+const canSkip = computed(() => operation.value !== "merge");
+
+/**
+ * The banner's title names the operation. Without this it read "Rebase paused"
+ * during a merge — caught in manual QA, and exactly the kind of thing that
+ * makes a UI untrustworthy.
+ */
+const pausedTitle = computed(() => {
+  switch (operation.value) {
+    case "cherry_pick":
+      return t("header.pausedCherryPick");
+    case "revert":
+      return t("header.pausedRevert");
+    case "merge":
+      return t("header.pausedMerge");
+    default:
+      return t("rebase.bannerTitle");
+  }
+});
+
+/** The abort button names the operation it is abandoning. */
+const abortLabel = computed(() => {
+  switch (operation.value) {
+    case "cherry_pick":
+      return t("header.abortCherryPick");
+    case "revert":
+      return t("header.abortRevert");
+    case "merge":
+      return t("header.abortMerge");
+    default:
+      return t("rebase.abort");
+  }
+});
+
 const stepLabel = computed(() => {
   if (props.repoState.step && props.repoState.total)
     return `${props.repoState.step} / ${props.repoState.total}`;
   return "";
 });
 
+/**
+ * Ask the parent to run the action; do not run it here.
+ *
+ * The banner used to call the IPC wrapper itself, which left no room for the
+ * confirmation an abort needs when it would discard resolution work — and put
+ * business logic in a component, which this codebase keeps in composables.
+ * App.vue owns the call now, through `runOperationAction`.
+ */
 async function runAction(action: "continue" | "abort" | "skip") {
   if (busy.value) return;
   busy.value = true;
   try {
-    const { gitRebaseAction } = await import("../utils/backend");
-    await gitRebaseAction(props.cwd, action);
-    emit("action-done", action);
-  } catch (err: any) {
-    emit("error", err?.message ?? String(err));
+    await props.onAction(action);
   } finally {
     busy.value = false;
   }
@@ -76,11 +138,11 @@ async function runAction(action: "continue" | "abort" | "skip") {
 
     <!-- Title + meta + hint, all inline -->
     <div class="rpm-text">
-      <span class="rpm-title">{{ t('rebase.bannerTitle') }}</span>
+      <span class="rpm-title">{{ pausedTitle }}</span>
       <span class="rpm-meta" v-if="shortHead || stepLabel">
         <code v-if="shortHead">{{ shortHead }}</code>
         <span v-if="repoState.targetBranch">→ <strong>{{ repoState.targetBranch }}</strong></span>
-        <span v-if="stepLabel" class="rpm-step">{{ stepLabel }}</span>
+        <span v-if="isRebase && stepLabel" class="rpm-step">{{ stepLabel }}</span>
       </span>
       <span class="rpm-hint" :class="repoState.hasConflict ? 'rpm-hint--conflict' : 'rpm-hint--ready'">
         {{ repoState.hasConflict ? t('rebase.bannerConflictHint') : t('rebase.bannerReadyHint') }}
@@ -90,24 +152,42 @@ async function runAction(action: "continue" | "abort" | "skip") {
     <!-- Actions -->
     <div class="rpm-actions">
       <button class="rpm-btn rpm-btn--danger" :disabled="anyBusy" @click="runAction('abort')">
-        {{ t('rebase.abort') }}
+        {{ abortLabel }}
       </button>
-      <button class="rpm-btn" :disabled="anyBusy" @click="runAction('skip')">
+      <button v-if="canSkip" class="rpm-btn" :disabled="anyBusy" @click="runAction('skip')">
         {{ t('rebase.skip') }}
       </button>
       <!-- Auto-resolve: drives the WHOLE rebase (resolve → stage → continue,
            looped across every step) until it finishes or hits a conflict it
            can't resolve. Engine-first, with AI fallback when configured. -->
-      <button v-if="repoState.hasConflict" class="rpm-btn rpm-btn--auto"
+      <button v-if="isRebase && repoState.hasConflict" class="rpm-btn rpm-btn--auto"
         :disabled="anyBusy" :title="t('rebase.resolveAutoHint')" @click="emit('auto-resolve')">
         <span v-if="autoResolving" class="rpm-spinner" aria-hidden="true" />
         {{ autoResolving ? t('rebase.resolveAutoBusy') : t('rebase.resolveAuto') }}
       </button>
-      <button class="rpm-btn rpm-btn--primary" :disabled="anyBusy || repoState.hasConflict"
+      <!-- v3.11 (#128 follow-up): closing RebaseEditor for the conflict banner
+           took the "Split this commit…" affordance with it, leaving only
+           Continue/Skip/Abort for the rest of the rebase.
+
+           Gated on `!hasConflict`, which is a correctness condition rather
+           than a cosmetic one. `gitSplitCommit` does `reset --mixed HEAD^`, so
+           it needs HEAD to BE the commit being split. Verified against real
+           git: at an `edit` stop HEAD is the freshly created commit, which is
+           right; at a conflict stop the commit does not exist yet and HEAD is
+           its parent, so splitting there would split the previous commit. -->
+      <button v-if="isRebase && pendingSplit && !repoState.hasConflict"
+        class="rpm-btn rpm-btn--primary rpm-btn--split"
+        :disabled="anyBusy" @click="emit('split')">
+        {{ t('rebase.splitThisCommit') }}
+      </button>
+      <!-- Demoted to neutral while Split is offered, so the two primaries do
+           not compete (same treatment RebaseEditor gives them). -->
+      <button class="rpm-btn" :class="{ 'rpm-btn--primary': !(pendingSplit && !repoState.hasConflict) }"
+        :disabled="anyBusy || repoState.hasConflict"
         :title="repoState.hasConflict ? t('rebase.bannerConflictHint') : t('rebase.continue')"
         @click="runAction('continue')">
         <span v-if="busy" class="rpm-spinner" aria-hidden="true" />
-        {{ t('rebase.continue') }}
+        {{ t('header.operationContinue') }}
       </button>
     </div>
   </div>
