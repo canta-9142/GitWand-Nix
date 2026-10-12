@@ -5,6 +5,22 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.12.2 — October 2026
+
+### AI listens to your language and model again
+
+In v3.12.1, the language and template you picked for a repository from an AI menu could quietly vanish: saving settings from somewhere else in the app wrote an older copy of them back. That is fixed, and every AI feature, from commit messages to conflict explanations, now turns your chosen language into the prompt the same way.
+
+The commit AI menu's language chips now translate the message you already have. Shorten, Add detail and Regenerate are gone from that menu; a custom prompt template does the same job.
+
+### Tell the AI what the diff can't
+
+PR creation, PR updates and release notes get a "ctx" button next to their AI action. Whatever you type there, the ticket it closes, the tone you want, what to leave out, is added to the prompt and remembered for that repository. The branch selector can also create a branch with an AI-suggested name.
+
+### Fixes and polish
+
+Your remotes' `HEAD` no longer shows up as a branch called "origin" in the PR base picker, and branches from remotes other than `origin` are treated as remote, not offered for deletion as local ones. The identity menu is no longer cut off by the commit rail. Modals and Help share one close button and larger titles, settings checkboxes render correctly on Linux, dock badges are centred, and split-button dividers and the diff minimap stay visible in light mode. The test suite also passes on machines set to a language other than English.
+
 ## v3.12.1 — October 2026
 
 ### Merging an AI task back never loses work

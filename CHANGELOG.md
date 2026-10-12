@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.12.2] - 2026-10-11
+
+### Added
+- **Extra context for AI-written PRs and release notes (#252).** PR creation, PR update and release-notes generation gain a "ctx" button on their AI split button. The free-form text typed there is kept per kind and per repository, and is appended to the prompt in its own delimited block.
+- **Create a branch with AI from the branch selector (#252).** The branch selector gets a create-with-AI action, and shows the generated branch name while it is being checked out. Its trigger animates its width when its content changes.
+
+### Changed
+- **The commit AI menu's language chips translate the current message (#252).** Picking a language now translates the message already in the box. The Shorten, Add detail and Regenerate actions are removed from the commit AI menu; the same results can be had with a custom prompt template.
+- **AI split buttons share one frame (#252).** Each segment used to draw its own gradient border, restarting the gradient at every seam and leaving the narrow middle segment looking borderless. One frame now wraps the whole button, and every AI split button uses the same style.
+- **Larger modal and Help titles (#253).** Modal and Help titles are bigger and use the shared font-size tokens.
+
+### Fixed
+- **AI generation follows the chosen language and model again (#252).** Saving settings from one place (the dock, the terminal, the file explorer…) wrote back a stale copy of them, silently dropping the per-repository AI language and template just picked from an AI menu. The shared settings now stay in step with every save. Every AI generator (commit message, PR description, summary and pre-review, release notes, stash message, conflict explanation) now maps the output language through one shared helper instead of its own copy.
+- **No phantom "origin" branch, and every remote's branches count as remote.** `refs/remotes/origin/HEAD` was listed as a branch called "origin", which showed up as a local branch in the PR base picker. Branches from a remote other than `origin` were treated as local, so the sidebar offered to delete them as local branches. Branch names and their remote flag now come from the full refname, with symrefs skipped, in the app and in the `pnpm dev:web` server alike.
+- **The identity menu is no longer clipped (#252).** It was cut off by the scrolling commit rail and drawn under the file list. It now floats above the window and closes when the page scrolls or the window is resized. The conventional-commit scroll arrows in the sidebar follow the actual scroll position.
+- **Modal close buttons line up, and light-theme details stay visible (#254).** Modals and Help share one close button. Settings checkboxes draw their own check mark, which WebKitGTK misplaced at 16px. Dock badge digits are centred and use tabular figures. Split-button and branch selector dividers, and the diff minimap's viewport, were invisible on the light theme; they now follow the theme.
+- **Tests pass on non-English machines (#251).** The desktop test suite pins its locale to `en-US` instead of inheriting the host's, and the CLI's offline DNS probe waits up to 5s instead of 2s.
+
 ## [3.12.1] - 2026-10-10
 
 ### Added
