@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **The AI review summary is generated once per PR head (#257).** Concurrent requests for the same PR used to start one generation each; they now share it.
+- **GitWand starts even when its global shortcut is taken (#256).** If another app already owned Cmd/Ctrl+Shift+G, GitWand aborted during startup. It now starts without the shortcut and logs why.
 
 ## [3.12.2] - 2026-10-11
 
