@@ -1348,10 +1348,10 @@ onMounted(() => {
         <div class="blog-teaser-header">
           <span class="blog-teaser-label">From the blog</span>
         </div>
-        <a href="/blog/v3-11-three-outcomes-not-two" class="blog-teaser-card">
-          <div class="blog-teaser-meta">September 21, 2026 · 9 min read</div>
-          <h3 class="blog-teaser-title">Three outcomes, not two: what went into GitWand v3.11</h3>
-          <p class="blog-teaser-excerpt">The Conflict Predictor stopped predicting and started running the merge, stopping on what needs a person. And a two-line bug report about an "Abort merge" button that lied led to the real fix: an operation ends three ways, not two. It completes, it halts on a further conflict, or it fails.</p>
+        <a href="/blog/reading-git-conflict-markers" class="blog-teaser-card">
+          <div class="blog-teaser-meta">October 13, 2026 · 8 min read</div>
+          <h3 class="blog-teaser-title">Reading a Git conflict marker: ours, theirs, base, diff3 and zdiff3</h3>
+          <p class="blog-teaser-excerpt">What sits between the markers Git writes into a conflicted file, why ours and theirs swap during a rebase, and the base section Git hides by default. One conflict in all three styles, the one config line to set, and how GitWand's engine uses the base to tell a trivial hunk from a real decision.</p>
           <span class="blog-teaser-cta">Read article →</span>
         </a>
       </div>
