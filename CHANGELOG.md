@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Act on PR comments from the PR detail view (#257).** On GitHub, you can reply to a review thread, edit or delete your own comments, resolve or unresolve a conversation, and copy a comment's link. Deleting the comment that starts a thread keeps its replies, and edits and replies are saved exactly as typed.
+- **A Force software rendering setting on Linux (#257).** Settings → General can turn GPU rendering off for systems where GitWand does not start. It applies at the next launch.
+
+### Changed
+- **Markdown is rendered by GitWand itself (#257).** markdown-it is replaced by an in-house renderer (`utils/markdown.ts`), still sanitized by DOMPurify. READMEs, PR descriptions and comments scroll noticeably faster. HTML comments stay hidden even when they span blank lines or sit inside a list item. A package version such as `vue@3.5.42` is no longer turned into an email link.
+- **Linux renders with the GPU by default (#257).** Software rendering (`WEBKIT_DISABLE_COMPOSITING_MODE`, `LIBGL_ALWAYS_SOFTWARE`, `GDK_BACKEND=x11`) used to be forced on every Linux launch to avoid the WebKitGTK EGL abort of #135 and #139. It is now applied only when a previous launch died before its page loaded, or when the setting is on. A launch marker under `~/.local/share/gitwand/` records the failure. A second instance that is still starting is not counted as a failure. Settings shows when the fallback was switched on automatically, and unticking it retries GPU rendering. Only DMA-BUF stays disabled on every launch.
+
+### Fixed
+- **The AI review summary is generated once per PR head (#257).** Concurrent requests for the same PR used to start one generation each; they now share it.
+
 ## [3.12.2] - 2026-10-11
 
 ### Added
