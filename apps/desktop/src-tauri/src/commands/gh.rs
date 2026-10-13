@@ -960,6 +960,87 @@ pub(crate) async fn gh_dismiss_review(
     .map_err(|e| e.to_string())?
 }
 
+/// Token for the review-comment and review-thread commands: the GitWand token
+/// when configured, else the `gh` CLI's own. These commands speak REST/GraphQL
+/// directly rather than through `gh api`, whose `-f` fields can't carry the
+/// integer `line`/`in_reply_to` values GitHub requires.
+fn review_api_token() -> Result<String, String> {
+    github_api::settings_github_token()
+        .or_else(gh_auth_token)
+        .ok_or_else(|| {
+            "GitHub authentication required (gh auth login or a token in Settings)".to_string()
+        })
+}
+
+/// Create an inline review comment or a reply (`CreatePrCommentParams`).
+#[tauri::command]
+pub(crate) async fn gh_pr_create_comment(
+    cwd: String,
+    number: i64,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_api::rest_pr_create_comment(&cwd, number, &params, &review_api_token()?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Edit the body of an inline review comment.
+#[tauri::command]
+pub(crate) async fn gh_pr_update_comment(
+    cwd: String,
+    number: i64,
+    comment_id: i64,
+    body: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_api::rest_pr_update_comment(&cwd, number, comment_id, &body, &review_api_token()?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete an inline review comment.
+#[tauri::command]
+pub(crate) async fn gh_pr_delete_comment(
+    cwd: String,
+    number: i64,
+    comment_id: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_api::rest_pr_delete_comment(&cwd, number, comment_id, &review_api_token()?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// List a PR's review threads with their resolution state.
+#[tauri::command]
+pub(crate) async fn gh_pr_review_threads(
+    cwd: String,
+    number: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_api::gql_pr_review_threads(&cwd, number, &review_api_token()?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Resolve or unresolve a PR review thread ("Resolve conversation").
+#[tauri::command]
+pub(crate) async fn gh_set_review_thread_resolved(
+    thread_id: String,
+    resolved: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_api::gql_set_review_thread_resolved(&thread_id, resolved, &review_api_token()?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn gh_request_reviewers_inner(cwd: String, number: i64, logins: Vec<String>) -> Result<(), String> {
     if let Some(tok) = github_api::settings_github_token() {
         return github_api::rest_request_reviewers(&cwd, number, &logins, &tok);

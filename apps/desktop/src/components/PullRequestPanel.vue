@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from "vue";
 import { safeHtml } from "../composables/useSafeHtml";
+import { escapeHtml } from "../utils/escapeHtml";
 import {
   ghListPrs,
   ghCreatePr,
@@ -340,7 +341,7 @@ async function handleReplyComment(inReplyToId: number, body: string) {
 
 async function handleEditComment(id: number, body: string) {
   try {
-    await ghPrUpdateComment(props.cwd, id, body);
+    await ghPrUpdateComment(props.cwd, id, body, selectedPr.value?.number);
     // Update locally
     const idx = prComments.value.findIndex((c) => c.id === id);
     if (idx !== -1) prComments.value[idx] = { ...prComments.value[idx], body, updated_at: new Date().toISOString() };
@@ -349,7 +350,7 @@ async function handleEditComment(id: number, body: string) {
 
 async function handleDeleteComment(id: number) {
   try {
-    await ghPrDeleteComment(props.cwd, id);
+    await ghPrDeleteComment(props.cwd, id, selectedPr.value?.number);
     prComments.value = prComments.value.filter((c) => c.id !== id && c.in_reply_to_id !== id);
     if (prDetail.value && prDetail.value.reviewComments > 0) prDetail.value.reviewComments--;
   } catch (err: any) { error.value = err.message; }
@@ -512,8 +513,7 @@ const checksUrl = computed(() => {
 
 
 function renderBody(body: string): string {
-  return body
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  return escapeHtml(body)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/`(.+?)`/g, '<code class="pr-code">$1</code>')
     .replace(/\n/g, "<br />");

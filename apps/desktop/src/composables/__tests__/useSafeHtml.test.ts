@@ -102,6 +102,13 @@ describe("safeHtml — raw HTML sanitization", () => {
     expect(out).toContain("<th>A</th>");
   });
 
+  it("drops a comment spanning blank lines inside a list item", () => {
+    const out = renderMarkdown("- item <!-- TODO\n\nhidden\n\n-->\n- next");
+    expect(out).not.toContain("hidden");
+    expect(out).not.toContain("--&gt;");
+    expect(out).toContain("next");
+  });
+
   it("returns empty string for nullish input", () => {
     expect(safeHtml(null)).toBe("");
     expect(safeHtml(undefined)).toBe("");
@@ -119,7 +126,7 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
   });
 
   it("strips raw HTML <script> tags embedded in markdown", () => {
-    // markdown-it (html: true) parses the raw HTML tag, and DOMPurify strips it.
+    // The renderer passes the raw HTML tag through, and DOMPurify strips it.
     const out = renderMarkdown("normal\n\n<script>alert(1)</script>\n\nmore");
     expect(out).not.toContain("<script");
     expect(out).not.toContain("alert(1)");
@@ -129,7 +136,7 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
 
   it("strips XSS payloads smuggled via inline HTML in markdown", () => {
     const out = renderMarkdown('click <img src=x onerror="alert(1)"> here');
-    // markdown-it (html: true) parses the raw HTML tag. DOMPurify allows the img tag,
+    // The renderer passes the raw HTML tag through. DOMPurify allows the img tag,
     // but strips the onerror handler.
     expect(out).toContain('<img src="x">');
     expect(out.toLowerCase()).not.toContain("onerror");
@@ -213,7 +220,7 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
   });
 
   it("neutralises javascript: links in markdown", () => {
-    // markdown-it's default link validator rejects javascript: URIs, so
+    // The renderer's link validator rejects javascript: URIs, so
     // the link is not parsed as a link at all — the source text remains
     // as inert markdown syntax. We assert no real <a href="javascript:">
     // ever reaches the DOM.
@@ -256,6 +263,20 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
   it("does not render single newlines as <br> when breaks is false (README behaviour)", () => {
     const out = renderMarkdown("line one\nline two", { breaks: false });
     expect(out).not.toContain("<br>");
+  });
+
+  it("drops HTML comments but keeps them inside code", () => {
+    const out = renderMarkdown("a <!-- hidden --> b\n\n<!-- block -->\n\n`<!-- code -->`");
+    expect(out).not.toContain("hidden");
+    expect(out).not.toContain("block");
+    expect(out).toContain("&lt;!-- code --&gt;");
+  });
+
+  it("drops a mid-paragraph comment spanning blank lines (README section hiding)", () => {
+    const out = renderMarkdown("text <!-- start\n\nhidden\n\nend --> more");
+    expect(out).not.toContain("hidden");
+    expect(out).toContain("text");
+    expect(out).toContain("more");
   });
 
   it("returns empty string for nullish input", () => {

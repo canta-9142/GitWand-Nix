@@ -14,6 +14,7 @@ pub(crate) mod network;
 pub(crate) mod ops;
 pub(crate) mod pr_edit;
 pub(crate) mod read;
+pub(crate) mod render_fallback;
 pub(crate) mod scratch;
 pub(crate) mod secrets;
 pub(crate) mod snapshots;

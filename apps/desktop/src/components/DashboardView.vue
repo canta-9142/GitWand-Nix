@@ -831,20 +831,16 @@ function formatDate(dateStr: string): string {
 
 // ─── README rendering ──────────────────────────────────────
 // Markdown parsing is delegated to the shared `useSafeHtml` composable
-// (markdown-it + DOMPurify). The only README-specific step kept here is
+// (`utils/markdown.ts` + DOMPurify). The only README-specific step kept here is
 // `extractReadmeHeader`, which promotes the HTML block that many
 // projects ship at the top of their README (title, tagline, nav links,
 // shields.io badges) into a dedicated styled header. Anything below
-// that block is run through the standard markdown-it renderer.
+// that block is run through the standard markdown renderer.
 function renderReadme(md: string, allowRemoteImages: boolean): string {
   const { headerHtml, rest } = extractReadmeHeader(md);
-  // Strip HTML comments early — READMEs often use them as section
-  // dividers, and we don't want them rendered as text. markdown-it's
-  // `html: false` mode escapes them, which looks noisy in the UI.
-  const cleaned = rest.replace(/<!--[\s\S]*?-->/g, "");
   // READMEs soft-wrap single newlines (GitHub behaviour) — disable `breaks` so
   // wrapped prose isn't broken up with spurious <br> tags.
-  return headerHtml + renderMarkdown(cleaned, { breaks: false, allowRemoteImages });
+  return headerHtml + renderMarkdown(rest, { breaks: false, allowRemoteImages });
 }
 
 // Remote images in the README (badges, screenshots) are withheld unless the
@@ -2363,6 +2359,11 @@ watch(
      aren't clipped at the card boundary. The outer dashboard scroll
      handles vertical overflow. */
   overflow: visible;
+  /* No drop shadow on this card only: a long README makes it tens of
+     thousands of px tall, and WebKitGTK repaints the `.card` shadow over its
+     full height on every scroll frame — measured ~78 ms/frame with it, 16 ms
+     without. (`contain: paint` would clip the deliberate overflow above.) */
+  box-shadow: none;
 }
 
 .readme-tabs {
@@ -2539,17 +2540,8 @@ watch(
 }
 
 .readme-formatted :deep(.md-check) {
-  list-style: none;
   margin-left: calc(-1 * var(--space-7));
   padding-left: 0;
-}
-.readme-formatted :deep(.md-check::before) {
-  content: "☐ ";
-  color: var(--color-text-muted);
-}
-.readme-formatted :deep(.md-checked::before) {
-  content: "☑ ";
-  color: var(--color-success);
 }
 
 .readme-formatted :deep(.md-img),

@@ -866,6 +866,18 @@ export interface PrReviewComment {
    *  resolved. `undefined` on forges/paths with no resolved-thread concept
    *  (GitHub review comments don't carry this field here). */
   resolved?: boolean;
+  /** Forge id of the review thread this comment belongs to, used to resolve
+   *  it. Set on GitHub (GraphQL thread node id); `undefined` elsewhere. */
+  thread_id?: string;
+}
+
+/** One PR review thread: the comment that opened it and its resolution state. */
+export interface PrReviewThread {
+  /** GraphQL node id of the thread. */
+  thread_id: string;
+  /** REST id of the thread's first comment. */
+  root_comment_id: number;
+  resolved: boolean;
 }
 
 /** Params for creating a new review comment. */
@@ -892,6 +904,30 @@ export async function ghPrComments(cwd: string, prNumber: number): Promise<PrRev
   const raw = await res.json();
   if (raw.error) throw new Error(raw.error);
   return raw as PrReviewComment[];
+}
+
+/** List a PR's review threads with their resolution state (GitHub GraphQL). */
+export async function ghPrReviewThreads(cwd: string, prNumber: number): Promise<PrReviewThread[]> {
+  if (isTauri()) return tauriInvoke<PrReviewThread[]>("gh_pr_review_threads", { cwd, number: prNumber });
+  const res = await devFetch(`${DEV_SERVER}/api/gh-pr-review-threads?cwd=${encodeURIComponent(cwd)}&number=${prNumber}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `gh pr review threads failed: ${res.status}`);
+  return data as PrReviewThread[];
+}
+
+/** Resolve (or unresolve) a PR review thread — "Resolve conversation". */
+export async function ghSetReviewThreadResolved(cwd: string, threadId: string, resolved: boolean): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gh_set_review_thread_resolved", { threadId, resolved });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gh-set-review-thread-resolved`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, threadId, resolved }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) throw new Error(data.error || `gh resolve thread failed: ${resp.status}`);
 }
 
 /**
@@ -966,6 +1002,7 @@ export async function ghPrCreateComment(
   prNumber: number,
   params: CreatePrCommentParams,
 ): Promise<PrReviewComment> {
+  if (isTauri()) return tauriInvoke<PrReviewComment>("gh_pr_create_comment", { cwd, number: prNumber, params });
   const res = await devFetch(`${DEV_SERVER}/api/gh-pr-comment`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -977,12 +1014,19 @@ export async function ghPrCreateComment(
   return raw as PrReviewComment;
 }
 
-/** Edit the body of an existing review comment. */
+/** Edit the body of an existing review comment. `prNumber` locates the repo
+ *  the PR lives in (the upstream, for a fork) — required on desktop. */
 export async function ghPrUpdateComment(
   cwd: string,
   commentId: number,
   body: string,
+  prNumber?: number,
 ): Promise<void> {
+  if (isTauri()) {
+    if (prNumber == null) throw new Error("ghPrUpdateComment requires the PR number");
+    await tauriInvoke("gh_pr_update_comment", { cwd, number: prNumber, commentId, body });
+    return;
+  }
   const res = await devFetch(`${DEV_SERVER}/api/gh-pr-comment?id=${commentId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -991,8 +1035,13 @@ export async function ghPrUpdateComment(
   if (!res.ok) throw new Error(`update comment failed: ${res.status}`);
 }
 
-/** Delete a review comment. */
-export async function ghPrDeleteComment(cwd: string, commentId: number): Promise<void> {
+/** Delete a review comment. `prNumber`: same contract as `ghPrUpdateComment`. */
+export async function ghPrDeleteComment(cwd: string, commentId: number, prNumber?: number): Promise<void> {
+  if (isTauri()) {
+    if (prNumber == null) throw new Error("ghPrDeleteComment requires the PR number");
+    await tauriInvoke("gh_pr_delete_comment", { cwd, number: prNumber, commentId });
+    return;
+  }
   const res = await fetch(
     `${DEV_SERVER}/api/gh-pr-comment?cwd=${encodeURIComponent(cwd)}&id=${commentId}`,
     { method: "DELETE" },

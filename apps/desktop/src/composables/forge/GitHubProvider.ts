@@ -28,6 +28,8 @@ import {
   ghDisableAutoMerge,
   ghCheckoutPr,
   ghPrComments,
+  ghPrReviewThreads,
+  ghSetReviewThreadResolved,
   ghPrIssueComments,
   ghPrCreateComment,
   ghPrUpdateComment,
@@ -43,6 +45,7 @@ import {
   ghPrEdit,
   ghListIssues,
 } from "../../utils/backend";
+import { withThreadState } from "../../utils/prCommentThreads";
 
 import type {
   ForgeProvider,
@@ -163,8 +166,18 @@ export class GitHubProvider implements ForgeProvider {
 
   // ── Comments ──────────────────────────────────────────────────────────────
 
-  listComments(cwd: string, prNumber: number): Promise<PrReviewComment[]> {
-    return ghPrComments(cwd, prNumber);
+  async listComments(cwd: string, prNumber: number): Promise<PrReviewComment[]> {
+    // REST comments carry no thread state; overlay it from GraphQL. Best-effort:
+    // without it the comments still list, just without resolve affordances.
+    const [comments, threads] = await Promise.all([
+      ghPrComments(cwd, prNumber),
+      ghPrReviewThreads(cwd, prNumber).catch(() => []),
+    ]);
+    return withThreadState(comments, threads);
+  }
+
+  setThreadResolved(cwd: string, threadId: string, resolved: boolean): Promise<void> {
+    return ghSetReviewThreadResolved(cwd, threadId, resolved);
   }
 
   listIssueComments(cwd: string, prNumber: number): Promise<PrReviewComment[]> {
@@ -175,14 +188,13 @@ export class GitHubProvider implements ForgeProvider {
     return ghPrCreateComment(cwd, prNumber, params);
   }
 
-  updateComment(cwd: string, commentId: number, body: string, _prNumber?: number): Promise<void> {
-    // _prNumber is ignored on GitHub — the comment_id is globally unique.
-    return ghPrUpdateComment(cwd, commentId, body);
+  updateComment(cwd: string, commentId: number, body: string, prNumber?: number): Promise<void> {
+    // prNumber resolves the repo the PR lives in (upstream, for a fork).
+    return ghPrUpdateComment(cwd, commentId, body, prNumber);
   }
 
-  deleteComment(cwd: string, commentId: number, _prNumber?: number): Promise<void> {
-    // _prNumber is ignored on GitHub — the comment_id is globally unique.
-    return ghPrDeleteComment(cwd, commentId);
+  deleteComment(cwd: string, commentId: number, prNumber?: number): Promise<void> {
+    return ghPrDeleteComment(cwd, commentId, prNumber);
   }
 
   // ── Reviews ───────────────────────────────────────────────────────────────

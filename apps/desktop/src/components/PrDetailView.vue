@@ -35,6 +35,7 @@ import AiSparkle from "./AiSparkle.vue";
 import AiTemplateMenu from "./AiTemplateMenu.vue";
 import AiContextButton from "./AiContextButton.vue";
 import { getAiExtraContext } from "../composables/useAiExtraContext";
+import { nestReplies, type CommentWithReplies } from "../utils/prCommentThreads";
 
 const { t } = useI18n();
 
@@ -302,7 +303,8 @@ function reviewStateMeta(state: string): { label: string; cls: string } {
   }
 }
 
-type TimelineComment = (typeof sortedComments.value)[number] & { kind: "comment" };
+type SortedComment = (typeof sortedComments.value)[number];
+type TimelineComment = CommentWithReplies<SortedComment> & { kind: "comment" };
 type TimelineReview = {
   kind: "review";
   id: number;
@@ -323,7 +325,9 @@ type TimelineItem = TimelineComment | TimelineReview;
  * hidden in a separate block.
  */
 const timeline = computed<TimelineItem[]>(() => {
-  const comments: TimelineItem[] = sortedComments.value.map((c) => ({ ...c, kind: "comment" as const }));
+  // Inline replies sit under the review comment that opened their thread
+  // (rendered as sub-messages), so only thread roots join the timeline.
+  const comments: TimelineItem[] = nestReplies(sortedComments.value).map((c) => ({ ...c, kind: "comment" as const }));
   // PENDING reviews (unsubmitted drafts) are excluded; COMMENTED reviews with an
   // empty body carry no standalone signal (their inline notes live in the
   // comments thread). `bodyHtml` is rendered once, like `sortedComments`.
@@ -358,7 +362,13 @@ const timeline = computed<TimelineItem[]>(() => {
 const descriptionHtml = computed(() => renderMarkdown(p.prDetail.value?.body, mdOpts.value));
 const descriptionImagesBlocked = computed(() => hasBlockedRemoteImages(descriptionHtml.value));
 const timelineImagesBlocked = computed(() =>
-  timeline.value.some((item) => hasBlockedRemoteImages(item.bodyHtml)),
+  timeline.value.some((item) =>
+    hasBlockedRemoteImages(item.bodyHtml)
+    || (item.kind === "comment" && item.replies.some((r) => hasBlockedRemoteImages(r.bodyHtml)))),
+);
+/** Conversation entries including nested replies — the section's count badge. */
+const timelineCount = computed(() =>
+  timeline.value.reduce((n, item) => n + 1 + (item.kind === "comment" ? item.replies.length : 0), 0),
 );
 // The inline review threads of the file shown in the Files tab render through
 // PrCommentThread, which follows `prImagesShown` (provided above). Offer the
@@ -425,6 +435,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener("mousemove", trackMouse);
   document.body.style.cursor = "";
+  clearTimeout(copiedTimer);
 });
 
 watch(fullscreenImageUrl, (newUrl) => {
@@ -498,6 +509,102 @@ function commentHref(c: { url: string; id: number }): string {
 /** Short relative time for a comment timestamp. */
 function commentTimeAgo(dateStr: string): string {
   return formatRelativeAge(dateStr, t);
+}
+
+// ─── Comment actions (Conversation tab) ────────────────────
+/** Edit / delete are offered on the viewer's own inline review comments only:
+ *  issue-level comments have no edit/delete path wired to a forge yet. */
+function canManageComment(c: { path: string; author: string }): boolean {
+  return !!c.path && !!p.currentUser.value && c.author === p.currentUser.value;
+}
+
+const copiedLinkId = ref<number | null>(null);
+let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+function copyCommentLink(c: { url: string; id: number }) {
+  const href = commentHref(c);
+  if (!href) return;
+  navigator.clipboard?.writeText(href).then(() => {
+    copiedLinkId.value = c.id;
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => { copiedLinkId.value = null; }, 1500);
+  }).catch(() => {});
+}
+
+const editingCommentId = ref<number | null>(null);
+const editDraft = ref("");
+const editSaving = ref(false);
+function startCommentEdit(c: { id: number; body: string }) {
+  confirmingDeleteId.value = null;
+  editingCommentId.value = c.id;
+  editDraft.value = c.body;
+}
+function cancelCommentEdit() {
+  editingCommentId.value = null;
+  editDraft.value = "";
+}
+async function saveCommentEdit() {
+  const id = editingCommentId.value;
+  // Markdown is whitespace-sensitive (indented code, trailing hard breaks):
+  // trim only to test for emptiness, save what the user typed.
+  const body = editDraft.value;
+  if (id == null || !body.trim() || editSaving.value) return;
+  editSaving.value = true;
+  try {
+    if (await p.handleEditComment(id, body)) cancelCommentEdit();
+  } finally {
+    editSaving.value = false;
+  }
+}
+
+/** Delete asks for an inline confirmation first — it can't be undone. */
+const confirmingDeleteId = ref<number | null>(null);
+const deletingCommentId = ref<number | null>(null);
+async function confirmCommentDelete(id: number) {
+  if (deletingCommentId.value != null) return;
+  deletingCommentId.value = id;
+  try {
+    await p.handleDeleteComment(id);
+  } finally {
+    deletingCommentId.value = null;
+    confirmingDeleteId.value = null;
+  }
+}
+
+/** A save or delete is in flight for this comment — shows the busy overlay. */
+function isCommentBusy(id: number): boolean {
+  return deletingCommentId.value === id || (editSaving.value && editingCommentId.value === id);
+}
+
+// ─── Thread reply box (Conversation tab) ───────────────────
+// One box open at a time, keyed by the id of the comment that opened the thread.
+const replyingTo = ref<number | null>(null);
+const replyDraft = ref("");
+const replySending = ref(false);
+let replyBox: HTMLTextAreaElement | null = null;
+function setReplyBox(el: unknown) {
+  replyBox = el instanceof HTMLTextAreaElement ? el : null;
+}
+
+function openThreadReply(rootId: number) {
+  replyingTo.value = rootId;
+  replyDraft.value = "";
+  nextTick(() => replyBox?.focus());
+}
+
+function cancelThreadReply() {
+  replyingTo.value = null;
+  replyDraft.value = "";
+}
+
+async function submitThreadReply(rootId: number) {
+  const body = replyDraft.value; // untrimmed, as in saveCommentEdit
+  if (!body.trim() || replySending.value) return;
+  replySending.value = true;
+  try {
+    if (await p.handleReplyComment(rootId, body)) cancelThreadReply();
+  } finally {
+    replySending.value = false;
+  }
 }
 
 // ─── Reviews admin: dismiss + request reviewers (B4) ───────
@@ -1161,7 +1268,7 @@ function submitRequestReviewers() {
           <section v-if="timeline.length" class="pdv-section pdv-section--comments">
             <h2 class="pdv-section-label">
               {{ t('pr.detail.statComments') }}
-              <span class="pdv-section-count">{{ timeline.length }}</span>
+              <span class="pdv-section-count">{{ timelineCount }}</span>
             </h2>
             <!-- One button per PR: skip it here when the description shows it. -->
             <RemoteImagesNotice
@@ -1217,37 +1324,165 @@ function submitRequestReviewers() {
                     :forge-name="p.forge.value.name"
                   />
                 </li>
-                <!-- Inline / issue comment -->
+                <!-- Inline / issue comment; replies of its review thread nest under it -->
                 <li v-else :key="`comment-${item.path}#${item.id}`" class="pdv-comment">
-                  <div class="pdv-comment-head">
-                    <Avatar class="pdv-comment-avatar" :name="item.author" :url="forgeAvatarUrl(p.forge.value.name, item.author)" />
-                    <span class="pdv-comment-author">{{ item.author }}</span>
-                    <span v-if="item.resolved" class="pdv-comment-resolved">✓ {{ t('pr.detail.commentResolved') }}</span>
-                    <button
-                      v-if="commentHref(item)"
-                      type="button"
-                      class="pdv-comment-goto"
-                      :title="t('pr.detail.commentGoto')"
-                      @click="openInBrowser(commentHref(item))"
-                    >
-                      {{ t('pr.detail.commentGoto') }}
-                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M6 3H3v10h10v-3M9 3h4v4M13 3 7 9" />
-                      </svg>
-                    </button>
-                    <span v-if="item.path" class="pdv-comment-anchor">{{ item.path.split('/').pop() }}<template v-if="item.line">:{{ item.line }}</template></span>
-                    <span class="pdv-comment-time" :title="item.created_at">{{ commentTimeAgo(item.created_at) }}</span>
+                  <div
+                    v-for="(c, i) in [item, ...item.replies]"
+                    :key="c.id"
+                    class="pdv-comment-entry"
+                    :class="{ 'pdv-comment-entry--reply': i > 0 }"
+                    :aria-busy="isCommentBusy(c.id)"
+                  >
+                    <Transition name="pdv-busy">
+                      <div v-if="isCommentBusy(c.id)" class="pdv-comment-busy" aria-hidden="true">
+                        <span class="pdv-spinner" />
+                      </div>
+                    </Transition>
+                    <div class="pdv-comment-head">
+                      <Avatar class="pdv-comment-avatar" :name="c.author" :url="forgeAvatarUrl(p.forge.value.name, c.author)" />
+                      <span class="pdv-comment-author">{{ c.author }}</span>
+                      <span v-if="i === 0 && c.resolved" class="pdv-comment-resolved">✓ {{ t('pr.detail.commentResolved') }}</span>
+                      <button
+                        v-if="commentHref(c)"
+                        type="button"
+                        class="pdv-comment-goto"
+                        :title="t('pr.detail.commentGoto')"
+                        @click="openInBrowser(commentHref(c))"
+                      >
+                        {{ t('pr.detail.commentGoto') }}
+                        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M6 3H3v10h10v-3M9 3h4v4M13 3 7 9" />
+                        </svg>
+                      </button>
+                      <span v-if="i === 0 && c.path" class="pdv-comment-anchor">{{ c.path.split('/').pop() }}<template v-if="c.line">:{{ c.line }}</template></span>
+                      <span class="pdv-comment-time" :title="c.created_at">{{ commentTimeAgo(c.created_at) }}</span>
+                      <div class="pdv-comment-actions">
+                        <button
+                          v-if="commentHref(c)"
+                          type="button"
+                          class="pdv-comment-action"
+                          :class="{ 'pdv-comment-action--done': copiedLinkId === c.id }"
+                          v-tooltip="copiedLinkId === c.id ? t('pr.comment.linkCopied') : t('pr.comment.copyLink')"
+                          :aria-label="t('pr.comment.copyLink')"
+                          @click="copyCommentLink(c)"
+                        >
+                          <svg v-if="copiedLinkId === c.id" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5 6.5 12 13 4.5" /></svg>
+                          <svg v-else width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.3-2.3a3 3 0 0 0-4.2-4.2l-.8.8M9.5 6.5a3 3 0 0 0-4.2 0L3 8.8A3 3 0 0 0 7.2 13l.8-.8" /></svg>
+                        </button>
+                        <button
+                          v-if="canManageComment(c) && p.forgeSupportsCommentEdit.value"
+                          type="button"
+                          class="pdv-comment-action"
+                          v-tooltip="t('pr.comment.edit')"
+                          :aria-label="t('pr.comment.edit')"
+                          @click="startCommentEdit(c)"
+                        >
+                          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 2.5 13.5 5 6 12.5 3 13l.5-3L11 2.5Z" /></svg>
+                        </button>
+                        <button
+                          v-if="canManageComment(c) && p.forgeSupportsCommentDelete.value"
+                          type="button"
+                          class="pdv-comment-action pdv-comment-action--danger"
+                          v-tooltip="t('pr.comment.delete')"
+                          :aria-label="t('pr.comment.delete')"
+                          @click="cancelCommentEdit(); confirmingDeleteId = c.id"
+                        >
+                          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M6 4V2.5h4V4M4 4l.7 9.5h6.6L12 4M6.8 6.5v4.5M9.2 6.5v4.5" /></svg>
+                        </button>
+                      </div>
+                    </div>
+                    <div v-if="confirmingDeleteId === c.id" class="pdv-comment-confirm">
+                      <span>{{ t('pr.comment.deleteConfirm') }}</span>
+                      <button type="button" class="pdv-thread-btn" :disabled="deletingCommentId === c.id" @click="confirmingDeleteId = null">{{ t('pr.comment.cancel') }}</button>
+                      <button
+                        type="button"
+                        class="pdv-thread-btn pdv-thread-btn--danger"
+                        :disabled="deletingCommentId === c.id"
+                        @click="confirmCommentDelete(c.id)"
+                      >{{ t('pr.comment.delete') }}</button>
+                    </div>
+                    <div v-if="editingCommentId === c.id" class="pdv-thread-compose">
+                      <textarea
+                        v-model="editDraft"
+                        class="pdv-thread-textarea"
+                        rows="4"
+                        :disabled="editSaving"
+                        @keydown.ctrl.enter.prevent="saveCommentEdit"
+                        @keydown.meta.enter.prevent="saveCommentEdit"
+                        @keydown.escape="cancelCommentEdit"
+                      />
+                      <div class="pdv-thread-actions pdv-thread-actions--end">
+                        <button type="button" class="pdv-thread-btn" :disabled="editSaving" @click="cancelCommentEdit">{{ t('pr.comment.cancel') }}</button>
+                        <button
+                          type="button"
+                          class="pdv-thread-btn pdv-thread-btn--primary"
+                          :disabled="!editDraft.trim() || editSaving"
+                          @click="saveCommentEdit"
+                        >{{ t('pr.comment.save') }}</button>
+                      </div>
+                    </div>
+                    <div v-else class="pdv-comment-body" @click="onMarkdownLinkClick" v-html="c.bodyHtml" />
+                    <PrReactions
+                      v-if="p.selectedPr.value"
+                      :cwd="p.cwd.value"
+                      :pr-number="p.selectedPr.value.number"
+                      :target-type="c.path ? 'review_comment' : 'issue_comment'"
+                      :target-id="c.id"
+                      :current-user="p.currentUser.value"
+                      :forge-name="p.forge.value.name"
+                    />
                   </div>
-                  <div class="pdv-comment-body" @click="onMarkdownLinkClick" v-html="item.bodyHtml" />
-                  <PrReactions
-                    v-if="p.selectedPr.value"
-                    :cwd="p.cwd.value"
-                    :pr-number="p.selectedPr.value.number"
-                    :target-type="item.path ? 'review_comment' : 'issue_comment'"
-                    :target-id="item.id"
-                    :current-user="p.currentUser.value"
-                    :forge-name="p.forge.value.name"
-                  />
+                  <!-- Reply being posted: a placeholder reply under the busy overlay -->
+                  <Transition name="pdv-busy">
+                    <div
+                      v-if="replySending && replyingTo === item.id"
+                      class="pdv-comment-entry pdv-comment-entry--reply pdv-comment-entry--pending"
+                      aria-busy="true"
+                    >
+                      <div class="pdv-comment-busy" aria-hidden="true">
+                        <span class="pdv-spinner" />
+                      </div>
+                      <div class="pdv-comment-head">
+                        <Avatar class="pdv-comment-avatar" :name="p.currentUser.value || ''" :url="forgeAvatarUrl(p.forge.value.name, p.currentUser.value || '')" />
+                        <span class="pdv-comment-author">{{ p.currentUser.value }}</span>
+                      </div>
+                      <div class="pdv-comment-body pdv-comment-body--pending">{{ replyDraft }}</div>
+                    </div>
+                  </Transition>
+                  <!-- Review threads: reply at the bottom + resolve conversation -->
+                  <div v-if="item.path && !(replySending && replyingTo === item.id)" class="pdv-thread-footer">
+                    <div v-if="replyingTo === item.id" class="pdv-thread-compose">
+                      <textarea
+                        :ref="setReplyBox"
+                        v-model="replyDraft"
+                        class="pdv-thread-textarea"
+                        rows="3"
+                        :placeholder="t('pr.comment.replyPlaceholder')"
+                        @keydown.ctrl.enter.prevent="submitThreadReply(item.id)"
+                        @keydown.meta.enter.prevent="submitThreadReply(item.id)"
+                        @keydown.escape="cancelThreadReply"
+                      />
+                      <div class="pdv-thread-actions pdv-thread-actions--end">
+                        <button type="button" class="pdv-thread-btn" @click="cancelThreadReply">{{ t('pr.comment.cancel') }}</button>
+                        <button
+                          type="button"
+                          class="pdv-thread-btn pdv-thread-btn--primary"
+                          :disabled="!replyDraft.trim() || replySending"
+                          @click="submitThreadReply(item.id)"
+                        >{{ t('pr.comment.replyShort') }}</button>
+                      </div>
+                    </div>
+                    <div v-else class="pdv-thread-actions">
+                      <button type="button" class="pdv-thread-btn pdv-thread-btn--reply" @click="openThreadReply(item.id)">{{ t('pr.comment.replyShort') }}</button>
+                      <button
+                        v-if="p.forgeSupportsResolveThread.value && item.thread_id"
+                        type="button"
+                        class="pdv-thread-btn"
+                        :class="{ 'pdv-thread-btn--resolve': !item.resolved }"
+                        @click="p.handleSetThreadResolved(item, !item.resolved)"
+                      >{{ item.resolved ? t('pr.comment.unresolveThread') : t('pr.comment.resolveThread') }}</button>
+                    </div>
+                  </div>
                 </li>
               </template>
             </ul>
@@ -2234,6 +2469,144 @@ function submitRequestReviewers() {
   border-radius: var(--radius-md);
 }
 
+/* Replies of a review thread: indented sub-messages under the root comment,
+   tied to it by a left rule. */
+.pdv-comment-entry--reply {
+  margin-top: var(--space-7);
+  margin-left: 0;
+  padding-left: var(--space-4);
+  border-left: 2px solid var(--color-border);
+}
+/* Busy overlay over a comment being saved / deleted / posted: a darkened
+   veil that breathes while the request runs, fading in and out. */
+.pdv-comment-entry { position: relative; }
+.pdv-comment-busy {
+  position: absolute;
+  inset: calc(-1 * var(--space-2));
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.2);
+  animation: pdv-busy-breathe 1.1s ease-in-out infinite alternate;
+}
+@keyframes pdv-busy-breathe {
+  to { background: rgba(0, 0, 0, 0.45); }
+}
+.pdv-busy-enter-active,
+.pdv-busy-leave-active { transition: opacity 0.25s ease; }
+.pdv-busy-enter-from,
+.pdv-busy-leave-to { opacity: 0; }
+.pdv-comment-entry--pending { min-height: 56px; }
+.pdv-comment-body--pending {
+  white-space: pre-wrap;
+  color: var(--color-text-muted);
+}
+
+/* Per-comment actions: copy link, edit, delete. */
+.pdv-comment-actions {
+  display: flex;
+  gap: var(--space-1);
+}
+.pdv-comment-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.pdv-comment-action:hover {
+  color: var(--color-accent);
+  border-color: var(--color-border);
+}
+.pdv-comment-action--danger:hover { color: var(--color-danger, #ef4444); }
+.pdv-comment-action--done { color: var(--color-success); }
+.pdv-comment-confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+}
+.pdv-comment-confirm span { margin-right: auto; }
+
+/* Reply box + resolve action closing a review thread. */
+.pdv-thread-footer {
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+.pdv-thread-compose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.pdv-thread-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  resize: vertical;
+}
+.pdv-thread-textarea:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+.pdv-thread-actions {
+  display: flex;
+  gap: var(--space-3);
+}
+.pdv-thread-actions--end { justify-content: flex-end; }
+.pdv-thread-btn {
+  padding: var(--space-2) var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+.pdv-thread-btn:hover:not(:disabled) {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+/* Filled variants: each sets only its colours, the shared rule does the rest. */
+.pdv-thread-btn--primary { --pdv-btn-bg: var(--color-accent); --pdv-btn-fg: var(--color-accent-text); }
+.pdv-thread-btn--reply { --pdv-btn-bg: var(--color-accent); }
+.pdv-thread-btn--resolve { --pdv-btn-bg: color-mix(in srgb, var(--color-success) 80%, black); }
+.pdv-thread-btn--danger { --pdv-btn-bg: var(--color-danger, #ef4444); }
+.pdv-thread-btn:is(.pdv-thread-btn--primary, .pdv-thread-btn--reply, .pdv-thread-btn--resolve, .pdv-thread-btn--danger),
+.pdv-thread-btn:is(.pdv-thread-btn--primary, .pdv-thread-btn--reply, .pdv-thread-btn--resolve, .pdv-thread-btn--danger):hover:not(:disabled) {
+  background: var(--pdv-btn-bg);
+  border-color: var(--pdv-btn-bg);
+  color: var(--pdv-btn-fg, #ffffff);
+  font-weight: var(--font-weight-semibold);
+}
+.pdv-thread-btn:is(.pdv-thread-btn--primary, .pdv-thread-btn--reply, .pdv-thread-btn--resolve, .pdv-thread-btn--danger):hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+.pdv-thread-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pdv-comment-entry--reply:last-child {
+  margin-bottom: var(--space-4);
+}
+
 .pdv-comment-head {
   display: flex;
   align-items: center;
@@ -2356,6 +2729,8 @@ function submitRequestReviewers() {
   line-height: 1.5;
   word-break: break-word;
 }
+/* Breathing room between a comment's body and its reaction row. */
+.pdv-comment-body + .prt-reactions { margin-top: var(--space-7); }
 .pdv-comment-body :deep(p) { margin-bottom: var(--space-5); }
 .pdv-comment-body :deep(p:last-child) { margin-bottom: 0; }
 .pdv-comment-body :deep(h1),

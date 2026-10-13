@@ -1046,6 +1046,75 @@ pub(crate) fn rest_pr_issue_comments(
     Ok(map_comments(&v, true))
 }
 
+/// Create an inline review comment, or a reply when `params.in_reply_to_id`
+/// is set. `params` is the frontend `CreatePrCommentParams` object; a new
+/// thread is anchored to the PR head commit, as GitHub requires.
+pub(crate) fn rest_pr_create_comment(
+    cwd: &str,
+    number: i64,
+    params: &serde_json::Value,
+    token: &str,
+) -> Result<serde_json::Value, String> {
+    let (repo, pr) = get_pr_json(cwd, number, token)?;
+    let body = js(params, "body");
+    if body.trim().is_empty() {
+        return Err("Comment body is empty".to_string());
+    }
+    // REST names the reply target `in_reply_to`, not `in_reply_to_id`.
+    let payload = match params.get("in_reply_to_id").and_then(|v| v.as_i64()) {
+        Some(reply_to) => serde_json::json!({ "body": body, "in_reply_to": reply_to }),
+        None => {
+            let mut p = serde_json::json!({
+                "body": body,
+                "commit_id": jnested(&pr, "head", "sha"),
+                "path": js(params, "path"),
+                "line": params.get("line").and_then(|v| v.as_i64()).unwrap_or(1),
+                "side": params.get("side").and_then(|v| v.as_str()).unwrap_or("RIGHT"),
+            });
+            if let Some(start) = params.get("start_line").and_then(|v| v.as_i64()) {
+                p["start_line"] = start.into();
+                p["start_side"] = params
+                    .get("start_side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("RIGHT")
+                    .into();
+            }
+            p
+        }
+    };
+    let url = format!("{}/repos/{}/pulls/{}/comments", API_BASE, repo, number);
+    let v = api_json("POST", &url, token, Some(&payload.to_string()))?;
+    Ok(map_comment(&v, false))
+}
+
+/// Edit the body of an inline review comment.
+pub(crate) fn rest_pr_update_comment(
+    cwd: &str,
+    number: i64,
+    comment_id: i64,
+    body: &str,
+    token: &str,
+) -> Result<(), String> {
+    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let url = format!("{}/repos/{}/pulls/comments/{}", API_BASE, repo, comment_id);
+    let payload = serde_json::json!({ "body": body });
+    api_json("PATCH", &url, token, Some(&payload.to_string()))?;
+    Ok(())
+}
+
+/// Delete an inline review comment.
+pub(crate) fn rest_pr_delete_comment(
+    cwd: &str,
+    number: i64,
+    comment_id: i64,
+    token: &str,
+) -> Result<(), String> {
+    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let url = format!("{}/repos/{}/pulls/comments/{}", API_BASE, repo, comment_id);
+    api_json("DELETE", &url, token, None)?;
+    Ok(())
+}
+
 // ─── Issues (REST) ───────────────────────────────────────────────────────────
 //
 // Issues live in `origin` (they are never cross-fork like PRs), so the `nwo` is
@@ -1455,6 +1524,81 @@ pub(crate) fn rest_dismiss_review(
     );
     let payload = serde_json::json!({ "message": message, "event": "DISMISS" });
     api_json("PUT", &url, token, Some(&payload.to_string()))?;
+    Ok(())
+}
+
+/// List a PR's review threads (GraphQL-only: REST has no thread concept).
+/// Each entry maps the REST id of the comment that opened the thread to the
+/// thread's node id and resolution state:
+/// `{ thread_id, root_comment_id, resolved }`.
+pub(crate) fn gql_pr_review_threads(
+    cwd: &str,
+    number: i64,
+    token: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("Invalid repo slug: {}", repo))?;
+    let query = "query($owner: String!, $name: String!, $n: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $n) { reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { databaseId } } } } } } }";
+    let mut out = Vec::new();
+    let mut after = serde_json::Value::Null;
+    // 20 pages × 100 threads — far beyond any reviewable PR; bounds a runaway loop.
+    for _ in 0..20 {
+        let v = graphql(
+            token,
+            query,
+            serde_json::json!({ "owner": owner, "name": name, "n": number, "after": after }),
+        )?;
+        let threads = v
+            .pointer("/data/repository/pullRequest/reviewThreads")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        for t in threads
+            .get("nodes")
+            .and_then(|n| n.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(root) = t
+                .pointer("/comments/nodes/0/databaseId")
+                .and_then(|x| x.as_i64())
+            else {
+                continue;
+            };
+            out.push(serde_json::json!({
+                "thread_id": js(t, "id"),
+                "root_comment_id": root,
+                "resolved": t.get("isResolved").and_then(|b| b.as_bool()).unwrap_or(false),
+            }));
+        }
+        let has_next = threads
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        if !has_next {
+            break;
+        }
+        after = threads
+            .pointer("/pageInfo/endCursor")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    Ok(out)
+}
+
+/// Resolve or unresolve a PR review thread by its GraphQL node id.
+pub(crate) fn gql_set_review_thread_resolved(
+    thread_id: &str,
+    resolved: bool,
+    token: &str,
+) -> Result<(), String> {
+    let query = if resolved {
+        "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id } } }"
+    } else {
+        "mutation($id: ID!) { unresolveReviewThread(input: { threadId: $id }) { thread { id } } }"
+    };
+    graphql(token, query, serde_json::json!({ "id": thread_id }))?;
     Ok(())
 }
 
