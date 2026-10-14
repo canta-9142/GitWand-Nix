@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import {
   findInvokedCommands,
   findDevServerRoutes,
+  findRegisteredCommands,
 } from "../commandRegistryParse";
 
 describe("findInvokedCommands", () => {
@@ -98,6 +99,64 @@ describe("findDevServerRoutes", () => {
   });
 });
 
+describe("findRegisteredCommands", () => {
+  it("takes the last segment of each path-qualified entry", () => {
+    const src = `.invoke_handler(tauri::generate_handler![\n  commands::read::git_log,\n  commands::ops::git_merge,\n  plain_cmd\n])`;
+    expect(findRegisteredCommands(src)).toEqual(["git_log", "git_merge", "plain_cmd"]);
+  });
+
+  it("does not count a commented-out entry", () => {
+    const src = `generate_handler![\n  // ── Section ──\n  commands::a::kept,\n  // commands::a::dropped,\n  /* commands::a::also_dropped, */\n]`;
+    expect(findRegisteredCommands(src)).toEqual(["kept"]);
+  });
+
+  it("skips an attribute but keeps the command it gates", () => {
+    const src = `generate_handler![\n  #[cfg(target_os = "macos")]\n  commands::a::mac_only,\n  commands::a::everywhere,\n]`;
+    expect(findRegisteredCommands(src)).toEqual(["everywhere", "mac_only"]);
+  });
+
+  it("stops at the macro's closing bracket", () => {
+    const src = `generate_handler![commands::a::inside])\nlet v = vec![outside];`;
+    expect(findRegisteredCommands(src)).toEqual(["inside"]);
+  });
+
+  it("is not fooled by comment markers inside a string above the macro", () => {
+    // `/*` in "src/*.rs" is not a comment opener: a naive strip would eat
+    // everything up to the next `*/`, macro included.
+    const src = `const GLOB: &str = "src/*.rs";\nlet url = "https://x";\ngenerate_handler![\n  commands::a::kept,\n]\n// later */`;
+    expect(findRegisteredCommands(src)).toEqual(["kept"]);
+  });
+
+  it("ignores the macro's name mentioned in a comment or a string", () => {
+    const src = `// see generate_handler![commands::a::in_comment]\nlet s = "generate_handler![in_string]";\ngenerate_handler![commands::a::real]`;
+    expect(findRegisteredCommands(src)).toEqual(["real"]);
+  });
+
+  it("skips an attribute whose arguments contain brackets", () => {
+    const src = `generate_handler![\n  #[cfg_attr(feature = "x", doc = "a [b] c")]\n  #[my_attr(list[0], nested[[1]])]\n  commands::a::gated,\n  commands::a::plain,\n]`;
+    expect(findRegisteredCommands(src)).toEqual(["gated", "plain"]);
+  });
+
+  it("does not take a lifetime for a char literal", () => {
+    const src = `fn f<'a>(x: &'a str) -> char { '[' }\ngenerate_handler![commands::a::kept]`;
+    expect(findRegisteredCommands(src)).toEqual(["kept"]);
+  });
+
+  it("lexes raw strings, escaped quotes and astral chars without losing the macro", () => {
+    const src = [
+      `let a = r#"has "quotes" and /* and generate_handler![x]"#;`,
+      `let b = br"/*";`,
+      `let c = '\\''; let d = '\\u{1F600}'; let e = '😀'; let f = "esc \\" /*";`,
+      `generate_handler![commands::a::kept, #![inner] commands::a::also]`,
+    ].join("\n");
+    expect(findRegisteredCommands(src)).toEqual(["also", "kept"]);
+  });
+
+  it("returns nothing when there is no macro", () => {
+    expect(findRegisteredCommands("fn main() {}")).toEqual([]);
+  });
+});
+
 describe("the parser against the real sources", () => {
   const root = resolve(__dirname, "../../..");
   const read = (p: string) => readFileSync(resolve(root, p), "utf-8");
@@ -118,5 +177,13 @@ describe("the parser against the real sources", () => {
     expect(
       findDevServerRoutes(read("dev-server.mjs")).length,
     ).toBeGreaterThanOrEqual(169);
+  });
+
+  it("finds at least as many registered commands as lib.rs held when this was written", () => {
+    // 305 on 2026-10-14. A floor: a parser that stopped at the first comment
+    // or attribute would make "every invoked command is registered" vacuous.
+    expect(
+      findRegisteredCommands(read("src-tauri/src/lib.rs")).length,
+    ).toBeGreaterThanOrEqual(305);
   });
 });

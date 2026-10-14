@@ -430,6 +430,21 @@ pub fn command_parity(
             tauri::async_runtime::block_on(commands::ops::git_unstage(s("cwd")?, vec![s("path")?]))
                 .map(parity_ok_marker)
         }
+        "git_file_log" => tauri::async_runtime::block_on(commands::read::git_file_log(
+            s("cwd")?,
+            s("path")?,
+            args.get("count").and_then(|v| v.as_u64()).map(|n| n as u32),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_file_diff" => tauri::async_runtime::block_on(commands::read::git_file_diff(
+            s("cwd")?,
+            s("path")?,
+            s("fromHash")?,
+            s("toHash")?,
+            s("fromPath").ok(),
+            s("toPath").ok(),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
         "git_tracked_ignored" => tauri::async_runtime::block_on(
             commands::tracked_ignored::git_tracked_ignored(s("cwd")?),
         )
@@ -927,6 +942,7 @@ pub fn run() {
             commands::read::git_file_log,
             commands::read::git_file_log_pickaxe,
             commands::read::git_file_log_range,
+            commands::read::git_file_diff,
             commands::read::git_blame,
             commands::ops::git_checkout_commit,
             commands::ops::git_reset_to_commit,

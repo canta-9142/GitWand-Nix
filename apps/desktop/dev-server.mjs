@@ -1297,6 +1297,73 @@ function parseFileLog(raw) {
   return entries;
 }
 
+/**
+ * Mirrors `historical_path` in src-tauri/src/commands/read.rs: a file's name
+ * at a past commit, read by git as `<commit>:<path>`, so checked lexically
+ * rather than against today's filesystem. Throws with Rust's messages.
+ */
+function historicalPath(name, p) {
+  if (p.includes("\0")) throw new Error(`${name} must not contain NUL`);
+  if (p.startsWith("/") || p.startsWith("\\") || /^[A-Za-z]:/.test(p)) {
+    throw new Error(`${name} must be relative to the repository root`);
+  }
+  const parts = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") throw new Error(`${name} must not contain \`..\``);
+    parts.push(seg);
+  }
+  if (!parts.length) throw new Error(`${name} must not be the repository root`);
+  return parts.join("/");
+}
+
+/** Mirrors `FILE_LOG_NAMED_FORMAT` in src-tauri/src/git/parse.rs. */
+const FILE_LOG_NAMED_FORMAT = "--format=%x01%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1e";
+
+/**
+ * Mirrors `parse_file_log_named` (src-tauri/src/git/parse.rs): `git log
+ * --follow -z --name-only` with FILE_LOG_NAMED_FORMAT. Each entry also gets
+ * `path`, the file's root-relative name at that commit (absent for a merge).
+ */
+function parseFileLogNamed(raw) {
+  const entries = [];
+  for (const record of raw.split("\x01")) {
+    // The header ends at the first `\x1e` after the five field separators
+    // (the name that follows may itself hold a `\x1e`).
+    let bodyStart = -1;
+    for (let k = 0, at = -1; k < 5; k++) {
+      at = record.indexOf("\x1f", at + 1);
+      if (at === -1) break;
+      if (k === 4) bodyStart = at;
+    }
+    if (bodyStart === -1) continue;
+    const end = record.indexOf("\x1e", bodyStart);
+    if (end === -1) continue;
+    const head = record.slice(0, end).split("\x1f");
+    // Rust's splitn(6): anything past the fifth separator belongs to the body.
+    const body = head.slice(5).join("\x1f");
+    // Then git writes NUL, one `\n`, and the name up to NUL — exactly that, so
+    // a name that itself starts with `\n` survives. A merge lists no name.
+    let rest = record.slice(end + 1);
+    if (rest.startsWith("\0")) rest = rest.slice(1);
+    if (rest.startsWith("\n")) rest = rest.slice(1);
+    const cut = rest.indexOf("\0");
+    const name = (cut === -1 ? rest : rest.slice(0, cut)) || undefined;
+    const entry = {};
+    if (name !== undefined) entry.path = name;
+    Object.assign(entry, {
+      hashFull: head[0].trim(),
+      hash: head[1].trim(),
+      author: head[2].trim(),
+      date: head[3].trim(),
+      message: head[4].trim(),
+      body: body.trim(),
+    });
+    entries.push(entry);
+  }
+  return entries;
+}
+
 // ─── Snapshot helpers (v3.8 Time Machine) ────────────────────
 //
 // Node port of `src-tauri/src/git/snapshot.rs`. Both implementations read and
@@ -4149,14 +4216,95 @@ async function handleRequest(req, res) {
       const filePath = url.searchParams.get("path");
       const fromHash = url.searchParams.get("from");
       const toHash = url.searchParams.get("to");
-      if (!cwd || !filePath || !fromHash || !toHash) return jsonResponse(req, res, { error: "Missing params" }, 400);
+      if (!cwd || !filePath) return jsonResponse(req, res, { error: "Missing params" }, 400);
+      // Step for step `git_file_diff` (src-tauri/src/commands/read.rs), same
+      // messages: an empty revision, one starting with `-` (git would read it
+      // as an option) or holding a control character (it would split the
+      // batch request below) is refused.
+      for (const [name, rev] of [["fromHash", fromHash], ["toHash", toHash]]) {
+        if (!rev || rev.trim() === "") return jsonResponse(req, res, { error: `${name} must not be empty` }, 400);
+        if (rev.startsWith("-") || /[\u0000-\u001f\u007f-\u009f]/.test(rev)) {
+          return jsonResponse(req, res, { error: `invalid ${name}: ${rev}` }, 400);
+        }
+      }
+      let gitPath;
+      let fromName = null;
+      let toName = null;
+      try {
+        const guarded = safeRepoPath(cwd, filePath);
+        const root = realpathSync.native(cwd);
+        if (guarded === root) throw new Error("path must not be the repository root");
+        gitPath = repoRelativePath(cwd, root, filePath, guarded);
+        const fp = url.searchParams.get("fromPath");
+        const tp = url.searchParams.get("toPath");
+        if (fp !== null) fromName = historicalPath("fromPath", fp);
+        if (tp !== null) toName = historicalPath("toPath", tp);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+      const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
       try {
         const resolvedCwd = resolve(cwd);
-        // Stream via spawn — explicit 10 MB cap can still be exceeded on
-        // large file rewrites between two distant commits.
-        const stdout = await gitSpawn(
-          ["diff", fromHash, toHash, "--", filePath],
-          resolvedCwd,
+        // `path` is relative to `cwd`, the log's names to the top level, where
+        // everything below runs — from the path git prints, not a resolved one.
+        const shown = spawnSync(GIT, ["rev-parse", "--show-toplevel", "--show-prefix"], {
+          cwd: resolvedCwd, encoding: "utf-8",
+        });
+        if (shown.status !== 0) throw new Error(`not a git repository: ${(shown.stderr || "").trim()}`);
+        const [top = "", prefix = ""] = (shown.stdout || "").split("\n");
+        const ownPath = prefix + gitPath;
+        fromName ??= ownPath;
+        toName ??= ownPath;
+
+        // Both revisions and both names in one `cat-file --batch-check`; a
+        // name holding a newline cannot travel in that line-based request and
+        // is looked up on its own.
+        const names = [fromName, toName];
+        const revs = [fromHash, toHash];
+        const request =
+          revs.map((r) => `${r}^{commit}\n`).join("") +
+          names.map((n, i) => (n.includes("\n") ? "" : `${revs[i]}^{commit}:${n}\n`)).join("");
+        const batch = spawnSync(GIT, ["cat-file", "--batch-check"], { cwd: top, encoding: "utf-8", input: request });
+        if (batch.status !== 0) throw new Error(`git cat-file failed: ${(batch.stderr || "").trim()}`);
+        const lines = (batch.stdout || "").split("\n");
+        let li = 0;
+        // `(oid, type)`, or null for `missing` / `ambiguous`.
+        const checkLine = (line) => {
+          if (line === undefined || line.endsWith(" missing") || line.endsWith(" ambiguous")) return null;
+          const [oid, kind] = line.split(" ");
+          return kind === undefined ? null : { oid, kind };
+        };
+        const commits = revs.map((r) => {
+          const found = checkLine(lines[li++]);
+          if (!found || found.kind !== "commit") throw badRequest(`unknown revision: ${r}`);
+          return found.oid;
+        });
+        const [fromType, toType] = names.map((n, i) => {
+          if (n.includes("\n")) {
+            const r = spawnSync(GIT, ["cat-file", "-t", `${commits[i]}:${n}`], { cwd: top, encoding: "utf-8" });
+            return r.status === 0 ? (r.stdout || "").trim() : null;
+          }
+          return checkLine(lines[li++])?.kind ?? null;
+        });
+        const [from, to] = commits;
+        if (fromType === null && toType === null) throw badRequest(`${filePath} not found at either commit`);
+        if (fromType === "tree" || toType === "tree") {
+          throw badRequest(`${filePath} is a directory, not a file`);
+        }
+        // Literal pathspecs; external diff, colour and textconv off — the
+        // output is parsed, never shown as is.
+        const args = ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-color", "--no-textconv"];
+        if (fromName !== toName && fromType !== null && toType !== null) {
+          // Renamed in between: blob to blob, so the hunks are the content change.
+          args.push(`${from}:${fromName}`, `${to}:${toName}`);
+        } else {
+          // One name, or only one side holds the file: a plain pathspec diff.
+          args.push(from, to, "--", fromType !== null ? fromName : toName);
+        }
+        // Stream via spawn, then cap like the Rust side: a whole-file rewrite
+        // between two distant commits can be large.
+        const { text: stdout, truncatedFromBytes } = truncateDiffOutput(
+          await gitSpawnBytes(args, top),
         );
 
         const hunks = [];
@@ -4202,13 +4350,14 @@ async function handleRequest(req, res) {
         }
         if (currentHunk) hunks.push(currentHunk);
 
-        return jsonResponse(req, res, { path: filePath, hunks });
+        const body = { path: filePath, hunks };
+        if (truncatedFromBytes !== undefined) body.truncatedFromBytes = truncatedFromBytes;
+        return jsonResponse(req, res, body);
       } catch (err) {
-        // Empty diff if identical
-        if (err.status === 0 || (err.stdout && err.stdout.trim() === "")) {
-          return jsonResponse(req, res, { path: filePath, hunks: [] });
-        }
-        return jsonResponse(req, res, { path: filePath, hunks: [] });
+        // Identical revisions exit 0 with no output and never land here. Report
+        // a failure (400 for a revision git cannot resolve), as the Rust command
+        // does, rather than an empty diff that reads as "no changes".
+        return jsonResponse(req, res, { error: err.message }, err.status ?? 500);
       }
     }
 
@@ -4795,10 +4944,15 @@ async function handleRequest(req, res) {
       if (!cwd || !filePath) return jsonResponse(req, res, { error: "cwd and path required" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        const fmt = "%H\n%h\n%an\n%aI\n%s\n%b\n---END---";
-        const out = spawnSync(GIT, ["log", "--follow", "-n", String(count), `--format=${fmt}`, "--", filePath],
-          { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-        return jsonResponse(req, res, parseFileLog(out.stdout || ""));
+        // Mirrors `git_file_log`: names included (`--name-only -z`), literal pathspec.
+        const out = spawnSync(GIT, [
+          "-c", "diff.relative=false", "--literal-pathspecs", "log", "--follow", "--name-only", "-z", "-n", String(count),
+          FILE_LOG_NAMED_FORMAT, "--", filePath,
+        ], { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 }); // as git-author-line-stats: Rust has no cap
+        // Same failure as the Rust command, never an empty history.
+        if (out.error) return jsonResponse(req, res, { error: `git log failed: ${out.error.message}` }, 500);
+        if (out.status !== 0) return jsonResponse(req, res, { error: `git log failed: ${out.stderr || ""}` }, 500);
+        return jsonResponse(req, res, parseFileLogNamed(out.stdout || ""));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -4812,10 +4966,15 @@ async function handleRequest(req, res) {
       const mode = url.searchParams.get("mode") === "G" ? "-G" : "-S";
       if (!cwd || !filePath || !search) return jsonResponse(req, res, { error: "cwd, path, search required" }, 400);
       try {
-        const fmt = "%H\n%h\n%an\n%aI\n%s\n%b\n---END---";
-        const out = spawnSync(GIT, ["log", "--follow", mode, search, `--format=${fmt}`, "--", filePath],
-          { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-        return jsonResponse(req, res, parseFileLog(out.stdout || ""));
+        // Mirrors `git_file_log_pickaxe`: same named output as the file log.
+        const out = spawnSync(GIT, [
+          "-c", "diff.relative=false", "--literal-pathspecs", "log", "--follow", "--name-only", "-z", mode, search,
+          FILE_LOG_NAMED_FORMAT, "--", filePath,
+        ], { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 });
+        // Same failure as the Rust command, never an empty history.
+        if (out.error) return jsonResponse(req, res, { error: `git log pickaxe failed: ${out.error.message}` }, 500);
+        if (out.status !== 0) return jsonResponse(req, res, { error: `git log pickaxe failed: ${out.stderr || ""}` }, 500);
+        return jsonResponse(req, res, parseFileLogNamed(out.stdout || ""));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
