@@ -19,7 +19,7 @@ _Ordered by priority, last verified 2026-10-10 (v3.12.1 shipped 2026-10-10 with 
 
 _v3.12.2 (AI context for PRs and release notes, AI branch creation, AI language and model fixes), v3.12.1 (merge-back no longer loses data, security hardening, full-screen Settings, WIP as a Git Tree row, per-project identity), v3.12.0 (built-in terminal renderer, WIP in the Git Tree), v3.11.2 (Finder-like folder navigation), v3.11.1 (History-aware LLM fallback) and v3.11.0 (Merge preview-to-apply) shipped; see [Shipped](#shipped) below and the full detail in [CHANGELOG.md](./CHANGELOG.md)._
 
-_On `main`, not released yet (entries under Unreleased in `CHANGELOG.md`): merged 2026-10-13, **in-house markdown renderer** replacing markdown-it, **PR comment actions** on GitHub (reply, edit, delete, resolve, copy link), and **GPU rendering by default on Linux** with an automatic software fallback after a failed launch plus a Settings toggle (#257); `non_overlapping` no longer duplicates lines both branches added under `diff3` (#259). Merged 2026-10-14: **reset `--keep`** (#263), **tracked-but-ignored warning** with untrack (#264), **opt-in auto fast-forward after fetch** (#265), plus fixes for the MCP residual-marker check (#260), Bitbucket PR-list pagination (#261) and PR write actions on forks (#262)._
+_On `main`, not released yet (entries under Unreleased in `CHANGELOG.md`): merged 2026-10-13, **in-house markdown renderer** replacing markdown-it, **PR comment actions** on GitHub (reply, edit, delete, resolve, copy link), and **GPU rendering by default on Linux** with an automatic software fallback after a failed launch plus a Settings toggle (#257); `non_overlapping` no longer duplicates lines both branches added under `diff3` (#259). Merged 2026-10-14: **reset `--keep`** (#263), **tracked-but-ignored warning** with untrack (#264), **opt-in auto fast-forward after fetch** (#265), plus fixes for the MCP residual-marker check (#260), Bitbucket PR-list pagination (#261) and PR write actions on forks (#262), and the command-registry test now covering the forge wrappers (#268)._
 
 ---
 
@@ -180,7 +180,6 @@ _Synthesis: none of the three addresses structured conflict-resolution AI (Stran
 ### Later (unscheduled)
 
 - **Follow-ups from the #234–#239 reviews** (2026-10-09):
-  - `commandRegistry.test.ts` scans `backend.ts`, `backend-core.ts` and `backend-ai.ts` only: the commands wrapped in `backend-pr.ts`, `backend-gitlab.ts`, `backend-bitbucket.ts` and `backend-gitea.ts` (including the new `*_pr_edit`) have no registry entry and no dev-server route — extend the scan and add the entries (or `GAP:` reasons) (#258)
   - explicit force pushes (reset, rebase, undo, the Force Push menu item) still use a bare `--force-with-lease`, which the 30 s background fetch defeats — pass the expected sha as the #239 auto path does
   - #239 treats a pull later undone by a local reset as a local rewrite (the collaborator's commit was once a local tip), so Force Push is offered and would drop it; and with `push.default=upstream` + a differently named upstream the auto force push can never succeed — judge against `@{push}` and lease that ref
   - #234: on Windows, `gh`/`glab` receive the PR body on the command line (≈32K limit) — send JSON on stdin (`--input -`); a background revalidation racing a save can briefly show the old title/body
