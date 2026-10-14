@@ -106,6 +106,7 @@ import { useNetworkStatus } from "./composables/useNetworkStatus";
 import { useConnectivity } from "./composables/useConnectivity";
 import { useScheduler } from "./composables/useScheduler";
 import { useRepoPoller } from "./composables/useRepoPoller";
+import { useAutoFastForward } from "./composables/useAutoFastForward";
 import { useRepoWatcher } from "./composables/useRepoWatcher";
 import { useTrackedIgnored, shouldRecheckTrackedIgnored } from "./composables/useTrackedIgnored";
 import { useWatcherRefreshQueue } from "./composables/useWatcherRefreshQueue";
@@ -3911,6 +3912,25 @@ const scheduler = useScheduler({
 });
 const { triggerReleaseNotesIfEnabled } = scheduler;
 
+// ─── Opt-in auto fast-forward after fetch ─────────────────────────────
+// Off by default. The tooltip verdict is derived from the already-loaded
+// status (no git spawn on the polling tick); the git-backed check and the
+// fast-forward itself only run after a fetch. Never opens a modal: a refusal
+// is only reported in the tooltip.
+const { autoFfBlock, requestRun: requestAutoFastForward } = useAutoFastForward({
+  enabled: () => settings.value.autoFastForward,
+  cwd: () => repoFolderPath.value,
+  status: () => repoStatus.value,
+  operation: () => repoOperationState.value,
+  busy: () =>
+    isPushing.value || isPulling.value || isMerging.value || isCommitting.value || isSwitchingBranch.value,
+  fetching: () => isFetching.value,
+  onFastForwarded: async ({ branch, count }) => {
+    await repoRefresh(true);
+    showDetailToast(t("syncAction.autoFfDone", branch, count), null);
+  },
+});
+
 // ─── Consolidated poller (§2.1) — single 2s interval replacing 5 independent polls ──
 const poller = useRepoPoller({
   onStatusChange: async (cwd) => {
@@ -3928,6 +3948,7 @@ const poller = useRepoPoller({
   },
   onFetchTick: async (cwd) => {
     await doFetch();
+    await requestAutoFastForward();
   },
   onNightlyTick: async () => {
     await scheduler.onNightlyTick();
@@ -4374,7 +4395,7 @@ onUnmounted(() => {
       :main-commit-count="mainCommitCount" :push-remote="pushRemote"
       :ahead-push-count="aheadPushCount" :is-pushing="isPushing" :is-pulling="isPulling"
       :force-push-preferred="forcePushPreferred" :is-fetching="isFetching" :fetch-percent="fetchPercent"
-      :cwd="repoFolderPath ?? ''" :branches="branches" :worktree-branches="worktreeBranches" :branches-loading="branchesLoading"
+      :auto-ff-block="autoFfBlock" :cwd="repoFolderPath ?? ''" :branches="branches" :worktree-branches="worktreeBranches" :branches-loading="branchesLoading"
       :is-switching-branch="isSwitchingBranch" :is-merging="isMerging" :tabs="repoTabs" :active-tab-id="activeTabId"
       :active-repo-path="activeRepoPath" :load-worktrees="loadProjectWorktrees"
       :worktree-project-paths="worktreeProjectPaths"
