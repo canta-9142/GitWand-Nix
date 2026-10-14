@@ -1394,11 +1394,51 @@ fn upstream_parent(cwd: &str, token: &str) -> Option<String> {
 /// parent. For a regular repo, it's the repo itself.
 fn base_owner_repo(cwd: &str, token: &str) -> Result<String, String> {
     let fi = rest_fork_info(cwd, token)?;
+    Ok(base_repo_of(&fi))
+}
+
+/// The base repo a `ForkInfo` points at: the upstream parent for a fork, the
+/// origin otherwise.
+fn base_repo_of(fi: &ForkInfo) -> String {
     if fi.is_fork && !fi.parent.is_empty() {
-        Ok(fi.parent)
+        fi.parent.clone()
     } else {
-        Ok(fi.origin)
+        fi.origin.clone()
     }
+}
+
+/// The repo a PR *number* refers to when it comes from the PR list the user is
+/// looking at. `rest_list_prs` lists the base repo, so a write action on such a
+/// number must target the base repo too: going through `get_pr_json` (origin
+/// first) would act on the fork's own same-numbered PR. `fork_info` is `None`
+/// when the fork lookup failed; fall back to origin, as `rest_pr_edit` always did.
+fn pr_target_repo(cwd: &str, fork_info: Option<&ForkInfo>) -> Result<String, String> {
+    match fork_info {
+        Some(fi) => Ok(base_repo_of(fi)),
+        None => {
+            let (owner, repo) = owner_repo(cwd)?;
+            Ok(format!("{}/{}", owner, repo))
+        }
+    }
+}
+
+/// Fetch PR `number` from the base repo (see `pr_target_repo`). Returns the
+/// `owner/repo` it was fetched from alongside the JSON. No origin/upstream
+/// fallback: a 404 here means the PR is not in the repo the list shows.
+fn get_base_pr_json(
+    cwd: &str,
+    number: i64,
+    token: &str,
+) -> Result<(String, serde_json::Value), String> {
+    let fi = rest_fork_info(cwd, token).ok();
+    let repo = pr_target_repo(cwd, fi.as_ref())?;
+    let v = api_json(
+        "GET",
+        &format!("{}/repos/{}/pulls/{}", API_BASE, repo, number),
+        token,
+        None,
+    )?;
+    Ok((repo, v))
 }
 
 // Bundling these into a params struct is a real API-shape decision (one
@@ -1493,20 +1533,45 @@ pub(crate) fn rest_merge_pr(
         "rebase" => "rebase",
         _ => "merge",
     };
-    // Resolve the repo (origin or upstream) + head branch for cleanup.
-    let (repo, pr) = get_pr_json(cwd, number, token)?;
-    let branch = jnested(&pr, "head", "ref");
+    // Resolve the base repo (where the merge happens) and the head branch.
+    let (repo, pr) = get_base_pr_json(cwd, number, token)?;
+    let cleanup = head_branch_to_delete(&pr);
 
     let payload = serde_json::json!({ "merge_method": merge_method });
     let url = format!("{}/repos/{}/pulls/{}/merge", API_BASE, repo, number);
     api_json("PUT", &url, token, Some(&payload.to_string()))?;
 
-    // Best-effort branch deletion (mirrors `gh pr merge --delete-branch`).
-    if !branch.is_empty() {
-        let ref_url = format!("{}/repos/{}/git/refs/heads/{}", API_BASE, repo, branch);
+    // Best-effort branch deletion (mirrors `gh pr merge --delete-branch`,
+    // which leaves a fork PR's branch alone).
+    if let Some((head_repo, branch)) = cleanup {
+        let ref_url = format!("{}/repos/{}/git/refs/heads/{}", API_BASE, head_repo, branch);
         let _ = api_json("DELETE", &ref_url, token, None);
     }
     Ok(())
+}
+
+/// The `(repo, branch)` whose ref a post-merge cleanup should delete.
+///
+/// Only a same-repo PR is cleaned up, like `gh pr merge --delete-branch`.
+/// A fork PR's head branch lives in the fork: deleting `head.ref` in the
+/// base repo would remove an unrelated upstream branch that shares its name,
+/// and deleting it in the fork would remove a contributor's branch whenever
+/// the token can push there. `head.repo` is null when the fork was deleted.
+fn head_branch_to_delete(pr: &serde_json::Value) -> Option<(String, String)> {
+    let full_name = |side: &str| {
+        pr.get(side)
+            .and_then(|h| h.get("repo"))
+            .and_then(|r| r.get("full_name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let branch = jnested(pr, "head", "ref");
+    let head_repo = full_name("head");
+    if branch.is_empty() || head_repo.is_empty() || head_repo != full_name("base") {
+        return None;
+    }
+    Some((head_repo.to_string(), branch))
 }
 
 /// Dismiss a submitted review (B4, v3.6.0).
@@ -1609,7 +1674,7 @@ pub(crate) fn rest_request_reviewers(
     logins: &[String],
     token: &str,
 ) -> Result<(), String> {
-    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let (repo, _pr) = get_base_pr_json(cwd, number, token)?;
     let url = format!(
         "{}/repos/{}/pulls/{}/requested_reviewers",
         API_BASE, repo, number
@@ -1620,8 +1685,9 @@ pub(crate) fn rest_request_reviewers(
 }
 
 pub(crate) fn rest_pr_ready(cwd: &str, number: i64, token: &str) -> Result<(), String> {
-    // Draft→ready is GraphQL-only; resolve the PR node_id first (origin or upstream).
-    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    // Draft→ready is GraphQL-only; resolve the PR node_id first, from the base
+    // repo the PR list shows (not origin: a fork may have a same-numbered PR).
+    let (_repo, pr) = get_base_pr_json(cwd, number, token)?;
     let node_id = js(&pr, "node_id");
     if node_id.is_empty() {
         return Err("Could not resolve PR node_id for ready conversion.".to_string());
@@ -1648,13 +1714,8 @@ pub(crate) fn rest_pr_edit(
     token: &str,
 ) -> Result<(), String> {
     let payload = super::pr_edit::edit_payload(title, body, "body")?;
-    let repo = match base_owner_repo(cwd, token) {
-        Ok(r) => r,
-        Err(_) => {
-            let (owner, repo) = owner_repo(cwd)?;
-            format!("{}/{}", owner, repo)
-        }
-    };
+    let fi = rest_fork_info(cwd, token).ok();
+    let repo = pr_target_repo(cwd, fi.as_ref())?;
     let url = format!("{}/repos/{}/pulls/{}", API_BASE, repo, number);
     api_json("PATCH", &url, token, Some(&payload.to_string()))?;
     Ok(())
@@ -1664,7 +1725,7 @@ pub(crate) fn rest_pr_edit(
 ///
 /// `enablePullRequestAutoMerge` takes the PR's node id, resolved the same way
 /// `rest_pr_ready` resolves it above: fetch the PR through the existing REST
-/// path (origin or upstream), read its `node_id`, and error out explicitly if
+/// path (`get_base_pr_json`), read its `node_id`, and error out explicitly if
 /// it is missing rather than sending an empty id to GraphQL.
 ///
 /// Known limitation, not fixed here: `gh_enable_auto_merge_inner`'s CLI path
@@ -1687,7 +1748,7 @@ pub(crate) fn rest_enable_auto_merge(
     method: &str,
     token: &str,
 ) -> Result<(), String> {
-    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let (_repo, pr) = get_base_pr_json(cwd, number, token)?;
     let node_id = js(&pr, "node_id");
     if node_id.is_empty() {
         return Err("Could not resolve PR node_id for auto-merge.".to_string());
@@ -1708,7 +1769,7 @@ pub(crate) fn rest_enable_auto_merge(
 
 /// GraphQL equivalent of `gh pr merge --disable-auto`.
 pub(crate) fn rest_disable_auto_merge(cwd: &str, number: i64, token: &str) -> Result<(), String> {
-    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let (_repo, pr) = get_base_pr_json(cwd, number, token)?;
     let node_id = js(&pr, "node_id");
     if node_id.is_empty() {
         return Err("Could not resolve PR node_id for auto-merge.".to_string());
@@ -2258,5 +2319,108 @@ mod tests {
     #[test]
     fn top_pr_from_rest_json_empty_list_is_none() {
         assert_eq!(top_pr_from_rest_json(&[]), None);
+    }
+
+    /// Run a git command in `dir`, panicking on failure (test scaffolding).
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git runs");
+        assert!(st.success(), "git {:?} failed", args);
+    }
+
+    /// A real temp repo whose `origin` is the given URL (the user's fork).
+    fn repo_with_origin(url: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gitwand-pr-target-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["remote", "add", "origin", url]);
+        dir
+    }
+
+    fn fork_info(is_fork: bool, origin: &str, parent: &str) -> ForkInfo {
+        ForkInfo {
+            is_fork,
+            origin: origin.to_string(),
+            parent: parent.to_string(),
+        }
+    }
+
+    // Regression: `rest_pr_ready` resolved the PR via `get_pr_json` (origin
+    // first), so on a fork it marked the fork's same-numbered PR ready instead
+    // of the upstream PR the list shows.
+    #[test]
+    fn pr_target_repo_is_upstream_for_a_fork() {
+        let dir = repo_with_origin("git@github.com:me/proj.git");
+        let fi = fork_info(true, "me/proj", "upstream/proj");
+        let got = pr_target_repo(dir.to_str().unwrap(), Some(&fi));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.unwrap(), "upstream/proj");
+    }
+
+    #[test]
+    fn pr_target_repo_is_origin_for_a_non_fork() {
+        let dir = repo_with_origin("https://github.com/me/proj.git");
+        let fi = fork_info(false, "me/proj", "");
+        let got = pr_target_repo(dir.to_str().unwrap(), Some(&fi));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.unwrap(), "me/proj");
+    }
+
+    #[test]
+    fn pr_target_repo_falls_back_to_the_real_origin_remote() {
+        let dir = repo_with_origin("git@github.com:me/proj.git");
+        let got = pr_target_repo(dir.to_str().unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.unwrap(), "me/proj");
+    }
+
+    #[test]
+    fn pr_target_repo_ignores_a_fork_with_an_empty_parent() {
+        let dir = repo_with_origin("git@github.com:me/proj.git");
+        let fi = fork_info(true, "me/proj", "");
+        let got = pr_target_repo(dir.to_str().unwrap(), Some(&fi));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.unwrap(), "me/proj");
+    }
+
+    // Regression: after merging a fork PR, `rest_merge_pr` deleted `head.ref`
+    // in the base repo, removing an unrelated same-named upstream branch.
+    #[test]
+    fn head_branch_to_delete_is_the_base_repo_for_a_same_repo_pr() {
+        let pr = serde_json::json!({
+            "base": { "repo": { "full_name": "owner/proj" } },
+            "head": { "ref": "feature", "repo": { "full_name": "owner/proj" } }
+        });
+        assert_eq!(
+            head_branch_to_delete(&pr),
+            Some(("owner/proj".to_string(), "feature".to_string()))
+        );
+    }
+
+    #[test]
+    fn head_branch_to_delete_leaves_a_fork_pr_alone() {
+        let pr = serde_json::json!({
+            "base": { "repo": { "full_name": "upstream/proj" } },
+            "head": { "ref": "feature", "repo": { "full_name": "me/proj" } }
+        });
+        assert_eq!(head_branch_to_delete(&pr), None);
+    }
+
+    #[test]
+    fn head_branch_to_delete_is_none_when_the_fork_was_deleted() {
+        let pr = serde_json::json!({
+            "base": { "repo": { "full_name": "upstream/proj" } },
+            "head": { "ref": "main", "repo": null }
+        });
+        assert_eq!(head_branch_to_delete(&pr), None);
     }
 }
