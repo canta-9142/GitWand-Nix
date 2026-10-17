@@ -1,4 +1,5 @@
 pub(crate) mod ai;
+pub(crate) mod ai_http;
 pub(crate) mod azure;
 pub(crate) mod bitbucket;
 pub(crate) mod credentials;
@@ -11,10 +12,16 @@ pub(crate) mod gitlab;
 pub(crate) mod mcp_catalog;
 pub(crate) mod network;
 pub(crate) mod ops;
+#[cfg(test)]
+mod ops_fast_forward_tests;
+pub(crate) mod pr_edit;
 pub(crate) mod read;
+pub(crate) mod render_fallback;
 pub(crate) mod scratch;
 pub(crate) mod secrets;
 pub(crate) mod snapshots;
+pub(crate) mod telemetry;
 pub(crate) mod terminal;
+pub(crate) mod tracked_ignored;
 pub(crate) mod watcher;
 pub(crate) mod workspace;

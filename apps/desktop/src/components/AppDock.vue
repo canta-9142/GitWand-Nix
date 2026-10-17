@@ -18,7 +18,7 @@ import { OPEN_SETTINGS_KEY } from "../composables/branchPickerBridge";
 
 const props = defineProps<{
   viewMode: ViewMode;
-  /** Uncommitted-file count — shown as a badge on the Changes entry. */
+  /** Uncommitted-file count — shown as a badge on the Git Tree entry. */
   changesCount?: number;
   /** Open-PR count — shown as a badge on the PRs entry. */
   prCount?: number;
@@ -51,8 +51,6 @@ const vertical = computed(() => settings.value.dockVertical);
 const idleOpacity = computed(() => settings.value.dockIdleOpacity ?? 0.45);
 
 function isHidden(id: DockEntryId): boolean {
-  // Changes hides itself while the working tree is clean, when the user opted in.
-  if (id === "changes" && settings.value.dockHideChangesWhenEmpty && !props.changesCount) return true;
   return isDockEntryHidden(id, settings.value);
 }
 
@@ -62,26 +60,25 @@ function entryLabel(id: DockEntryId): string {
     case "dashboard": return t("sidebar.tabDashboard");
     case "prs": return "PRs";
     case "graph": return t("sidebar.gitTree");
-    case "changes": return t("sidebar.tabChanges");
   }
 }
 
-/** Persisted order, normalised so all five entries are always present. */
+/** Persisted order, normalised so all four entries are always present. */
 const orderedIds = computed<DockEntryId[]>(() => normalizeDockOrder(settings.value.dockOrder));
 
 /** Order, minus the entries the user has hidden. */
 const visibleIds = computed<DockEntryId[]>(() => orderedIds.value.filter((id) => !isHidden(id)));
 
 function isActive(id: DockEntryId): boolean {
-  // History is a sub-view reached from the Git Tree (clicking a commit), so
-  // it keeps the Git Tree entry highlighted.
-  if (id === "graph") return props.viewMode === "graph" || props.viewMode === "history";
+  // History (clicking a commit) and Changes (clicking the WIP row) are
+  // sub-views of the Git Tree, so they keep its entry highlighted.
+  if (id === "graph") return props.viewMode === "graph" || props.viewMode === "history" || props.viewMode === "changes";
   return props.viewMode === id;
 }
 
 function badgeFor(id: DockEntryId): number | undefined {
   if (id === "prs") return props.prCount || undefined;
-  if (id === "changes") return props.changesCount || undefined;
+  if (id === "graph") return props.changesCount || undefined;
   return undefined;
 }
 
@@ -105,6 +102,33 @@ const dockStyle = computed(() => {
   }
   return {};
 });
+
+/**
+ * Side for the dock's tooltips. Horizontal dock: let v-tooltip pick above or
+ * below. Vertical dock: open toward the middle of the window, so a tooltip
+ * never lands on the next icon or off-screen.
+ */
+// Reactive window width: a computed reading window.innerWidth directly never
+// re-runs on resize, so the side went stale once the dock crossed the middle.
+const viewportWidth = ref(window.innerWidth);
+function onWindowResize() {
+  viewportWidth.value = window.innerWidth;
+}
+window.addEventListener("resize", onWindowResize, { passive: true });
+
+const tipPosition = computed<"left" | "right" | undefined>(() => {
+  if (!vertical.value) return undefined;
+  const p = livePos.value ?? settings.value.dockPosition;
+  return p && p.x > viewportWidth.value / 2 ? "left" : "right";
+});
+
+/** The view buttons' text labels are hidden (icons-only or vertical dock). */
+const labelsHidden = computed(() => iconsOnly.value || vertical.value);
+
+/** v-tooltip binding for a dock button. */
+function tip(text: string) {
+  return { text, position: tipPosition.value };
+}
 
 let startX = 0, startY = 0, originX = 0, originY = 0;
 
@@ -202,18 +226,13 @@ function onMenuKey(e: KeyboardEvent) {
   if (e.key === "Escape") closeMenu();
 }
 
-/** Today / Dashboard / PRs can be removed; Git Tree & Changes cannot. */
+/** Today / Dashboard / PRs can be removed; Git Tree cannot. */
 function isRemovable(id: DockEntryId): boolean {
   return id === "launchpad" || id === "dashboard" || id === "prs";
 }
 
 function isStartup(id: DockEntryId): boolean {
   return settings.value.startupView === id;
-}
-
-/** Changes has no diff-less landing, so it is not offered as a startup view. */
-function canBeStartup(id: DockEntryId): boolean {
-  return id !== "changes";
 }
 
 // ── Per-target actions ──
@@ -225,14 +244,7 @@ function removeFromDock(id: DockEntryId) {
 }
 
 function setAsStartup(id: DockEntryId) {
-  if (id === "changes") return; // not a valid startup view
   patch({ startupView: id });
-  closeMenu();
-}
-
-const hideChangesWhenEmpty = computed(() => settings.value.dockHideChangesWhenEmpty);
-function toggleHideChangesWhenEmpty() {
-  patch({ dockHideChangesWhenEmpty: !settings.value.dockHideChangesWhenEmpty });
   closeMenu();
 }
 
@@ -335,6 +347,7 @@ function removeFilesFromDock() {
 }
 
 onBeforeUnmount(() => {
+  window.removeEventListener("resize", onWindowResize);
   window.removeEventListener("pointermove", onDrag);
   window.removeEventListener("pointerup", endDrag);
   closeMenu();
@@ -354,7 +367,7 @@ onBeforeUnmount(() => {
       <button
         v-if="unlocked"
         class="dock-handle"
-        :title="t('settings.dock.handleTooltip')"
+        v-tooltip="tip(t('settings.dock.handleTooltip'))"
         :aria-label="t('settings.dock.handleTooltip')"
         @pointerdown="startDrag"
         @contextmenu="openMenu($event, null)"
@@ -371,7 +384,8 @@ onBeforeUnmount(() => {
           class="dock-btn"
           :class="{ 'dock-btn--active': isActive(id) }"
           :aria-pressed="isActive(id)"
-          :title="entryLabel(id)"
+          v-tooltip="tip(labelsHidden ? entryLabel(id) : '')"
+          :aria-label="entryLabel(id)"
           @click="emit('changeView', id)"
           @contextmenu="openMenu($event, id)"
         >
@@ -394,13 +408,9 @@ onBeforeUnmount(() => {
             <path d="M13 6h3a2 2 0 0 1 2 2v7" /><line x1="6" y1="9" x2="6" y2="21" />
           </svg>
           <!-- Git Tree -->
-          <svg v-else-if="id === 'graph'" class="dock-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <svg v-else class="dock-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="6" cy="6" r="3" /><circle cx="6" cy="18" r="3" />
             <circle cx="18" cy="12" r="3" /><path d="M6 9v6" /><path d="M18 9a9 9 0 0 1-9 9" />
-          </svg>
-          <!-- Changes -->
-          <svg v-else class="dock-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" />
           </svg>
 
           <span class="dock-label">{{ entryLabel(id) }}</span>
@@ -419,7 +429,7 @@ onBeforeUnmount(() => {
       class="dock-terminal"
       :class="{ 'dock-terminal--active': terminalActive }"
       :aria-pressed="terminalActive"
-      :title="t('terminal.headerTooltip')"
+      v-tooltip="tip(t('terminal.headerTooltip'))"
       :aria-label="t('terminal.headerLabel')"
       @click="emit('toggleTerminal')"
       @contextmenu="openMenu($event, 'terminal')"
@@ -437,7 +447,7 @@ onBeforeUnmount(() => {
       class="dock-files"
       :class="{ 'dock-files--active': filesActive }"
       :aria-pressed="filesActive"
-      :title="t('files.headerTooltip')"
+      v-tooltip="tip(t('files.headerTooltip'))"
       :aria-label="t('files.headerLabel')"
       @click="emit('toggleFiles')"
       @contextmenu="openMenu($event, 'files')"
@@ -523,15 +533,10 @@ onBeforeUnmount(() => {
           @click="removeFromDock(entryTarget)">
           {{ t('settings.dock.menu.remove') }}
         </button>
-        <button v-if="canBeStartup(entryTarget)" class="dock-menu-item" role="menuitemcheckbox"
+        <button class="dock-menu-item" role="menuitemcheckbox"
           :aria-checked="isStartup(entryTarget)" @click="setAsStartup(entryTarget)">
           {{ t('settings.dock.menu.setStartup') }}
           <span class="dock-menu-check">{{ isStartup(entryTarget) ? '✓' : '' }}</span>
-        </button>
-        <button v-if="entryTarget === 'changes'" class="dock-menu-item" role="menuitemcheckbox"
-          :aria-checked="hideChangesWhenEmpty" @click="toggleHideChangesWhenEmpty">
-          {{ t('settings.dock.menu.hideChangesWhenEmpty') }}
-          <span class="dock-menu-check">{{ hideChangesWhenEmpty ? '✓' : '' }}</span>
         </button>
         <div class="dock-menu-sep" role="separator"></div>
       </template>
@@ -587,15 +592,21 @@ onBeforeUnmount(() => {
 
 .app-dock__pill {
   pointer-events: auto;
+  /* Pill geometry, declared once: the square icon-button size below is
+     derived from it, so changing the padding or border can't desync them. */
+  --dock-pill-padding: var(--space-2, 4px);
+  --dock-pill-border: 1px;
+  /* Side of a square dock button: the pill's inner height. */
+  --dock-btn-size: calc(var(--app-dock-height, 44px) - 2 * var(--dock-pill-padding) - 2 * var(--dock-pill-border));
   /* Single source of truth, shared with anything that must clear the dock
      (see `--app-dock-height` in assets/main.css). */
   min-height: var(--app-dock-height, 44px);
   display: flex;
   align-items: stretch;
   gap: var(--space-1, 4px);
-  padding: var(--space-2, 6px);
+  padding: var(--dock-pill-padding);
   background: color-mix(in srgb, var(--color-bg-secondary) 97%, transparent);
-  border: 1px solid var(--color-border);
+  border: var(--dock-pill-border) solid var(--color-border);
   border-radius: var(--radius-md, 10px);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28), 0 2px 6px rgba(0, 0, 0, 0.18);
   backdrop-filter: blur(8px);
@@ -608,15 +619,19 @@ onBeforeUnmount(() => {
   opacity: 1;
 }
 
-/* Terminal tile — mirrors the pill's chrome but as a standalone square that
-   sits flush beside the dock and shares its idle-fade behaviour. */
-.dock-terminal {
+/* Terminal & Files tiles — mirror the pill's chrome but as standalone squares
+   that sit flush beside the dock and share its idle-fade behaviour. */
+.dock-terminal,
+.dock-files {
   pointer-events: auto;
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: var(--space-5, 9px);
+  /* Sized from the dock token so the tiles never stretch the pill taller;
+     min-height (not height) lets them still stretch with the pill. */
+  width: var(--app-dock-height, 44px);
+  min-height: var(--app-dock-height, 44px);
   background: color-mix(in srgb, var(--color-bg-secondary) 97%, transparent);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md, 10px);
@@ -632,7 +647,7 @@ onBeforeUnmount(() => {
   opacity: 1;
 }
 
-.dock-terminal:hover {
+.dock-terminal:not(.dock-terminal--active):hover {
   color: var(--color-text);
   background: var(--color-bg-secondary);
 }
@@ -647,31 +662,11 @@ onBeforeUnmount(() => {
   outline-offset: 2px;
 }
 
-/* Files tile — mirrors the pill's chrome but as a standalone square that
-   sits flush beside the dock and shares its idle-fade behaviour. */
-.dock-files {
-  pointer-events: auto;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5, 9px);
-  background: color-mix(in srgb, var(--color-bg-secondary) 97%, transparent);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md, 10px);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28), 0 2px 6px rgba(0, 0, 0, 0.18);
-  backdrop-filter: blur(8px);
-  color: var(--color-text-muted);
-  cursor: pointer;
-  opacity: var(--dock-idle-opacity, 0.45);
-  transition: opacity 0.2s ease, background 0.15s, color 0.15s;
-}
-
 .app-dock:hover .dock-files {
   opacity: 1;
 }
 
-.dock-files:hover {
+.dock-files:not(.dock-files--active):hover {
   color: var(--color-text);
   background: var(--color-bg-secondary);
 }
@@ -725,7 +720,7 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.dock-btn:hover {
+.dock-btn:not(.dock-btn--active):hover {
   background: var(--color-bg-hover, rgba(127, 127, 127, 0.12));
   color: var(--color-text);
 }
@@ -762,12 +757,17 @@ onBeforeUnmount(() => {
 }
 
 .app-dock__pill--icons-only .dock-btn {
+  justify-content: center;
   padding: var(--space-3, 9px);
+  /* Square: as wide as the pill's inner height, which the button stretches to. */
+  min-width: var(--dock-btn-size);
 }
 
 /* Vertical mode — stack the dock as a column; rotate icon + text 90°. */
 .app-dock__pill--vertical {
   flex-direction: column;
+  /* Same footprint as the horizontal pill, across instead of down. */
+  min-width: var(--app-dock-height, 44px);
 }
 
 .app-dock__pill--vertical .dock-handle {
@@ -782,6 +782,8 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: var(--space-3, 9px);
   padding: var(--space-3, 9px);
+  /* Square: as tall as the pill's inner width, which the button stretches to. */
+  min-height: var(--dock-btn-size);
 }
 
 /* Vertical dock is icon-only; keep the glyphs upright. */
@@ -806,13 +808,18 @@ onBeforeUnmount(() => {
   justify-content: center;
   min-width: 18px;
   height: 18px;
-  padding: 0 5px;
+  padding: 0 5px 1px;
   border-radius: 9px;
   background: var(--color-accent);
   color: #fff;
   font-size: 11px;
   font-weight: 700;
-  line-height: 0;
+  font-variant-numeric: tabular-nums;
+  /* line-height: 0 centered the font's ascent/descent box, not the digits,
+     so the number sat off-center. 1 keeps a real line box; text-box trims it
+     to cap height → baseline where supported, centering the glyphs exactly. */
+  line-height: 1;
+  text-box: trim-both cap alphabetic;
 }
 
 /* Handle right-click menu. */

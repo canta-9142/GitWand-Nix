@@ -54,12 +54,13 @@ import {
   gitAddToGitignore,
 } from "../utils/backend";
 import { requireOnline } from "../utils/networkGuard";
-import { clearUpdatePromptSkip } from "./useBranchUpdatePrompt";
+import { clearUpdatePromptSkip, evaluateAutoForcePush } from "./useBranchUpdatePrompt";
 import { t } from "./useI18n";
 import { resolveConflictOperation } from "../utils/conflictOperation";
 import { useWorkspaceScope } from "./useWorkspaceScope";
 import { useSettings } from "./useSettings";
 import { useUndoToast } from "./useUndoToast";
+import { commitIdentityFor } from "./useIdentity";
 
 export type ViewMode =
   | "dashboard"
@@ -93,6 +94,8 @@ export interface RepoFileEntry {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";
   section: "staged" | "unstaged" | "untracked" | "conflicted";
+  /** Path before a rename — set only when `status` is "renamed". */
+  oldPath?: string;
 }
 
 /**
@@ -120,6 +123,22 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   const successMessage = ref<string | null>(null);
   const viewMode = ref<ViewMode>("dashboard");
   const forcePushPreferred = ref(false);
+  /**
+   * Set only while `forcePushPreferred` was switched on by the divergence probe
+   * (not by a reset / rebase the user ran): the `@{upstream}` sha it judged
+   * safe to overwrite. Drives re-validation and the explicit push lease.
+   */
+  const autoForcePushSha = ref<string | null>(null);
+  let settingAutoForcePush = false;
+  // Any other way of changing the preference makes it the user's own choice
+  // (or turns it off): the auto record no longer applies.
+  watch(
+    forcePushPreferred,
+    () => {
+      if (!settingAutoForcePush) autoForcePushSha.value = null;
+    },
+    { flush: "sync" },
+  );
 
   // ── Monorepo scope (v2.21.0) ────────────────────────────────────────────
   const { activeScope } = useWorkspaceScope();
@@ -182,10 +201,12 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   }
 
   // Persist forcePushPreferred to localStorage so it survives app reloads.
-  watch(forcePushPreferred, (val) => {
+  // An auto-detected preference is stored as `auto:<sha>` so a restart keeps
+  // the lease it was judged against; an explicit one stays "1".
+  watch([forcePushPreferred, autoForcePushSha], ([val, sha]) => {
     const key = forcePushKey();
     if (!key) return;
-    if (val) localStorage.setItem(key, "1");
+    if (val) localStorage.setItem(key, sha ? `auto:${sha}` : "1");
     else localStorage.removeItem(key);
   });
 
@@ -195,11 +216,75 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     (branch) => {
       if (!branch) return;
       const key = forcePushKey();
-      forcePushPreferred.value = key
-        ? localStorage.getItem(key) === "1"
-        : false;
+      const stored = key ? localStorage.getItem(key) : null;
+      const autoSha = stored?.startsWith("auto:") ? stored.slice(5) : null;
+      settingAutoForcePush = true;
+      try {
+        forcePushPreferred.value = stored === "1" || !!autoSha;
+        autoForcePushSha.value = autoSha || null;
+      } finally {
+        settingAutoForcePush = false;
+      }
     },
   );
+
+  // Diverged because local history was rewritten (a rebase from the CLI, a
+  // flow that doesn't flag it…): prefer force push without relying on every
+  // rewriting entry point to set the flag. The verdict is re-evaluated on every
+  // status refresh — origin/<branch> can move under us (auto-fetch) and a
+  // verdict about the old tip says nothing about the new one — and an
+  // auto-detected preference is dropped as soon as the probe turns negative or
+  // `@{upstream}` is no longer the sha it was judged against. Explicit
+  // preferences (reset, rebase run in-app) are never revoked here.
+  let forcePushProbeSeq = 0;
+  watch(status, async (s) => {
+    const seq = ++forcePushProbeSeq;
+    const path = folderPath.value;
+    if (!s || !path || !s.branch) return;
+    const diverged = s.ahead > 0 && s.behind > 0;
+    const startPreferred = forcePushPreferred.value;
+    const startAutoSha = autoForcePushSha.value;
+    // Nothing to judge or invalidate: not diverged and no auto record.
+    if (!diverged && startAutoSha === null) return;
+    const verdict = await evaluateAutoForcePush(path, s.branch, {
+      preferred: startPreferred,
+      autoSha: startAutoSha,
+    });
+    // The answer is only good for the exact repo / branch / divergence it was
+    // asked about, and only if nothing newer or the user changed the state.
+    const cur = status.value;
+    if (
+      seq !== forcePushProbeSeq ||
+      folderPath.value !== path ||
+      !cur ||
+      cur.branch !== s.branch ||
+      cur.ahead !== s.ahead ||
+      cur.behind !== s.behind ||
+      forcePushPreferred.value !== startPreferred ||
+      autoForcePushSha.value !== startAutoSha
+    ) {
+      return;
+    }
+    settingAutoForcePush = true;
+    try {
+      if (verdict.action === "set") {
+        if (diverged) {
+          forcePushPreferred.value = true;
+          autoForcePushSha.value = verdict.upstream;
+        } else if (verdict.upstream !== startAutoSha) {
+          // Not diverged: a "set" here would flip every plain ahead-only branch.
+          // The only thing to do is drop a record for an upstream that moved.
+          forcePushPreferred.value = false;
+          autoForcePushSha.value = null;
+        }
+      } else if (verdict.action === "clear") {
+        forcePushPreferred.value = false;
+        autoForcePushSha.value = null;
+      }
+    } finally {
+      settingAutoForcePush = false;
+    }
+  });
 
   // Commit editor state
   const COMMIT_SIGNATURE = "\u{1FA84} Commit via GitWand";
@@ -261,6 +346,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   watch(folderPath, () => {
     branches.value = [];
     log.value = [];
+    _logViewAnchor = null;
   });
 
   /**
@@ -273,7 +359,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   watch(activeScope, () => {
     if (!folderPath.value) return;
     void loadStatus(folderPath.value);
-    void loadLog();
+    void reloadLogForViewChange();
     void loadRevCounts();
   });
 
@@ -327,10 +413,10 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       result.push({ path: f, status: "modified", section: "conflicted" });
     }
     for (const f of s.staged) {
-      result.push({ path: f.path, status: f.status, section: "staged" });
+      result.push({ path: f.path, status: f.status, section: "staged", oldPath: f.oldPath });
     }
     for (const f of s.unstaged) {
-      result.push({ path: f.path, status: f.status, section: "unstaged" });
+      result.push({ path: f.path, status: f.status, section: "unstaged", oldPath: f.oldPath });
     }
     for (const f of s.untracked) {
       result.push({ path: f, status: "added", section: "untracked" });
@@ -615,6 +701,27 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   // scroll pagination continues past the ceiling.
   const PREFETCH_CEILING = 5000;
   let _prefetchToken = 0;
+  // Bumped whenever the log *view* changes (branch/author filter, monorepo
+  // scope). An in-flight page fetched for the previous view must not land in
+  // the new one, so loadLog/loadMoreLog drop results whose epoch is stale.
+  let _logViewEpoch = 0;
+  // Hash of the deepest row the graph currently shows (reported on scroll).
+  // A forced reload keeps the log at least this deep so it doesn't shrink
+  // under a user who scrolled far down; otherwise it fetches the first page
+  // only and lets the background prefetch refill the rest.
+  let _logViewAnchor: string | null = null;
+
+  function setLogViewAnchor(hash: string | null) {
+    _logViewAnchor = hash;
+  }
+
+  /** Rows a forced reload must refetch up front: the viewed depth plus a page of margin. */
+  function forcedReloadDepth(): number {
+    const viewed = _logViewAnchor
+      ? log.value.findIndex((e) => e.hashFull === _logViewAnchor) + 1
+      : 0;
+    return Math.max(LOG_PAGE, Math.min(log.value.length, viewed + LOG_PAGE));
+  }
 
   function isCanonicalLogView(): boolean {
     return (
@@ -656,11 +763,16 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    *   unchanged top-commit hash (the in-memory `haveSameHead` keep and the
    *   `LOG_CACHE` restore) and refetch fresh. Ref/decoration-only mutations
    *   (push moving origin/HEAD, branch/tag/stash deletion, fetch) leave the top
-   *   commit untouched, so without this they'd serve a stale log. Refetches at
-   *   the current depth so a paginated view doesn't collapse back to page 1.
+   *   commit untouched, so without this they'd serve a stale log. Refetches
+   *   only down to what the user is viewing (see `forcedReloadDepth`) — not the
+   *   whole prefetched history — and the background prefetch refills the rest.
+   * @param viewChanged True when the filter/scope just changed: fetch only the
+   *   first page (the current depth belongs to the old view — up to the whole
+   *   prefetched history) and never keep the old view's entries.
    */
-  async function loadLog(count?: number, force = false) {
+  async function loadLog(count?: number, force = false, viewChanged = false) {
     if (!folderPath.value) return;
+    const epoch = _logViewEpoch;
     try {
       const authorEmail =
         logAuthorFilter.value === "mine"
@@ -672,9 +784,11 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // only needs a cheap first-page probe to detect HEAD movement. Filtered
       // views reload at least what's visible so polling doesn't collapse a
       // paginated log back to page 1.
-      const pageSize = isCanon
+      const pageSize = viewChanged
+        ? LOG_PAGE
+        : isCanon
         ? force
-          ? Math.max(LOG_PAGE, log.value.length)
+          ? forcedReloadDepth()
           : LOG_PAGE
         : (count ?? Math.max(LOG_PAGE, log.value.length));
       const entries = await getGitLog(
@@ -688,12 +802,15 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       );
       // Refresh the hidden-commit badge counts alongside the scoped log.
       await loadRevCounts();
+      // A newer view change superseded this fetch — its result is stale.
+      if (epoch !== _logViewEpoch) return;
 
       const head = entries[0]?.hashFull;
       if (isCanon) {
         const cached = LOG_CACHE.get(folderPath.value);
         const haveSameHead =
           !force &&
+          !viewChanged &&
           log.value.length >= entries.length &&
           log.value[0]?.hashFull === head;
         if (haveSameHead) {
@@ -749,6 +866,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   async function loadMoreLog(pageSize: number = LOG_PAGE) {
     if (!folderPath.value || !logHasMore.value || logLoadingMore.value) return;
     logLoadingMore.value = true;
+    const epoch = _logViewEpoch;
     try {
       const authorEmail =
         logAuthorFilter.value === "mine"
@@ -765,6 +883,9 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
         isCurrentBranchOnly ? (status.value?.branch ?? undefined) : undefined,
         activeScope.value ?? undefined,
       );
+      // The view changed while this page was in flight — it belongs to the
+      // old filter/scope, don't append it to the new log.
+      if (epoch !== _logViewEpoch) return;
       // Dedupe: in all-refs mode the `--skip` offset counts filtered-out stash
       // pseudo-commits, so consecutive pages can overlap by a few commits.
       // Drop any hash we already have before appending.
@@ -784,14 +905,29 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     } catch (err: any) {
       error.value = `git log (page): ${err?.message ?? err}`;
     } finally {
-      logLoadingMore.value = false;
+      // A view change already reset the flag; don't clear a newer page's.
+      if (epoch === _logViewEpoch) logLoadingMore.value = false;
     }
   }
 
   async function setLogBranchFilter(filter: "all" | "current") {
     if (logBranchFilter.value === filter) return;
     logBranchFilter.value = filter;
-    await loadLog();
+    await reloadLogForViewChange();
+  }
+
+  /**
+   * Reload the log after the filter/scope changed. Cancels the canonical
+   * background prefetch and invalidates in-flight pages, then fetches the
+   * first page of the new view (or restores the cached full log when back on
+   * the canonical view).
+   */
+  async function reloadLogForViewChange() {
+    _logViewEpoch++;
+    _prefetchToken++;
+    _logViewAnchor = null;
+    logLoadingMore.value = false;
+    await loadLog(undefined, false, true);
   }
 
   /**
@@ -804,7 +940,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       currentGitUser.value = await getGitUser(folderPath.value);
     }
     logAuthorFilter.value = filter;
-    await loadLog();
+    await reloadLogForViewChange();
   }
 
   /**
@@ -814,7 +950,18 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     if (!folderPath.value) return;
     selectedCommitHash.value = hash;
     try {
-      commitDiffs.value = await getGitShow(folderPath.value, hash);
+      const diffs = await getGitShow(folderPath.value, hash);
+      // Stashes are pushed with --include-untracked: those files live in the
+      // stash commit's 3rd parent, which `git show --first-parent` never sees.
+      if (stashes.value.some((s) => s.hash === hash)) {
+        try {
+          diffs.push(...(await getGitShow(folderPath.value, `${hash}^3`)));
+        } catch {
+          // No untracked part in this stash.
+        }
+      }
+      if (selectedCommitHash.value !== hash) return;
+      commitDiffs.value = diffs;
     } catch (err: any) {
       commitDiffs.value = [];
       error.value = `git show: ${err?.message ?? err}`;
@@ -915,7 +1062,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // git trailer convention: one blank line before the trailer block.
       const trailerBlock = trailers.trim();
       if (trailerBlock) fullMessage += `\n\n${trailerBlock}`;
-      const hash = await gitCommit(folderPath.value, fullMessage);
+      const hash = await gitCommit(folderPath.value, fullMessage, commitIdentityFor(folderPath.value));
       lastCommitHash.value = hash;
       commitSummary.value = "";
       commitDescription.value = getCommitSignatureDefault();
@@ -947,7 +1094,8 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       selectedFilePath.value = null;
       selectedFileStaged.value = false;
       diff.value = null;
-      await refresh();
+      // Force: amending rewrites HEAD, which may not be the log's top commit.
+      await refresh(true);
     } catch (err: any) {
       error.value = `amend: ${err?.message ?? err}`;
     }
@@ -964,7 +1112,16 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // this covers both a genuine first publish and a branch that exists on
       // the remote but lost its tracking config.
       const publish = needsUpstream.value;
-      const result = await gitPush(folderPath.value, publish, force);
+      // An auto-detected preference was judged against one remote tip: pass it
+      // as an explicit lease so the push is refused if the remote moved since.
+      const leaseSha = force ? autoForcePushSha.value : null;
+      const leaseBranch = status.value?.branch;
+      const result = await gitPush(
+        folderPath.value,
+        publish,
+        force,
+        leaseSha && leaseBranch ? { branch: leaseBranch, sha: leaseSha } : undefined,
+      );
       if (!result.success) {
         error.value = `push: ${result.message}`;
       } else {
@@ -1052,12 +1209,16 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   }
 
   /**
-   * Post-checkout "Update branch": stash-if-dirty → pull --ff-only → pop.
+   * Post-checkout "Update branch": stash-if-dirty → pull → pop.
    *
-   * Used by the dedicated prompt shown when checking out a behind-only branch
-   * (behind > 0, ahead == 0). `--ff-only` fetches and fast-forwards atomically
-   * and refuses anything non-fast-forward, so a stale ahead/behind status
-   * (race since the last fetch) degrades into a clean error, never a merge.
+   * - `"ff-only"` — the prompt for a behind-only branch (behind > 0, ahead == 0).
+   *   `--ff-only` fetches and fast-forwards atomically and refuses anything
+   *   non-fast-forward, so a stale ahead/behind status (race since the last
+   *   fetch) degrades into a clean error, never a merge.
+   * - `"rebase"` — the prompt for a branch whose upstream was rewritten and
+   *   that has no commits of its own (`isUpstreamRewriteOnly`, #223).
+   *   `pull --rebase` uses the fork-point, so it drops the old upstream commits
+   *   and lands exactly on the rewritten branch; a merge would conflict.
    *
    * Returns:
    * - "ok"           — branch updated (WIP restored if it was stashed)
@@ -1067,7 +1228,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    *                    `message` carries the raw git error for the caller
    *                    to surface
    */
-  async function updateBranchFastForward(): Promise<{
+  async function updateBranchToUpstream(mode: "ff-only" | "rebase" = "ff-only"): Promise<{
     status: "ok" | "pop-conflict" | "failed";
     message?: string;
   }> {
@@ -1078,7 +1239,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     const dirty = !isClean.value;
     try {
       if (dirty) await gitStash(folderPath.value, "GitWand: update branch");
-      const result = await gitPull(folderPath.value, "ff-only");
+      const result = await gitPull(folderPath.value, mode);
       if (!result.success) {
         // The tree hasn't moved — the pop applies cleanly, restoring the WIP.
         if (dirty) await gitStashPop(folderPath.value).catch(() => {});
@@ -1209,11 +1370,12 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    * `isCherryPicking` ref could not survive a reload or a repo opened while
    * already mid-cherry-pick, which is what #201 had to work around.
    */
-  async function cherryPick(hashes: string[]) {
+  async function cherryPick(hashes: string[], opts: { noCommit?: boolean } = {}) {
     if (!folderPath.value || hashes.length === 0) return;
     try {
-      const result = await gitCherryPick(folderPath.value, hashes);
-      await refresh();
+      const result = await gitCherryPick(folderPath.value, hashes, opts.noCommit ?? false);
+      // Force: in the all-refs log the new commit may not land on top.
+      await refresh(true);
 
       const hasConflictedFiles =
         status.value && status.value.conflicted.length > 0;
@@ -1235,6 +1397,11 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
         }
       } else if (!result.success) {
         error.value = `cherry-pick: ${result.message || "unknown error"}`;
+      } else if (opts.noCommit) {
+        // WIP pick: nothing was committed — show the picked files so the user
+        // can manage them before committing.
+        viewMode.value = "changes";
+        successMessage.value = "cherry-pick-wip-done";
       } else {
         successMessage.value = "cherry-pick-done";
       }
@@ -1264,7 +1431,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     if (!folderPath.value) return;
     try {
       await gitStashApply(folderPath.value, index);
-      await refresh();
+      await refresh(true);
     } catch (err: any) {
       error.value = `stash apply: ${err?.message ?? err}`;
     }
@@ -1275,10 +1442,9 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     try {
       await gitStashApply(folderPath.value, index);
       await gitStashDrop(folderPath.value, index);
-      await refresh();
-      await loadStashes();
       // Force: popping drops the stash ref, which the all-refs log renders.
-      await loadLog(undefined, true);
+      await refresh(true);
+      await loadStashes();
     } catch (err: any) {
       error.value = `stash pop: ${err?.message ?? err}`;
     }
@@ -1324,6 +1490,8 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
 
   async function createBranch(name: string): Promise<boolean> {
     if (!folderPath.value) return false;
+    // Same busy flag as switchBranch: creating checks the new branch out.
+    isSwitchingBranch.value = true;
     try {
       await gitCreateBranch(folderPath.value, name, true);
       // Force: the new branch ref sits on the current HEAD, so the log's
@@ -1334,6 +1502,8 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     } catch (err: any) {
       error.value = `create branch: ${err?.message ?? err}`;
       return false;
+    } finally {
+      isSwitchingBranch.value = false;
     }
   }
 
@@ -1584,6 +1754,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     loadMoreLog,
     setLogAuthorFilter,
     setLogBranchFilter,
+    setLogViewAnchor,
     stageFiles,
     stageAll,
     unstageFiles,
@@ -1594,7 +1765,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     amendCommit,
     push,
     pull,
-    updateBranchFastForward,
+    updateBranchToUpstream,
     fetch: fetchRemote,
     mergeBranch,
     discardFiles,

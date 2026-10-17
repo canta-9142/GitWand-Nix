@@ -11,6 +11,7 @@ import {
   gitFileCount,
   gitRemoteInfo,
   type PullRequest,
+  type PrEdit,
   type PullRequestDetail,
   type CICheck,
   type CIAnnotation,
@@ -36,6 +37,7 @@ import { forgeFromRemoteInfo, githubProvider } from "./forge/useForge";
 import { ForgeNotImplementedError, CURSOR_WEB_BASE, forgeSupportsPRs } from "./forge/types";
 import { usePrCache, listKey, detailKey } from "./usePrCache";
 import { whenIdle } from "../utils/idleSchedule";
+import { escapeHtml } from "../utils/escapeHtml";
 import { getPersistedDiffMode, type DiffMode } from "../utils/diffMode";
 import { requireOnline } from "../utils/networkGuard";
 import { formatRelativeAge } from "../utils/relativeTime";
@@ -817,7 +819,9 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     prAnnotations.value = [];
     annotationsLoaded.value = false;
     checksLoaded.value = false;
+    checksLoading.value = false;
     issueCommentsLoaded.value = false;
+    issueCommentsLoading.value = false;
     fileCountLoaded.value = false;
     prDiffFiles.value = [];
     diffIndex.value = [];
@@ -919,30 +923,42 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
 
   async function loadChecks() {
     if (!selectedPr.value || checksLoaded.value || checksLoading.value) return;
+    const number = selectedPr.value.number;
+    const current = () => selectedPr.value?.number === number;
     checksLoading.value = true;
     try {
-      prChecks.value = await forge.value.getCIChecks(cwd.value, selectedPr.value.number);
+      const checks = await forge.value.getCIChecks(cwd.value, number);
+      // Stale response: the user moved to another PR — don't write PR A's
+      // checks into PR B's refs (or cache key via persistDetailCache).
+      if (!current()) return;
+      prChecks.value = checks;
       checksLoaded.value = true;
       persistDetailCache();
     } catch {
-      checksLoaded.value = true; // non-fatal — checks tab simply stays empty
+      if (current()) checksLoaded.value = true; // non-fatal — checks tab simply stays empty
     } finally {
-      checksLoading.value = false;
+      // `resetDetail()` already cleared the flag for the new PR, whose own
+      // flight may now be in progress — leave it alone.
+      if (current()) checksLoading.value = false;
     }
   }
 
   async function loadIssueComments() {
     if (!selectedPr.value || issueCommentsLoaded.value || issueCommentsLoading.value) return;
+    const number = selectedPr.value.number;
+    const current = () => selectedPr.value?.number === number;
     issueCommentsLoading.value = true;
     try {
-      prIssueComments.value =
-        (await forge.value.listIssueComments?.(cwd.value, selectedPr.value.number)) ?? [];
+      const comments = (await forge.value.listIssueComments?.(cwd.value, number)) ?? [];
+      // Same stale-response guard as `loadChecks` / `fetchDetailBundle`.
+      if (!current()) return;
+      prIssueComments.value = comments;
       issueCommentsLoaded.value = true;
       persistDetailCache();
     } catch {
-      issueCommentsLoaded.value = true;
+      if (current()) issueCommentsLoaded.value = true;
     } finally {
-      issueCommentsLoading.value = false;
+      if (current()) issueCommentsLoading.value = false;
     }
   }
 
@@ -1066,7 +1082,10 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     cwd, selectedPr, prDetail, detailTab, loadDiff, diffIndex, annotationsByFile,
   });
 
-  watch(detailTab, async (tab) => {
+  // Keyed on the PR too: `resetDetail()` forces the tab back to "info", so
+  // opening a PR while already on "info" would never change `detailTab` and
+  // the info tab's lazy loaders (issue comments, summary) would never fire.
+  watch([detailTab, () => selectedPr.value?.number], async ([tab]) => {
     if (tab === "diff") {
       loadDiff();
       loadAnnotations();
@@ -1184,6 +1203,43 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     }
   }
 
+  /** True when the active forge can edit a PR's title and description. */
+  const forgeSupportsEdit = computed(() => typeof forge.value.updatePR === "function");
+
+  /**
+   * Edit a PR's title and/or description on the forge. Returns whether it was
+   * written so the caller can keep its editor open on failure. On success the
+   * open detail and the list row are patched in place — no refetch, the forge
+   * just stored what we sent.
+   */
+  async function updatePr(number: number, edit: PrEdit): Promise<boolean> {
+    if (!forge.value.updatePR) return false;
+    if (!(await requireOnline("pr edit"))) {
+      error.value = t("connectivity.offline.disabledOp");
+      return false;
+    }
+    try {
+      await forge.value.updatePR(cwd.value, number, edit);
+      if (prDetail.value?.number === number) {
+        prDetail.value = { ...prDetail.value, ...edit };
+        persistDetailCache();
+      }
+      if (edit.title !== undefined) {
+        const title = edit.title;
+        prs.value = prs.value.map((pr) => (pr.number === number ? { ...pr, title } : pr));
+        if (selectedPr.value?.number === number) selectedPr.value = { ...selectedPr.value, title };
+        // Lists are cached with titles in them; drop them so the next load is fresh.
+        cache.invalidateLists(cwd.value);
+        PR_LIST_CACHE.delete(cwd.value);
+      }
+      success.value = t("pr.success.prUpdated", number);
+      return true;
+    } catch (err: any) {
+      error.value = err.message;
+      return false;
+    }
+  }
+
   async function mergePr() {
     if (!mergingPr.value) return;
     if (!(await requireOnline("gh pr merge"))) {
@@ -1251,12 +1307,19 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     } catch (err: any) { error.value = err.message; }
   }
 
-  async function handleReplyComment(inReplyToId: number, body: string) {
-    if (!selectedPr.value) return;
+  /** Resolves `true` once the reply is posted and appended, `false` on
+   *  failure (surfaced via `error`) — lets the caller keep the draft. The
+   *  reply inherits its parent's thread state, so no refetch is needed. */
+  async function handleReplyComment(inReplyToId: number, body: string): Promise<boolean> {
+    if (!selectedPr.value) return false;
     try {
-      await forge.value.createComment(cwd.value, selectedPr.value.number, { body, in_reply_to_id: inReplyToId });
-      await refreshComments();
-    } catch (err: any) { error.value = err.message; }
+      const reply = await forge.value.createComment(cwd.value, selectedPr.value.number, { body, in_reply_to_id: inReplyToId });
+      const parent = prComments.value.find((c) => c.id === inReplyToId);
+      prComments.value = [...prComments.value, { ...reply, thread_id: parent?.thread_id, resolved: parent?.resolved }];
+      if (prDetail.value) prDetail.value.reviewComments++;
+      persistDetailCache();
+      return true;
+    } catch (err: any) { error.value = err.message; return false; }
   }
 
   /** True when the active forge supports editing a review comment (F2) — the
@@ -1271,22 +1334,26 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
    *  unsupported rather than surfaced as an error banner. `forgeSupports*`
    *  hides the action before this can even be called, so this guard is
    *  defense-in-depth, not the primary UX. */
-  async function handleEditComment(id: number, body: string) {
+  async function handleEditComment(id: number, body: string): Promise<boolean> {
     try {
-      await forge.value.updateComment(cwd.value, id, body);
+      await forge.value.updateComment(cwd.value, id, body, selectedPr.value?.number);
       const idx = prComments.value.findIndex((c) => c.id === id);
       if (idx !== -1) prComments.value[idx] = { ...prComments.value[idx], body, updated_at: new Date().toISOString() };
       persistDetailCache();
+      return true;
     } catch (err: any) {
-      if (err instanceof ForgeNotImplementedError) return;
-      error.value = err.message;
+      if (!(err instanceof ForgeNotImplementedError)) error.value = err.message;
+      return false;
     }
   }
 
   async function handleDeleteComment(id: number) {
     try {
-      await forge.value.deleteComment(cwd.value, id);
-      prComments.value = prComments.value.filter((c) => c.id !== id && c.in_reply_to_id !== id);
+      await forge.value.deleteComment(cwd.value, id, selectedPr.value?.number);
+      // Only the comment itself: deleting a thread's root leaves its replies
+      // on the forge, where they show as top-level comments after a refetch
+      // (`nestReplies` keeps a reply whose root is gone top-level).
+      prComments.value = prComments.value.filter((c) => c.id !== id);
       if (prDetail.value && prDetail.value.reviewComments > 0) prDetail.value.reviewComments--;
       persistDetailCache();
     } catch (err: any) {
@@ -1376,6 +1443,28 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     }
   }
 
+  /** True when the active forge can resolve review threads. */
+  const forgeSupportsResolveThread = computed(() => typeof forge.value.setThreadResolved === "function");
+
+  /** Resolve / unresolve the review thread opened by `root` ("Resolve
+   *  conversation"). Every comment of the thread is updated in place, so the
+   *  timeline reflects it without refetching. Same unsupported-is-silent
+   *  contract as `handleDismissReview`. */
+  async function handleSetThreadResolved(root: PrReviewComment, resolved: boolean) {
+    const threadId = root.thread_id;
+    if (!forge.value.setThreadResolved || !threadId) return;
+    try {
+      await forge.value.setThreadResolved(cwd.value, threadId, resolved);
+      prComments.value = prComments.value.map((c) =>
+        c.thread_id === threadId ? { ...c, resolved } : c,
+      );
+      persistDetailCache();
+    } catch (err: any) {
+      if (err instanceof ForgeNotImplementedError) return;
+      error.value = err.message;
+    }
+  }
+
   /** Request reviewers on the open PR (B4). Same unsupported-is-silent
    *  contract as `handleDismissReview`. */
   async function handleRequestReviewers(logins: string[]) {
@@ -1456,8 +1545,7 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
   }
 
   function renderBody(body: string): string {
-    return body
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    return escapeHtml(body)
       .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
       .replace(/`(.+?)`/g, '<code class="pr-code">$1</code>')
       .replace(/\n/g, "<br />");
@@ -1666,9 +1754,11 @@ export function usePrPanel(cwd: Ref<string>, opts: PrPanelOptions = {}) {
     init, ensurePrsLoaded, loadRemote, loadPrs, loadMorePrs, loadCurrentUser, selectPr, loadDiff, loadChecks,
     revalidateOpenDetail,
     createPr, checkoutPr, mergePr, armAutoMerge, disarmAutoMerge, convertDraftToReady,
+    updatePr, forgeSupportsEdit,
     handleCreateComment, handleReplyComment, handleEditComment,
     handleDeleteComment, handleApplySuggestion, handleAddToReview, handleSubmitReview,
     handleDismissReview, handleRequestReviewers, forgeSupportsDismissReview, forgeSupportsRequestReviewers,
+    handleSetThreadResolved, forgeSupportsResolveThread,
     forgeSupportsCommentEdit, forgeSupportsCommentDelete,
     loadConflictPreview, loadHotspots, loadFileHistory,
     // Helpers

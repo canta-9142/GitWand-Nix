@@ -32,8 +32,28 @@ export const TOGGLE_GIT_TREE_KEY: InjectionKey<() => void> = Symbol("toggleGitTr
 
 /** Settings tab identifiers accepted by {@link OPEN_SETTINGS_KEY}. */
 export type SettingsTabTarget =
-  | "general" | "dock" | "git" | "editor" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "releaseNotes";
+  | "general" | "dock" | "git" | "editor" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "aiTemplates";
 
-/** Open the Settings panel, optionally on a specific tab (e.g. from the PR sidebar). */
-export const OPEN_SETTINGS_KEY: InjectionKey<(tab?: SettingsTabTarget) => void> = Symbol("openSettings");
+/** Section of a Settings tab that {@link OPEN_SETTINGS_KEY} can scroll to. */
+export type SettingsSectionTarget = "identities";
 
+/**
+ * Open the Settings panel, optionally on a specific tab (e.g. from the PR
+ * sidebar) and scrolled to one of its sections (e.g. the commit panel's
+ * "Manage profiles…").
+ */
+export const OPEN_SETTINGS_KEY: InjectionKey<(tab?: SettingsTabTarget, section?: SettingsSectionTarget) => void> =
+  Symbol("openSettings");
+
+
+/**
+ * Write an AI-generated commit message into the App-owned commit draft.
+ *
+ * RepoSidebar's commit pane unmounts when the user switches view, and Vue
+ * drops `emit()` from an unmounted instance — so an AI generation that
+ * resolves after navigation must not rely on `update:commitSummary`. The
+ * sink ignores results whose `cwd` is no longer the open repo.
+ */
+export const COMMIT_MESSAGE_SINK_KEY: InjectionKey<
+  (cwd: string, summary: string, description: string) => void
+> = Symbol("commitMessageSink");
