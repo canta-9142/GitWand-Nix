@@ -10,8 +10,8 @@
 
 import { createServer } from "node:http";
 import { execSync, execFileSync, spawnSync, spawn } from "node:child_process";
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, unlinkSync, realpathSync, renameSync, mkdirSync, mkdtempSync, rmSync, copyFileSync, watch } from "node:fs";
-import { resolve, join, dirname, basename, sep, isAbsolute } from "node:path";
+import { readFileSync, writeFileSync, readdirSync, statSync, lstatSync, existsSync, unlinkSync, realpathSync, renameSync, mkdirSync, mkdtempSync, rmSync, copyFileSync, chmodSync, watch } from "node:fs";
+import { resolve, join, dirname, basename, sep, isAbsolute, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Socket } from "node:net";
 import { createRequire } from "node:module";
@@ -32,6 +32,24 @@ process.on("unhandledRejection", (reason) => {
 });
 
 /**
+ * Throw unless `cwd` lies inside a git working tree (it or an ancestor holds a
+ * `.git` entry). Mirrors `require_git_worktree` in `src-tauri/src/git/cmd.rs`,
+ * messages included: `/api/read-file` and `/api/write-file` refuse any other
+ * cwd, so `read-file { cwd: "/" }` no longer reads arbitrary files.
+ */
+function requireGitWorktree(cwd) {
+  let dir;
+  try { dir = realpathSync.native(cwd); }
+  catch (e) { throw new Error(`cwd does not resolve: ${e.message}`); }
+  for (;;) {
+    if (existsSync(join(dir, ".git"))) return;
+    const up = dirname(dir);
+    if (up === dir) throw new Error(`cwd is not inside a git working tree: ${cwd}`);
+    dir = up;
+  }
+}
+
+/**
  * Resolve `relPath` under `cwd`, ensuring the result stays inside the canonical
  * cwd. Mirrors the Rust `safe_repo_path` helper in `src-tauri/src/lib.rs` so
  * dev-server and the Tauri backend enforce the same boundary.
@@ -46,33 +64,141 @@ function safeRepoPath(cwd, relPath) {
 
   let cwdCanonical;
   try {
-    cwdCanonical = realpathSync(cwd);
+    // `.native`, like every resolution below: the JS `realpathSync` keeps the
+    // caller's spelling (letter case, NFC/NFD on macOS) while the native one
+    // returns the on-disk name, and mixing the two made every path an escape.
+    cwdCanonical = realpathSync.native(cwd);
   } catch (e) {
     throw new Error(`cwd does not resolve: ${e.message}`);
   }
 
-  const joined = join(cwdCanonical, relPath);
+  // Joined like Rust's `Path::join`: an absolute `relPath` replaces the root,
+  // and nothing is folded lexically. `path.resolve`/`join` would fold
+  // `linkdir/..` to the repo root, while the OS takes it to the parent of the
+  // link's TARGET, so the path is only ever resolved on the filesystem, with
+  // `realpathSync.native` (the JS `realpathSync` folds `..` first, too).
+  const joined = isAbsolute(relPath)
+    ? relPath
+    : cwdCanonical.endsWith(sep) ? cwdCanonical + relPath : cwdCanonical + sep + relPath;
 
-  // For writes the target file may not exist yet — canonicalize the parent
-  // and reassemble the final path.
+  // The path may not exist (a file about to be written, or one whose deletion
+  // is being diffed, possibly with its whole directory). Canonicalize the
+  // deepest ancestor that does exist and append the missing tail, which holds
+  // no symlink since none of it exists; it may only be plain names, never `..`.
+  // "Does not exist" means exactly that: a dangling, looping or unreadable
+  // symlink is a refusal, not a missing directory to skip. The last component
+  // alone may be a symlink that does not resolve (it is not followed here;
+  // `/api/write-file` checks for it). Mirrors the Rust helper, messages included.
   let resolved;
   try {
-    resolved = realpathSync(joined);
-  } catch {
-    const parent = dirname(joined);
-    let parentCanonical;
-    try {
-      parentCanonical = realpathSync(parent);
-    } catch (e) {
-      throw new Error(`parent path does not resolve: ${e.message}`);
+    resolved = realpathSync.native(joined);
+  } catch (err) {
+    const unresolvable = () =>
+      new Error(`path does not resolve: ${joined} (dangling, looping or unreadable component)`);
+    let leafIsSymlink = false;
+    try { leafIsSymlink = lstatSync(joined).isSymbolicLink(); } catch { /* not a symlink */ }
+    // ENOTDIR: a component on the way is a regular file (a deleted `secret/x`
+    // whose folder became a file `secret`); absent too, once the file is found
+    // to be a regular file and not a symlink. Mirrors Rust.
+    let belowAFile = isNotDir(joined, err);
+    if (!isAbsent(joined, err) && !belowAFile && !leafIsSymlink) throw unresolvable();
+
+    let ancestor = joined;
+    let base;
+    for (;;) {
+      const up = dirname(ancestor);
+      if (up === ancestor) throw new Error("path has no resolvable ancestor");
+      ancestor = up;
+      try {
+        base = realpathSync.native(ancestor);
+        break;
+      } catch (e) {
+        if (isNotDir(ancestor, e)) belowAFile = true;
+        else if (!isAbsent(ancestor, e)) throw unresolvable();
+      }
     }
-    resolved = join(parentCanonical, basename(joined));
+    if (belowAFile) {
+      let isFile = false;
+      try { isFile = lstatSync(ancestor).isFile(); } catch { /* not a file */ }
+      if (!isFile) throw unresolvable();
+    }
+    const segments = [];
+    for (const seg of joined.slice(ancestor.length).split(sep)) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") {
+        throw new Error(`path does not resolve: ${joined} (\`..\` below a missing directory)`);
+      }
+      segments.push(seg);
+    }
+    resolved = segments.length
+      ? (base.endsWith(sep) ? base : base + sep) + segments.join(sep)
+      : base;
   }
 
   if (resolved !== cwdCanonical && !resolved.startsWith(cwdCanonical + sep)) {
     throw new Error(`path escapes cwd (resolved: ${resolved}, cwd: ${cwdCanonical})`);
   }
   return resolved;
+}
+
+/**
+ * `true` when `p` failed to resolve only because nothing exists there: not a
+ * dangling or looping symlink, not an unreadable directory. Mirrors Rust's
+ * `is_absent` in `src-tauri/src/git/cmd.rs`.
+ */
+function isAbsent(p, err) {
+  if (err?.code !== "ENOENT") return false;
+  try {
+    lstatSync(p);
+    return false;
+  } catch (e) {
+    return e.code === "ENOENT";
+  }
+}
+
+/**
+ * `true` when `p` failed to resolve because a component on the way is not a
+ * directory (ENOTDIR), as seen without following a final symlink. Mirrors
+ * Rust's `is_not_dir`.
+ */
+function isNotDir(p, err) {
+  if (err?.code !== "ENOTDIR") return false;
+  try {
+    lstatSync(p);
+    return false;
+  } catch (e) {
+    return e.code === "ENOTDIR";
+  }
+}
+
+/**
+ * `path` as a clean repo-relative path, `/`-separated (no `./`, an absolute
+ * path inside the repo made relative), falling back to the guard's resolved
+ * path when it cannot be cleaned lexically. Mirrors Rust's
+ * `repo_relative_path` in `commands/read.rs`, so both backends hand git the
+ * same argument and produce the same diff header.
+ */
+function repoRelativePath(cwd, root, path, guarded) {
+  let rel = null;
+  if (isAbsolute(path)) {
+    for (const base of [cwd, root]) {
+      const prefix = base.endsWith(sep) ? base : base + sep;
+      if (path === base) { rel = ""; break; }
+      if (path.startsWith(prefix)) { rel = path.slice(prefix.length); break; }
+    }
+  } else {
+    rel = path;
+  }
+  let parts = [];
+  if (rel !== null) {
+    for (const seg of rel.split(sep)) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") { parts = []; break; }
+      parts.push(seg);
+    }
+  }
+  if (!parts.length) parts = relative(root, guarded).split(sep).filter(Boolean);
+  return parts.join("/");
 }
 
 /** Resolve the full path to a CLI binary, checking Homebrew paths on macOS. */
@@ -95,6 +221,25 @@ const GLAB = resolveBin("glab");
 const GIT = resolveBin("git");
 
 /**
+ * Lexical check of a pathspec handed to `git rm --cached`. Mirrors
+ * `validate_pathspec` (commands/tracked_ignored.rs) - keep the two in sync.
+ * Not `safeRepoPath`: that one resolves symlinks, so a tracked link pointing
+ * outside the repo would fail the whole batch, though `git rm --cached` only
+ * touches the index entry. Non-empty, no NUL, not absolute, no `..`
+ * component; on Windows `\\` is a separator and a drive/UNC prefix absolute.
+ */
+function validateUntrackPathspec(p) {
+  if (typeof p !== "string" || !p.trim()) throw new Error("path must not be empty");
+  if (p.includes("\0")) throw new Error("path must not contain NUL");
+  const windows = process.platform === "win32";
+  const absolute = p.startsWith("/") || (windows && (p.startsWith("\\") || /^[A-Za-z]:/.test(p)));
+  if (absolute) throw new Error(`path must be relative to the repo (got: ${p})`);
+  if (p.split(windows ? /[\\/]/ : "/").includes("..")) {
+    throw new Error(`path must not contain \`..\` (got: ${p})`);
+  }
+}
+
+/**
  * Extract a percentage from a git progress line, e.g.
  * "Receiving objects:  56% (456/812), 1.2 MiB | 3.4 MiB/s". Mirrors the Rust
  * `extract_percent` helper in `commands/ops.rs` — keep the two in sync.
@@ -106,6 +251,182 @@ function devExtractPercent(line) {
   const m = before.match(/(\d+(?:\.\d+)?)\s*$/);
   if (!m) return 0;
   return Math.min(100, Math.max(0, parseFloat(m[1])));
+}
+
+/**
+ * `@gitwand/core`, imported once and cached. Node resolves it to
+ * `packages/core/dist`, which `pnpm dev:web` / `pnpm dev:server` build first
+ * (`build:core`); started any other way, a missing or stale dist would make
+ * every diff route answer a 500 with a cryptic resolution error, so it is
+ * checked here and reported with the fix. A failed load is not cached, so a
+ * build made after startup is picked up on the next request — but a stale
+ * dist that loaded fine is cached by Node until the dev-server restarts.
+ */
+const DEV_CORE_HELPERS = ["classifyHunkLine", "hunkBodyFromHeader", "noHunkBody", "parseHunkHeader", "scanSecrets"];
+let devCorePromise = null;
+function loadDevCore() {
+  if (devCorePromise) return devCorePromise;
+  devCorePromise = import("@gitwand/core").then(
+    (core) => {
+      const missing = DEV_CORE_HELPERS.filter((name) => typeof core[name] !== "function");
+      if (missing.length > 0) {
+        throw new Error(
+          `@gitwand/core is out of date (missing ${missing.join(", ")}): run \`pnpm --filter @gitwand/core build\`, then restart the dev-server`,
+        );
+      }
+      return core;
+    },
+    (err) => {
+      throw new Error(`@gitwand/core could not be loaded: run \`pnpm --filter @gitwand/core build\` (${err.message})`);
+    },
+  );
+  devCorePromise.catch(() => { devCorePromise = null; });
+  return devCorePromise;
+}
+
+/**
+ * Parse one file's unified diff into hunks — the dev-server twin of Rust's
+ * `parse_diff_hunks` (src-tauri/src/git/parse.rs). `core` is the module from
+ * `loadDevCore()`; its hunk-body helpers are the TS twin of Rust's `HunkBody`:
+ * inside a hunk, bounded by its `@@` counts, a line is classified by its first
+ * character only — a removed `-- note` is the diff line `--- note`, not a file
+ * header — and a bare "" is a blank context line while both counts remain
+ * (`diff.suppressBlankEmpty`). Outside a hunk, "" and headers are skipped.
+ *
+ * Returns `{ hunks, status }`, `status` being "added" when a `new file mode`
+ * header was seen (Rust's `detected_status`).
+ */
+function devParseDiffHunks(core, text) {
+  const { classifyHunkLine, hunkBodyFromHeader, noHunkBody, parseHunkHeader } = core;
+  const hunks = [];
+  let status;
+  let currentHunk = null;
+  let body = noHunkBody();
+  let oldLineNo = 0;
+  let newLineNo = 0;
+
+  for (const line of text.split("\n")) {
+    const kind = currentHunk ? classifyHunkLine(body, line) : null;
+    if (kind) {
+      const content = line.substring(1);
+      if (kind === "add") {
+        currentHunk.lines.push({ type: "add", content, oldLineNo: null, newLineNo });
+        newLineNo++;
+      } else if (kind === "delete") {
+        currentHunk.lines.push({ type: "delete", content, oldLineNo, newLineNo: null });
+        oldLineNo++;
+      } else {
+        currentHunk.lines.push({ type: "context", content, oldLineNo, newLineNo });
+        oldLineNo++;
+        newLineNo++;
+      }
+    } else if (line.startsWith("new file mode")) {
+      status = "added";
+    } else if (line.startsWith("@@")) {
+      if (currentHunk) hunks.push(currentHunk);
+      // Same fallback as Rust's parse_hunk_header for an unparsable header.
+      const range = parseHunkHeader(line) ?? { oldStart: 0, oldCount: 1, newStart: 0, newCount: 1 };
+      oldLineNo = range.oldStart;
+      newLineNo = range.newStart;
+      body = hunkBodyFromHeader(line);
+      currentHunk = { header: line, ...range, lines: [] };
+    } else if (line.startsWith("diff ")) {
+      body = noHunkBody();
+    }
+  }
+  if (currentHunk) hunks.push(currentHunk);
+  return { hunks, status };
+}
+
+/** Per-directory cap of `list_repo_dir` — mirrors MAX_REPO_DIR_ENTRIES in files.rs. */
+const MAX_REPO_DIR_ENTRIES = 5000;
+
+/** Code-point order, the same as Rust's `str::cmp` (UTF-8 byte order). */
+function cmpCodePoints(a, b) {
+  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+
+/**
+ * Mirror of the Tauri `list_repo_dir` command (Files view, v3.11.2): one level
+ * of the working tree, `.git` skipped, symlinks reported and never followed,
+ * non-UTF-8 names skipped, sorted directories first then case-insensitively,
+ * capped after sorting. Rust classifies ignores in process with libgit2; this
+ * process has no libgit2, so it makes one `git check-ignore -z --stdin` call,
+ * which already leaves tracked paths out (verified 2026-10-01: `build/`
+ * holding a tracked file and a force-added `*.log` are not reported). Slow on
+ * a huge directory, but dev-only. Pinned by tests/parity/list-repo-dir.test.mjs.
+ */
+function devListRepoDir(cwd, rawDir, includeIgnored) {
+  if (!cwd || !cwd.trim()) throw new Error("cwd must not be empty");
+  const dir = String(rawDir ?? "").replace(/^\/+|\/+$/g, "");
+  if (dir.split("/").includes(".git")) throw new Error(`Refusing to list inside .git: ${dir}`);
+  const resolved = safeRepoPath(cwd, dir === "" ? "." : dir);
+  let st;
+  try {
+    st = statSync(resolved);
+  } catch {
+    throw new Error(`Directory not found: ${dir}`);
+  }
+  if (!st.isDirectory()) throw new Error(`Not a directory: ${dir}`);
+
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const raw = [];
+  let dirents;
+  try {
+    dirents = readdirSync(resolved, { withFileTypes: true, encoding: "buffer" });
+  } catch (e) {
+    throw new Error(`Failed to list ${dir || "."}: ${e.message}`);
+  }
+  for (const d of dirents) {
+    let name;
+    try {
+      name = decoder.decode(d.name);
+    } catch {
+      continue; // not UTF-8: no path built from it could round-trip
+    }
+    if (name === ".git") continue;
+    const kind = d.isSymbolicLink() ? "symlink" : d.isDirectory() ? "dir" : "file";
+    let size = 0;
+    if (kind === "file") {
+      try { size = lstatSync(join(resolved, name)).size; } catch { size = 0; }
+    }
+    raw.push({ name, kind, size });
+  }
+  raw.sort((a, b) => {
+    if ((a.kind === "dir") !== (b.kind === "dir")) return a.kind === "dir" ? -1 : 1;
+    return cmpCodePoints(a.name.toLowerCase(), b.name.toLowerCase()) || cmpCodePoints(a.name, b.name);
+  });
+
+  const prefix = dir ? `${dir}/` : "";
+  const rels = raw.map((e) => prefix + e.name);
+  let ignoredSet = new Set();
+  if (rels.length > 0) {
+    const r = spawnSync(GIT, ["check-ignore", "-z", "--stdin"], {
+      cwd,
+      input: rels.join("\0") + "\0",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    // 0 = some ignored, 1 = none ignored; anything else is a git failure,
+    // reported but not fatal (the listing is still right about what exists).
+    if (r.status === 0) {
+      ignoredSet = new Set(r.stdout.toString("utf8").split("\0").filter(Boolean));
+    } else if (r.status !== 1) {
+      console.warn(`[dev] list-repo-dir: git check-ignore failed: ${r.stderr?.toString() ?? r.error}`);
+    }
+  }
+
+  const entries = [];
+  let truncated = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ignored = ignoredSet.has(rels[i]);
+    if (ignored && !includeIgnored) continue;
+    if (entries.length === MAX_REPO_DIR_ENTRIES) {
+      truncated = true;
+      break;
+    }
+    entries.push({ name: raw[i].name, path: rels[i], kind: raw[i].kind, ignored, size: raw[i].size });
+  }
+  return { entries, truncated };
 }
 
 /**
@@ -168,6 +489,361 @@ const claudeSpawnEnv = (() => {
   delete clean.ANTHROPIC_AUTH_TOKEN;
   return clean;
 })();
+
+/**
+ * Allowlisted environment for an AI CLI prompt. Mirrors `ai_cmd` in
+ * `src-tauri/src/commands/ai.rs`: the CLIs are agents fed untrusted repo
+ * content, so they get home/locale/proxy variables and their own provider's
+ * auth only — never forge tokens (GH_TOKEN, GITLAB_TOKEN) or cloud
+ * credentials (AWS_*, AZURE_*).
+ */
+const AI_ENV_BASE = new Set([
+  "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP", "PATH",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+  "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "USERNAME", "USERDOMAIN",
+  "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+  "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+]);
+/** Mirrors CLAUDE_AUTH_OVERRIDE_ENV (types.rs): stripped so the CLI uses the subscription. */
+const CLAUDE_AUTH_OVERRIDE = ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+const envFlagSet = (v) => {
+  const t = String(v ?? "").trim();
+  return t !== "" && t !== "0" && t.toLowerCase() !== "false";
+};
+const isEnvName = (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n);
+const readText = (p) => { try { return readFileSync(p, "utf-8"); } catch { return null; } };
+/** smol-toml (root devDependency) for Codex's config.toml; absent → no env_key forwarded. */
+let parseToml = null;
+try { ({ parse: parseToml } = await import("smol-toml")); } catch { /* optional */ }
+/** Mirrors `parse_codex_env_keys` (ai.rs): every env_key, env_http_headers values. */
+function codexEnvKeys(text) {
+  if (!parseToml) return [];
+  let doc;
+  try { doc = parseToml(text); } catch { return []; }
+  const out = [];
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== "object") return;
+    for (const [k, x] of Object.entries(v)) {
+      if (k === "env_key" && typeof x === "string") out.push(x);
+      else if (k === "env_http_headers" && x && typeof x === "object") {
+        for (const n of Object.values(x)) if (typeof n === "string") out.push(n);
+      } else walk(x);
+    }
+  };
+  walk(doc);
+  return out.filter(isEnvName);
+}
+/** Mirrors `claude_managed_settings_files` (ai.rs). */
+function claudeManagedSettingsFiles() {
+  const dirs = process.platform === "darwin" ? ["/Library/Application Support/ClaudeCode"]
+    : process.platform === "win32" ? ["C:\\Program Files\\ClaudeCode", "C:\\ProgramData\\ClaudeCode"]
+    : ["/etc/claude-code"];
+  const files = [];
+  for (const d of dirs) {
+    files.push(join(d, "managed-settings.json"));
+    try {
+      files.push(...readdirSync(join(d, "managed-settings.d")).filter((n) => n.endsWith(".json")).sort()
+        .map((n) => join(d, "managed-settings.d", n)));
+    } catch { /* none */ }
+  }
+  return files;
+}
+/**
+ * Mirrors `ai_env_context` (ai.rs): Claude's Bedrock / Vertex / Foundry
+ * switches (env, user settings.json, managed settings), Codex `env_key`s and
+ * opencode `{env:NAME}` from user-level config files only — never from the
+ * repository.
+ */
+function aiEnvContext(cli, env = process.env) {
+  const ctx = { claudeBedrock: false, claudeVertex: false, claudeFoundry: false, configRefs: [] };
+  const home = env.HOME || env.USERPROFILE || "";
+  if (cli === "claude") {
+    ctx.claudeBedrock = envFlagSet(env.CLAUDE_CODE_USE_BEDROCK);
+    ctx.claudeVertex = envFlagSet(env.CLAUDE_CODE_USE_VERTEX);
+    ctx.claudeFoundry = envFlagSet(env.CLAUDE_CODE_USE_FOUNDRY);
+    const dir = (env.CLAUDE_CONFIG_DIR || "").trim() || (home && join(home, ".claude"));
+    const files = [...(dir ? [join(dir, "settings.json")] : []), ...claudeManagedSettingsFiles()];
+    for (const f of files) {
+      const text = readText(f);
+      if (!text) continue;
+      try {
+        const e = JSON.parse(text)?.env ?? {};
+        const flag = (v) => envFlagSet(typeof v === "boolean" ? (v ? "1" : "0") : v);
+        ctx.claudeBedrock ||= flag(e.CLAUDE_CODE_USE_BEDROCK);
+        ctx.claudeVertex ||= flag(e.CLAUDE_CODE_USE_VERTEX);
+        ctx.claudeFoundry ||= flag(e.CLAUDE_CODE_USE_FOUNDRY);
+      } catch { /* not JSON */ }
+    }
+  } else if (cli === "codex") {
+    const dir = (env.CODEX_HOME || "").trim() || (home && join(home, ".codex"));
+    const text = dir && readText(join(dir, "config.toml"));
+    if (text) ctx.configRefs.push(...codexEnvKeys(text));
+  } else if (cli === "opencode") {
+    const files = [];
+    if ((env.OPENCODE_CONFIG || "").trim()) files.push(env.OPENCODE_CONFIG);
+    const cfgHome = (env.XDG_CONFIG_HOME || "").trim() || (home && join(home, ".config"));
+    if (cfgHome) for (const n of ["opencode.json", "opencode.jsonc", "config.json"]) files.push(join(cfgHome, "opencode", n));
+    for (const f of files) {
+      const text = readText(f);
+      if (!text) continue;
+      for (const m of text.matchAll(/\{env:([^}]*)\}/g)) if (isEnvName(m[1])) ctx.configRefs.push(m[1]);
+    }
+  }
+  return ctx;
+}
+/** Mirrors CLAUDE_CONFIG_ENV (ai.rs): Claude Code's documented configuration, by name. */
+const CLAUDE_CONFIG_ENV = new Set([
+  "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_FOUNDRY_BASE_URL",
+  "ANTHROPIC_FOUNDRY_RESOURCE", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+  "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY",
+  "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "CLAUDE_CODE_PROXY_RESOLVES_HOSTS",
+  "CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CODE_SHELL", "CLAUDE_CODE_MAX_RETRIES", "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+  "API_TIMEOUT_MS", "ANTHROPIC_BETAS", "DISABLE_COST_WARNINGS", "MAX_THINKING_TOKENS",
+  "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER", "DISABLE_PROMPT_CACHING",
+  "DISABLE_NON_ESSENTIAL_MODEL_CALLS",
+]);
+const AI_ENV_PROVIDER = {
+  claude: (k, ctx) => !CLAUDE_AUTH_OVERRIDE.includes(k) && (
+    CLAUDE_CONFIG_ENV.has(k)
+    || (ctx.claudeBedrock && k.startsWith("AWS_"))
+    || (ctx.claudeVertex && (["CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_QUOTA_PROJECT", "GCLOUD_PROJECT"].includes(k) || k.startsWith("VERTEX_REGION_") || k.startsWith("CLOUDSDK_")))
+    || (ctx.claudeFoundry && k === "ANTHROPIC_FOUNDRY_API_KEY")),
+  codex: (k) => k.startsWith("CODEX_")
+    || ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORGANIZATION", "OPENAI_PROJECT", "AZURE_OPENAI_API_KEY"].includes(k),
+  opencode: (k) => k.startsWith("OPENCODE_") || [
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY",
+    "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
+  ].includes(k),
+  copilot: (k) => k.startsWith("COPILOT_") && k !== "COPILOT_ALLOW_ALL",
+  antigravity: (k) => [
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI",
+  ].includes(k),
+};
+/** Mirrors `cached_ai_env_context` (ai.rs): config files read at most every 10 s per CLI. */
+const aiEnvContextCache = new Map();
+function cachedAiEnvContext(cli) {
+  const hit = aiEnvContextCache.get(cli);
+  if (hit && Date.now() - hit.at < 10_000) return hit.ctx;
+  const ctx = aiEnvContext(cli);
+  aiEnvContextCache.set(cli, { at: Date.now(), ctx });
+  return ctx;
+}
+function aiSpawnEnv(cli) {
+  const ctx = cachedAiEnvContext(cli);
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (AI_ENV_BASE.has(k) || AI_ENV_BASE.has(k.toUpperCase()) || k.startsWith("LC_")
+      || ctx.configRefs.includes(k) || AI_ENV_PROVIDER[cli](k, ctx)) {
+      env[k] = v;
+    }
+  }
+  return env;
+}
+
+/** Mirrors CLAUDE_DENIED_TOOLS (ai.rs). */
+const CLAUDE_DENIED_TOOLS = [
+  "Bash", "BashOutput", "KillBash", "KillShell", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead",
+  "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "SlashCommand", "Skill",
+];
+/** Mirrors `claude_caps` (ai.rs): lockdown flags the installed claude knows, cached per binary. */
+const claudeCapsCache = new Map();
+async function claudeCaps(bin) {
+  // Keyed on the binary's identity (path, size, mtime). 10 s probe in its own
+  // process group, killed as a whole on timeout and never waited on past it.
+  // A failed or empty probe is remembered for 5 minutes. Mirrors `claude_caps`.
+  let id = bin;
+  try { const st = statSync(bin); id = `${bin}\0${st.size}\0${st.mtimeMs}`; } catch { /* keep path */ }
+  const hit = claudeCapsCache.get(id);
+  if (hit?.caps) return hit.caps;
+  const none = { tools: false, settingSources: false, strictMcp: false, noSessionPersistence: false };
+  if (hit?.failedAt && Date.now() - hit.failedAt < 5 * 60_000) return none;
+  const help = await new Promise((resolveHelp) => {
+    let out = "";
+    let done = false;
+    let timer = null; // declared before `finish` can run (spawn may throw synchronously)
+    const finish = (v) => { if (!done) { done = true; if (timer) clearTimeout(timer); resolveHelp(v); } };
+    let child;
+    try {
+      child = spawn(bin, ["--help"], {
+        env: aiSpawnEnv("claude"),
+        stdio: ["ignore", "pipe", "ignore"],
+        detached: process.platform !== "win32",
+      });
+    } catch { return finish(""); }
+    timer = setTimeout(() => {
+      try {
+        if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)]);
+        else process.kill(-child.pid, "SIGKILL");
+      } catch { /* already gone */ }
+      finish("");
+    }, 10_000);
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => finish(""));
+    child.on("exit", (code) => {
+      // Give the pipe a moment to drain, without waiting on a grandchild.
+      setTimeout(() => finish(code === 0 ? out : ""), 200);
+    });
+  });
+  if (!help.trim()) {
+    claudeCapsCache.set(id, { failedAt: Date.now() });
+    return none;
+  }
+  const words = new Set(help.split(/[\s,]+/));
+  const caps = {
+    tools: words.has("--tools"),
+    settingSources: words.has("--setting-sources"),
+    strictMcp: words.has("--strict-mcp-config"),
+    noSessionPersistence: words.has("--no-session-persistence"),
+  };
+  claudeCapsCache.set(id, { caps });
+  return caps;
+}
+let aiRunsBaseCache = null;
+/**
+ * Mirrors `ai_runs_base` / `prepare_runs_base` (ai.rs): the per-user base of
+ * the per-run directories, validated once — a real directory (not a
+ * symlink) owned by the current user; mode 0700, with one warning when the
+ * filesystem does not keep it. Never the shared /tmp.
+ */
+function aiRunsBase() {
+  // Prepared again if deleted since (cache cleaner); a failure is not cached.
+  if (aiRunsBaseCache && existsSync(aiRunsBaseCache)) return aiRunsBaseCache;
+  const home = homedir();
+  const xdg = (process.env.XDG_CACHE_HOME || "").trim();
+  const root = process.platform === "darwin" ? join(home, "Library", "Caches")
+    : process.platform === "win32" ? (process.env.LOCALAPPDATA || join(home, "AppData", "Local"))
+    : (isAbsolute(xdg) ? xdg : join(home, ".cache"));
+  const dir = join(root, "gitwand", "ai-runs");
+  mkdirSync(dir, { recursive: true });
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`AI working directory ${dir}: is not a plain directory`);
+  if (process.platform !== "win32") {
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+      throw new Error(`AI working directory ${dir}: belongs to another user`);
+    }
+    try { chmodSync(dir, 0o700); } catch (e) { console.warn(`[dev-server] cannot restrict ${dir}: ${e.message}`); }
+    const mode = lstatSync(dir).mode & 0o777;
+    if (mode & 0o077) console.warn(`[dev-server] ${dir} keeps mode ${mode.toString(8)}; per-run directories still apply`);
+  }
+  sweepStaleRunDirs(dir); // at setup only, never before each run
+  aiRunsBaseCache = dir;
+  return dir;
+}
+/** Mirrors `sweep_stale_run_dirs` / STALE_RUN_AGE (ai.rs): drop run-* leftovers older than a day. */
+function sweepStaleRunDirs(base) {
+  let names = [];
+  try { names = readdirSync(base); } catch { return; }
+  for (const n of names) {
+    if (!n.startsWith("run-")) continue;
+    const p = join(base, n);
+    try {
+      const st = lstatSync(p);
+      if (Date.now() - st.mtimeMs > 24 * 60 * 60_000) rmSync(p, { recursive: true, force: true });
+    } catch { /* gone */ }
+  }
+}
+/**
+ * Mirrors `ai_prompt_cmd` + `AiRunDir` (ai.rs): run an AI CLI in a fresh
+ * private directory of its own (mkdtemp: exclusive, 0700), a git repository
+ * when the CLI needs one (Codex), removed afterwards whatever happens — never
+ * the repository, never a directory another run could have left files in.
+ */
+function spawnAiSync(bin, args, opts, { gitRepo = false } = {}) {
+  const base = aiRunsBase();
+  const dir = mkdtempSync(join(base, "run-"));
+  try {
+    if (gitRepo) {
+      const g = spawnSync(GIT, ["init", "-q"], { cwd: dir });
+      if (g.status !== 0) throw new Error(`AI working directory ${dir}: git init failed`);
+    }
+    return spawnSync(bin, args, { ...opts, cwd: dir });
+  } finally {
+    // Best effort, like AiRunDir's Drop: never replaces the CLI's result.
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* EBUSY/EPERM */ }
+  }
+}
+/** Mirrors `stderr_looks_like_error` (ai.rs). */
+function stderrLooksLikeError(stderr) {
+  const STATUS = ["401", "403", "429", "500", "502", "503", "504"];
+  const PHRASES = ["permission denied", "unauthorized", "forbidden", "rate limit", "rate-limited",
+    "quota exceeded", "insufficient_quota", "invalid api key", "invalid_api_key", "authentication failed"];
+  // eslint-disable-next-line no-control-regex
+  const clean = String(stderr || "").replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]|\x1b./g, "");
+  return clean.split("\n").some((line) => {
+    const tokens = line.split(/[^A-Za-z0-9_]+/).filter(Boolean);
+    const words = line.split(/\s+/).filter(Boolean);
+    const lower = line.toLowerCase();
+    return tokens.some((t) => t === "ERROR" || t === "FATAL")
+      || line.trimStart().startsWith("error ")
+      || words.some((w) => w.endsWith("Error:") || w.endsWith("error:"))
+      || words.some((w, k) => k > 0 && words[k - 1].startsWith("HTTP/") && /^[45]\d\d$/.test(w))
+      || tokens.some((t, k) => k > 0 && ["status", "http", "code"].includes(tokens[k - 1].toLowerCase()) && STATUS.includes(t))
+      || /"name"\s*:\s*"[^"]*Error"/.test(line)
+      || PHRASES.some((p) => lower.includes(p));
+  });
+}
+/** Mirrors `claude_lockdown_args` (ai.rs): no tools, no project settings, no MCP. */
+function claudeLockdownArgs(caps) {
+  return [
+    ...(caps.tools ? ["--tools", ""] : []),
+    ...(caps.settingSources ? ["--setting-sources", "user"] : []),
+    ...(caps.strictMcp ? ["--strict-mcp-config"] : []),
+    ...(caps.noSessionPersistence ? ["--no-session-persistence"] : []),
+    "--disallowedTools", ...CLAUDE_DENIED_TOOLS,
+  ];
+}
+
+/** dev:web stand-in for the keychain-held AI API key (memory only). */
+let devAiApiKey = "";
+/** Origin the dev key is bound to — mirrors `StoredKey::origin` in ai_http.rs. */
+let devAiApiKeyOrigin = null;
+/**
+ * Parse an AI endpoint as `parse_endpoint` (ai_http.rs) does: http(s), a host,
+ * no credentials, no whitespace / control characters. Throws the same text.
+ */
+function parseAiEndpoint(raw) {
+  const s = String(raw ?? "");
+  if (/[\s\x00-\x1f\x7f]/.test(s)) throw new Error("AI endpoint contains whitespace or control characters");
+  let u;
+  try { u = new URL(s); } catch { throw new Error("AI endpoint must be an http(s) URL"); }
+  if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) {
+    throw new Error("AI endpoint must be an http(s) URL");
+  }
+  if (u.username || u.password) throw new Error("AI endpoint must not carry credentials");
+  return u;
+}
+const devAiKeyInfo = () => (devAiApiKey ? { hint: aiKeyHint(devAiApiKey), origin: devAiApiKeyOrigin } : null);
+/** dev:web stand-in for the telemetry opt-out marker. */
+let devTelemetryEnabled = true;
+/** dev:web stand-in for the software-rendering marker. */
+let devSoftwareRendering = false;
+/** Masked hint of a key — mirrors `key_hint` in commands/ai_http.rs. */
+function aiKeyHint(key) {
+  if (!key) return null;
+  const chars = [...key];
+  if (chars.length <= 8) return "••••••••";
+  return chars.slice(0, 4).join("") + "••••" + chars.slice(-4).join("");
+}
+
+/**
+ * Effort levels the AI CLIs accept — same allowlist as the Rust backend's
+ * `valid_effort`. Returns the level, or "" to let the CLI keep its default.
+ */
+const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+function validEffort(effort) {
+  const e = String(effort ?? "").trim();
+  return EFFORT_LEVELS.includes(e) ? e : "";
+}
 console.log(`[dev-server] gh binary:  ${GH}`);
 console.log(`[dev-server] git binary: ${GIT}`);
 
@@ -182,6 +858,11 @@ console.log(`[dev-server] git binary: ${GIT}`);
  * non-zero or the process fails to spawn.
  */
 function gitSpawn(args, cwd) {
+  return gitSpawnBytes(args, cwd).then((buf) => buf.toString("utf-8"));
+}
+
+/** `gitSpawn`, resolving the raw stdout bytes. */
+function gitSpawnBytes(args, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(GIT, args, { cwd });
     const stdoutChunks = [];
@@ -197,9 +878,24 @@ function gitSpawn(args, cwd) {
         reject(new Error(`git ${args.join(" ")} exited with ${code}: ${stderr.trim()}`));
         return;
       }
-      resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
+      resolve(Buffer.concat(stdoutChunks));
     });
   });
+}
+
+/** Mirrors `DIFF_TRUNCATE_BYTES` in src-tauri/src/types.rs. */
+const DIFF_TRUNCATE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Mirrors `truncate_diff_output` in src-tauri/src/commands/read.rs: cap raw
+ * diff bytes at DIFF_TRUNCATE_BYTES, cut back to the last newline so the
+ * parser only sees complete lines, and report the original size.
+ */
+function truncateDiffOutput(raw) {
+  if (raw.length <= DIFF_TRUNCATE_BYTES) return { text: raw.toString("utf-8"), truncatedFromBytes: undefined };
+  let cut = DIFF_TRUNCATE_BYTES;
+  while (cut > 0 && raw[cut - 1] !== 0x0a) cut--;
+  return { text: raw.subarray(0, cut).toString("utf-8"), truncatedFromBytes: raw.length };
 }
 
 /**
@@ -460,6 +1156,19 @@ async function githubFetch(path, token, accept = "application/vnd.github+json") 
   });
 }
 
+/** Run a GitHub GraphQL operation; returns `data`, throws on the first `errors[]` entry. */
+async function githubGraphql(token, query, variables) {
+  const resp = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+  if (json.errors?.length) throw new Error(`GraphQL error: ${json.errors[0].message}`);
+  return json.data;
+}
+
 const PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--port") ?? "3001", 10);
 
 /**
@@ -673,6 +1382,73 @@ function parseFileLog(raw) {
   return entries;
 }
 
+/**
+ * Mirrors `historical_path` in src-tauri/src/commands/read.rs: a file's name
+ * at a past commit, read by git as `<commit>:<path>`, so checked lexically
+ * rather than against today's filesystem. Throws with Rust's messages.
+ */
+function historicalPath(name, p) {
+  if (p.includes("\0")) throw new Error(`${name} must not contain NUL`);
+  if (p.startsWith("/") || p.startsWith("\\") || /^[A-Za-z]:/.test(p)) {
+    throw new Error(`${name} must be relative to the repository root`);
+  }
+  const parts = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") throw new Error(`${name} must not contain \`..\``);
+    parts.push(seg);
+  }
+  if (!parts.length) throw new Error(`${name} must not be the repository root`);
+  return parts.join("/");
+}
+
+/** Mirrors `FILE_LOG_NAMED_FORMAT` in src-tauri/src/git/parse.rs. */
+const FILE_LOG_NAMED_FORMAT = "--format=%x01%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1e";
+
+/**
+ * Mirrors `parse_file_log_named` (src-tauri/src/git/parse.rs): `git log
+ * --follow -z --name-only` with FILE_LOG_NAMED_FORMAT. Each entry also gets
+ * `path`, the file's root-relative name at that commit (absent for a merge).
+ */
+function parseFileLogNamed(raw) {
+  const entries = [];
+  for (const record of raw.split("\x01")) {
+    // The header ends at the first `\x1e` after the five field separators
+    // (the name that follows may itself hold a `\x1e`).
+    let bodyStart = -1;
+    for (let k = 0, at = -1; k < 5; k++) {
+      at = record.indexOf("\x1f", at + 1);
+      if (at === -1) break;
+      if (k === 4) bodyStart = at;
+    }
+    if (bodyStart === -1) continue;
+    const end = record.indexOf("\x1e", bodyStart);
+    if (end === -1) continue;
+    const head = record.slice(0, end).split("\x1f");
+    // Rust's splitn(6): anything past the fifth separator belongs to the body.
+    const body = head.slice(5).join("\x1f");
+    // Then git writes NUL, one `\n`, and the name up to NUL — exactly that, so
+    // a name that itself starts with `\n` survives. A merge lists no name.
+    let rest = record.slice(end + 1);
+    if (rest.startsWith("\0")) rest = rest.slice(1);
+    if (rest.startsWith("\n")) rest = rest.slice(1);
+    const cut = rest.indexOf("\0");
+    const name = (cut === -1 ? rest : rest.slice(0, cut)) || undefined;
+    const entry = {};
+    if (name !== undefined) entry.path = name;
+    Object.assign(entry, {
+      hashFull: head[0].trim(),
+      hash: head[1].trim(),
+      author: head[2].trim(),
+      date: head[3].trim(),
+      message: head[4].trim(),
+      body: body.trim(),
+    });
+    entries.push(entry);
+  }
+  return entries;
+}
+
 // ─── Snapshot helpers (v3.8 Time Machine) ────────────────────
 //
 // Node port of `src-tauri/src/git/snapshot.rs`. Both implementations read and
@@ -851,6 +1627,29 @@ function pruneSnapshots(cwd, maxAgeDays, maxCount) {
     deleted += 1;
   });
   return deleted;
+}
+
+/**
+ * Paths named when `reset --keep` refused, or null when the failure is
+ * something else. Mirrors `reset_keep_blocked_files` in commands/ops.rs.
+ */
+function resetKeepBlockedFiles(stderr) {
+  const files = [];
+  let blocked = false;
+  let inList = false;
+  for (const line of stderr.split("\n")) {
+    const m = /^error: Entry '(.*)' /.exec(line);
+    if (m) { blocked = true; inList = false; files.push(m[1]); continue; }
+    if (
+      line.startsWith("error: Your local changes to the following files would be overwritten") ||
+      line.startsWith("error: The following untracked working tree files would be overwritten")
+    ) { blocked = true; inList = true; continue; }
+    if (inList) {
+      if (line.startsWith("\t")) files.push(line.slice(1));
+      else inList = false;
+    }
+  }
+  return blocked ? files : null;
 }
 
 /**
@@ -1744,7 +2543,7 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/read-file" && req.method === "POST") {
       const { cwd, path } = await readBody(req);
       let fullPath;
-      try { fullPath = safeRepoPath(cwd, path); }
+      try { fullPath = safeRepoPath(cwd, path); requireGitWorktree(cwd); }
       catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
       // Read bytes and decode strictly, mirroring the Rust `read_file`, which is
       // `std::fs::read_to_string` and rejects anything that is not valid UTF-8.
@@ -1771,9 +2570,18 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/write-file" && req.method === "POST") {
       const { cwd, path, content } = await readBody(req);
       let fullPath;
-      try { fullPath = safeRepoPath(cwd, path); }
+      try { fullPath = safeRepoPath(cwd, path); requireGitWorktree(cwd); }
       catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
-      writeFileSync(fullPath, content, "utf-8");
+      // The guard resolves a symlink that leads somewhere real, so `fullPath`
+      // is only still a symlink when it dangles (or loops). Writing through it
+      // would create its target, wherever that is. Mirrors Rust's write_file.
+      let isLink = false;
+      try { isLink = lstatSync(fullPath).isSymbolicLink(); } catch { /* absent */ }
+      if (isLink) {
+        return jsonResponse(req, res, { error: `refusing to write through a symlink that does not resolve: ${path}` }, 400);
+      }
+      try { writeFileSync(fullPath, content, "utf-8"); }
+      catch (e) { return jsonResponse(req, res, { error: `Failed to write ${path}: ${e.message}` }, 500); }
       return jsonResponse(req, res, { ok: true });
     }
 
@@ -2052,6 +2860,37 @@ async function handleRequest(req, res) {
       return jsonResponse(req, res, { root, truncated });
     }
 
+    // POST /api/list-repo-dir  { cwd, dir, includeIgnored }
+    //
+    // Mirrors the Tauri `list_repo_dir` command (Files view, v3.11.2) through
+    // devListRepoDir() above. Response: { entries, truncated }, camelCase like
+    // the Rust struct's `rename_all = "camelCase"`.
+    if (url.pathname === "/api/list-repo-dir" && req.method === "POST") {
+      const { cwd, dir = "", includeIgnored = false } = await readBody(req);
+      try {
+        return jsonResponse(req, res, devListRepoDir(cwd, dir, includeIgnored === true));
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
+    // POST /api/reveal-in-file-manager  { cwd, path }
+    //
+    // Stands in for the Tauri `reveal_in_file_manager` (v3.11.2), which opens
+    // the OS file manager: only the packaged app on the user's desktop session
+    // can do that. The route validates the path exactly as the Rust command
+    // does (safe_repo_path, then existence), so a bad path fails the same way
+    // under `pnpm dev:web`, and then it only logs.
+    if (url.pathname === "/api/reveal-in-file-manager" && req.method === "POST") {
+      const { cwd, path } = await readBody(req);
+      let full;
+      try { full = safeRepoPath(cwd, path); }
+      catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+      if (!existsSync(full)) return jsonResponse(req, res, { error: `Path not found: ${path}` }, 400);
+      console.info(`[dev] revealInFileManager: ${full}`);
+      return jsonResponse(req, res, { ok: true });
+    }
+
     // GET /api/list-dir?path=/some/dir  — list directories for folder picker
     if (url.pathname === "/api/list-dir" && req.method === "GET") {
       const dirPath = resolve(url.searchParams.get("path") || homedir());
@@ -2324,6 +3163,19 @@ async function handleRequest(req, res) {
 
       if (!cwd || !path) return jsonResponse(req, res, { error: "Missing cwd or path param" }, 400);
 
+      // Every branch below hands `path` to git, and the untracked fallback
+      // runs `git diff --no-index`, which reads whatever file it names. Refuse
+      // anything resolving outside the repo first, like Rust's `git_diff`.
+      let gitPath;
+      try {
+        const guarded = safeRepoPath(cwd, path);
+        const root = realpathSync.native(cwd);
+        if (guarded === root) throw new Error("path must not be the repository root");
+        gitPath = repoRelativePath(cwd, root, path, guarded);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+
       try {
         const resolvedCwd = resolve(cwd);
 
@@ -2352,12 +3204,13 @@ async function handleRequest(req, res) {
           });
         }
 
-        const args = staged ? ["diff", "--cached", "--", path] : ["diff", "--", path];
+        const args = staged ? ["diff", "--cached", "--", gitPath] : ["diff", "--", gitPath];
         let stdout;
+        let truncatedFromBytes;
         try {
           // Stream via spawn — execSync's default 1 MB cap blows up on large files
           // (lockfiles, generated assets, big migrations…).
-          stdout = await gitSpawn(args, resolvedCwd);
+          ({ text: stdout, truncatedFromBytes } = truncateDiffOutput(await gitSpawnBytes(args, resolvedCwd)));
         } catch { stdout = ""; }
 
         // ── New untracked file: fall back to --no-index diff (all lines green) ──
@@ -2368,87 +3221,37 @@ async function handleRequest(req, res) {
         // renders the entire file as an addition instead of showing no
         // unstaged change. Drift found by tests/parity/git-diff (issue #183).
         if (!stdout.trim() && !staged) {
-          const absFile = join(resolvedCwd, path);
+          const absFile = join(resolvedCwd, gitPath);
           const tracked =
-            spawnSync(GIT, ["ls-files", "--error-unmatch", "--", path], {
+            spawnSync(GIT, ["ls-files", "--error-unmatch", "--", gitPath], {
               cwd: resolvedCwd,
               encoding: "utf-8",
             }).status === 0;
           if (!tracked && existsSync(absFile) && !statSync(absFile).isDirectory()) {
-            const r = spawnSync("git", ["diff", "--no-index", "--", "/dev/null", absFile], {
-              cwd: resolvedCwd, encoding: "utf-8",
+            // Raw bytes, no maxBuffer cap: like the Rust side, read it all,
+            // then truncate the same way as the plain diff. The repo-relative
+            // path (as in Rust) keeps the header, hence the byte count and the
+            // cut, identical on both sides.
+            const r = spawnSync(GIT, ["diff", "--no-index", "--", "/dev/null", gitPath], {
+              cwd: resolvedCwd, maxBuffer: Infinity,
             });
-            stdout = r.stdout || "";
+            ({ text: stdout, truncatedFromBytes } = truncateDiffOutput(r.stdout || Buffer.alloc(0)));
           }
         }
 
-        const hunks = [];
-        let currentHunk = null;
-        let oldLineNo = 0;
-        let newLineNo = 0;
-        // Mirrors Rust's parse_diff_hunks: a "new file mode" line marks the
-        // diff as an addition. Matches the Rust GitDiff shape, which omits
-        // `status` entirely when not detected (skip_serializing_if).
-        let status;
+        // Mirrors Rust's parse_diff_hunks. A "new file mode" line marks the
+        // diff as an addition; like the Rust GitDiff shape, `status` is
+        // omitted entirely when not detected (skip_serializing_if). The
+        // phantom-context gotcha of issue #183 (AGENTS.md) is handled by the
+        // bounded hunk body in devParseDiffHunks.
+        const { hunks, status } = devParseDiffHunks(await loadDevCore(), stdout);
 
-        const lines = stdout.split("\n");
-        for (const line of lines) {
-          if (line.startsWith("new file mode")) {
-            status = "added";
-          } else if (line.startsWith("@@")) {
-            if (currentHunk) hunks.push(currentHunk);
-
-            const header = line;
-            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-            const oldStart = match ? parseInt(match[1]) : 0;
-            const oldCount = match ? parseInt(match[2] || "1") : 1;
-            const newStart = match ? parseInt(match[3]) : 0;
-            const newCount = match ? parseInt(match[4] || "1") : 1;
-
-            oldLineNo = oldStart;
-            newLineNo = newStart;
-
-            currentHunk = { header, oldStart, oldCount, newStart, newCount, lines: [] };
-          } else if (currentHunk) {
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              currentHunk.lines.push({
-                type: "add",
-                content: line.substring(1),
-                oldLineNo: null,
-                newLineNo,
-              });
-              newLineNo++;
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              currentHunk.lines.push({
-                type: "delete",
-                content: line.substring(1),
-                oldLineNo,
-                newLineNo: null,
-              });
-              oldLineNo++;
-              // Context lines start with a single space. Testing
-              // `!startsWith("\\")` instead lets the empty string that
-              // `split("\n")` leaves after the trailing newline through, which
-              // appended a phantom context line to every diff, and the Rust
-              // parser (`strip_prefix(' ')`) never did. This is the gotcha
-              // AGENTS.md documents; drift found by tests/parity/git-diff
-              // (issue #183).
-            } else if (line.startsWith(" ")) {
-              currentHunk.lines.push({
-                type: "context",
-                content: line.substring(1),
-                oldLineNo,
-                newLineNo,
-              });
-              oldLineNo++;
-              newLineNo++;
-            }
-          }
-        }
-
-        if (currentHunk) hunks.push(currentHunk);
-
-        return jsonResponse(req, res, { path, hunks, ...(status ? { status } : {}) });
+        return jsonResponse(req, res, {
+          path,
+          hunks,
+          ...(status ? { status } : {}),
+          ...(truncatedFromBytes !== undefined ? { truncatedFromBytes } : {}),
+        });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -2496,24 +3299,33 @@ async function handleRequest(req, res) {
           currentLines = [];
         };
 
+        const { classifyHunkLine, hunkBodyFromHeader, noHunkBody, parseHunkHeader, scanSecrets } =
+          await loadDevCore();
+
+        // Remaining body of the current hunk (core's hunk-body helpers, the twin of Rust's
+        // HunkBody): inside it an added `++ token` is the line `+++ token`, a hunk line —
+        // neither dropped nor read as a `+++ b/<path>` header (AGENTS.md diff-parsing gotcha).
+        let body = noHunkBody();
         for (const line of stdout.split("\n")) {
-          if (line.startsWith("diff --git ")) {
+          const kind = classifyHunkLine(body, line);
+          if (kind) {
+            if (kind === "add") {
+              if (currentPath !== null) {
+                currentLines.push({ line: newLineNo, text: line.slice(1) });
+              }
+              newLineNo++;
+            }
+            // `-`-prefixed removed lines are irrelevant for the added-lines-only scan surface.
+          } else if (line.startsWith("diff --git ")) {
+            body = noHunkBody();
             flush();
           } else if (line.startsWith("+++ ")) {
             const rest = line.slice("+++ ".length);
             currentPath = rest === "/dev/null" ? null : rest.replace(/^b\//, "");
           } else if (line.startsWith("@@")) {
-            const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-            newLineNo = match ? parseInt(match[1], 10) : 0;
-          } else if (line.startsWith("+") && !line.startsWith("+++")) {
-            // A content added line starts with a single `+`; the `+++` file header is handled
-            // above by parsing state, never by this check alone (AGENTS.md diff-parsing gotcha).
-            if (currentPath !== null) {
-              currentLines.push({ line: newLineNo, text: line.slice(1) });
-            }
-            newLineNo++;
+            newLineNo = parseHunkHeader(line)?.newStart ?? 0;
+            body = hunkBodyFromHeader(line);
           }
-          // `-`-prefixed removed lines are irrelevant for the added-lines-only scan surface.
         }
         flush();
 
@@ -2524,7 +3336,6 @@ async function handleRequest(req, res) {
           entropyThreshold: typeof config.entropyThreshold === "number" ? config.entropyThreshold : 0,
         };
 
-        const { scanSecrets } = await import("@gitwand/core");
         const findings = scanSecrets(files, scanConfig);
         return jsonResponse(req, res, findings);
       } catch (err) {
@@ -2703,6 +3514,59 @@ async function handleRequest(req, res) {
       }
     }
 
+    // GET /api/git-tracked-ignored?cwd=<path>
+    // Mirrors git_tracked_ignored (tracked_ignored.rs): tracked paths that match
+    // an ignore rule, capped at 500, with the uncapped total.
+    if (url.pathname === "/api/git-tracked-ignored" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        const out = execFileSync(
+          GIT,
+          ["ls-files", "-z", "-c", "-i", "--exclude-standard"],
+          { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 },
+        );
+        const all = out.split("\0").filter(Boolean);
+        const CAP = 500;
+        return jsonResponse(req, res, {
+          paths: all.slice(0, CAP),
+          total: all.length,
+          truncated: all.length > CAP,
+        });
+      } catch (err) {
+        const detail = err.stderr?.toString().trim() || err.message;
+        return jsonResponse(req, res, { error: `git ls-files failed: ${detail}` }, 500);
+      }
+    }
+
+    // POST /api/git-untrack-paths  { cwd, paths }
+    // Mirrors git_untrack_paths (tracked_ignored.rs): `git rm --cached` with the
+    // pathspecs on stdin, literal, tolerant of paths that are no longer tracked.
+    if (url.pathname === "/api/git-untrack-paths" && req.method === "POST") {
+      const { cwd, paths } = await readBody(req);
+      if (!cwd || !Array.isArray(paths)) return jsonResponse(req, res, { error: "Missing cwd or paths" }, 400);
+      if (paths.length === 0) return jsonResponse(req, res, { ok: true });
+      try {
+        const resolvedCwd = resolve(cwd);
+        // The repo itself goes through the shared guard; the pathspecs get the
+        // lexical check only (see validateUntrackPathspec).
+        safeRepoPath(resolvedCwd, ".");
+        for (const p of paths) validateUntrackPathspec(p);
+        execFileSync(
+          GIT,
+          [
+            "--literal-pathspecs", "rm", "--cached", "--quiet", "--ignore-unmatch",
+            "--pathspec-from-file=-", "--pathspec-file-nul",
+          ],
+          { cwd: resolvedCwd, input: paths.map((p) => `${p}\0`).join(""), encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+        );
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        const detail = err.stderr?.toString().trim() || err.message;
+        return jsonResponse(req, res, { error: `git rm --cached failed: ${detail}` }, 500);
+      }
+    }
+
     // POST /api/git-stage-patch  { cwd, patch }
     if (url.pathname === "/api/git-stage-patch" && req.method === "POST") {
       const { cwd, patch } = await readBody(req);
@@ -2739,11 +3603,19 @@ async function handleRequest(req, res) {
 
     // POST /api/git-commit  { cwd, message }
     if (url.pathname === "/api/git-commit" && req.method === "POST") {
-      const { cwd, message } = await readBody(req);
+      const { cwd, message, identityName, identityEmail, identitySigningKey } = await readBody(req);
       if (!cwd || !message) return jsonResponse(req, res, { error: "Missing cwd or message" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        execFileSync("git", ["commit", "-m", message], {
+        // Mirrors git_commit (ops.rs): a per-commit identity override, only
+        // when both name and email are present.
+        const name = (identityName ?? "").trim();
+        const email = (identityEmail ?? "").trim();
+        const key = (identitySigningKey ?? "").trim();
+        const identityArgs = name && email
+          ? ["-c", `user.name=${name}`, "-c", `user.email=${email}`, ...(key ? ["-c", `user.signingkey=${key}`] : [])]
+          : [];
+        execFileSync("git", [...identityArgs, "commit", "-m", message], {
           cwd: resolvedCwd,
           encoding: "utf-8",
         });
@@ -2929,20 +3801,36 @@ async function handleRequest(req, res) {
 
     // POST /api/git-push  { cwd, setUpstream?, force? }
     if (url.pathname === "/api/git-push" && req.method === "POST") {
-      const { cwd, setUpstream, force } = await readBody(req);
+      const { cwd, setUpstream, force, leaseBranch, leaseSha } = await readBody(req);
       if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        let cmd = "git push";
-        if (setUpstream) cmd += " --set-upstream origin HEAD";
-        if (force) cmd += " --force-with-lease";
-        cmd += " 2>&1";
-        const stdout = execSync(cmd, {
-          cwd: resolvedCwd,
-          encoding: "utf-8",
-          shell: true,
-        });
-        return jsonResponse(req, res, { success: true, message: stdout.trim() });
+        const args = ["push"];
+        if (setUpstream) args.push("--set-upstream", "origin", "HEAD");
+        if (force) {
+          const hasBranch = leaseBranch != null;
+          const hasSha = leaseSha != null;
+          if (hasBranch !== hasSha) {
+            return jsonResponse(req, res, { success: false, message: "lease_branch and lease_sha must be given together" });
+          }
+          if (hasBranch) {
+            // Mirrors force_with_lease_arg() in src-tauri/src/commands/ops.rs.
+            const shaOk = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(String(leaseSha));
+            const b = String(leaseBranch);
+            const branchOk =
+              b !== "" && !/^[-/]/.test(b) && !/[/.]$/.test(b) && !b.includes("..") && !b.includes("//") &&
+              !b.includes("@{") && !/[\u0000-\u0020\u007f~^:?*[\\]/.test(b);
+            if (!shaOk) return jsonResponse(req, res, { success: false, message: "invalid lease sha" });
+            if (!branchOk) return jsonResponse(req, res, { success: false, message: "invalid lease branch" });
+            args.push(`--force-with-lease=refs/heads/${b}:${leaseSha}`);
+          } else {
+            args.push("--force-with-lease");
+          }
+        }
+        const r = spawnSync(GIT, args, { cwd: resolvedCwd, encoding: "utf-8" });
+        const out = ((r.stdout || "") + (r.stderr || "")).trim();
+        if (r.error) return jsonResponse(req, res, { success: false, message: r.error.message });
+        return jsonResponse(req, res, { success: r.status === 0, message: out });
       } catch (err) {
         return jsonResponse(req, res, { success: false, message: ((err.stdout || "") + (err.stderr || "")).toString().trim() || err.message });
       }
@@ -3057,15 +3945,15 @@ async function handleRequest(req, res) {
 
     // POST /api/git-merge-abort  { cwd }
 
-    // POST /api/git-cherry-pick  { cwd, hashes }
+    // POST /api/git-cherry-pick  { cwd, hashes, noCommit? }
     if (url.pathname === "/api/git-cherry-pick" && req.method === "POST") {
-      const { cwd, hashes } = await readBody(req);
+      const { cwd, hashes, noCommit } = await readBody(req);
       if (!cwd || !Array.isArray(hashes) || hashes.length === 0)
         return jsonResponse(req, res, { success: false, message: "Missing cwd or hashes" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
         const { spawnSync } = await import("child_process");
-        const result = spawnSync("git", ["cherry-pick", ...hashes], {
+        const result = spawnSync("git", ["cherry-pick", ...(noCommit ? ["--no-commit"] : []), ...hashes], {
           cwd: resolvedCwd,
           encoding: "utf-8",
         });
@@ -3110,6 +3998,64 @@ async function handleRequest(req, res) {
       }
     }
 
+    // POST /api/git-fast-forward-to-upstream  { cwd }
+    // Mirror of the Rust `git_fast_forward_to_upstream`: re-check every repo-side
+    // condition in the same order, then `merge --ff-only --no-stat @{upstream}`.
+    // A refusal is a normal result ({ fastForwarded: false, reason }), not an error.
+    if (url.pathname === "/api/git-fast-forward-to-upstream" && req.method === "POST") {
+      const { cwd } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        const resolvedCwd = resolve(cwd);
+        const g = (args) => spawnSync(GIT, args, { cwd: resolvedCwd, encoding: "utf-8" });
+        const refused = (reason, behind = 0) => jsonResponse(req, res, { fastForwarded: false, reason, behind });
+
+        const gd = g(["rev-parse", "--git-dir"]);
+        if (gd.status !== 0) return jsonResponse(req, res, { error: (gd.stderr || "").trim() || "not a git repository" }, 500);
+        const gitDir = isAbsolute(gd.stdout.trim()) ? gd.stdout.trim() : join(resolvedCwd, gd.stdout.trim());
+        if (["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"]
+          .some((f) => existsSync(join(gitDir, f)))) return refused("operation");
+
+        if (g(["symbolic-ref", "-q", "HEAD"]).status !== 0) return refused("detached");
+        const up = g(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+        if (up.status !== 0 || !up.stdout.trim()) return refused("noUpstream");
+
+        const counts = g(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
+        let ahead = 0, behind = 0;
+        if (counts.status === 0) {
+          const [a, b] = counts.stdout.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
+          ahead = a ?? 0;
+          behind = b ?? 0;
+        }
+        if (behind === 0) return refused("upToDate");
+
+        const st = g(["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=no"]);
+        let trackedEdits = st.status !== 0;
+        let conflicts = false;
+        for (const line of (st.stdout || "").split("\n")) {
+          if (line.length < 3) continue;
+          trackedEdits = true;
+          if (["DD", "AU", "UD", "UA", "DU", "AA", "UU"].includes(line.slice(0, 2))) conflicts = true;
+        }
+        if (conflicts) return refused("conflicts", behind);
+        if (ahead > 0) return refused("localCommits", behind);
+        if (trackedEdits) return refused("trackedEdits", behind);
+
+        const br = g(["symbolic-ref", "--short", "-q", "HEAD"]).stdout.trim() || null;
+        const m = g(["merge", "--ff-only", "--no-stat", "@{upstream}"]);
+        if (m.status === 0) return jsonResponse(req, res, { fastForwarded: true, behind, branch: br });
+        return jsonResponse(req, res, {
+          fastForwarded: false,
+          reason: "gitRefused",
+          stderr: ((m.stderr || "").trim() || (m.stdout || "").trim()),
+          behind,
+          branch: br,
+        });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
     // POST /api/git-repo-state  { cwd }
     if (url.pathname === "/api/git-repo-state" && req.method === "POST") {
       const { cwd } = await readBody(req);
@@ -3129,7 +4075,7 @@ async function handleRequest(req, res) {
         const hasConflict = () => {
           try {
             const out = es("git status --porcelain", { cwd: resolvedCwd, encoding: "utf-8" });
-            return out.split("\n").some(l => ["UU","AA","UD","DU","AU","UA"].includes(l.slice(0,2)));
+            return out.split("\n").some(l => ["DD","AU","UD","UA","DU","AA","UU"].includes(l.slice(0,2)));
           } catch { return false; }
         };
 
@@ -3254,6 +4200,28 @@ async function handleRequest(req, res) {
       return jsonResponse(req, res, { path: expanded });
     }
 
+    // POST /api/read-commit-template  { cwd } -> { content: string | null }
+    // Mirrors commands::read::read_commit_template: the path comes from git
+    // config, never from the client, and only a small regular file is read.
+    if (url.pathname === "/api/read-commit-template" && req.method === "POST") {
+      const { cwd } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const r = spawnSync(GIT, ["config", "commit.template"], { cwd: resolve(cwd), encoding: "utf-8" });
+      const raw = r.status === 0 ? (r.stdout || "").trim() : "";
+      if (!raw) return jsonResponse(req, res, { content: null });
+      const home = process.env.HOME || process.env.USERPROFILE || "";
+      const path = raw.startsWith("~") ? home + raw.slice(1) : raw;
+      try {
+        const st = statSync(path);
+        if (!st.isFile() || st.size > 64 * 1024) {
+          return jsonResponse(req, res, { error: `Commit template is not a small regular file: ${path}` }, 400);
+        }
+        return jsonResponse(req, res, { content: readFileSync(path, "utf-8") });
+      } catch (e) {
+        return jsonResponse(req, res, { error: `Failed to read commit template ${path}: ${e.message}` }, 400);
+      }
+    }
+
     // POST /api/git-config-identity  { cwd } -> [name, email]
     // Mirrors commands::read::git_config_identity, including its refusal: an
     // unset name or email is an error, not an empty pair. Same audit finding.
@@ -3282,66 +4250,110 @@ async function handleRequest(req, res) {
       const filePath = url.searchParams.get("path");
       const fromHash = url.searchParams.get("from");
       const toHash = url.searchParams.get("to");
-      if (!cwd || !filePath || !fromHash || !toHash) return jsonResponse(req, res, { error: "Missing params" }, 400);
+      if (!cwd || !filePath) return jsonResponse(req, res, { error: "Missing params" }, 400);
+      // Step for step `git_file_diff` (src-tauri/src/commands/read.rs), same
+      // messages: an empty revision, one starting with `-` (git would read it
+      // as an option) or holding a control character (it would split the
+      // batch request below) is refused.
+      for (const [name, rev] of [["fromHash", fromHash], ["toHash", toHash]]) {
+        if (!rev || rev.trim() === "") return jsonResponse(req, res, { error: `${name} must not be empty` }, 400);
+        if (rev.startsWith("-") || /[\u0000-\u001f\u007f-\u009f]/.test(rev)) {
+          return jsonResponse(req, res, { error: `invalid ${name}: ${rev}` }, 400);
+        }
+      }
+      let gitPath;
+      let fromName = null;
+      let toName = null;
+      try {
+        const guarded = safeRepoPath(cwd, filePath);
+        const root = realpathSync.native(cwd);
+        if (guarded === root) throw new Error("path must not be the repository root");
+        gitPath = repoRelativePath(cwd, root, filePath, guarded);
+        const fp = url.searchParams.get("fromPath");
+        const tp = url.searchParams.get("toPath");
+        if (fp !== null) fromName = historicalPath("fromPath", fp);
+        if (tp !== null) toName = historicalPath("toPath", tp);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+      const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
       try {
         const resolvedCwd = resolve(cwd);
-        // Stream via spawn — explicit 10 MB cap can still be exceeded on
-        // large file rewrites between two distant commits.
-        const stdout = await gitSpawn(
-          ["diff", fromHash, toHash, "--", filePath],
-          resolvedCwd,
+        // `path` is relative to `cwd`, the log's names to the top level, where
+        // everything below runs — from the path git prints, not a resolved one.
+        const shown = spawnSync(GIT, ["rev-parse", "--show-toplevel", "--show-prefix"], {
+          cwd: resolvedCwd, encoding: "utf-8",
+        });
+        if (shown.status !== 0) throw new Error(`not a git repository: ${(shown.stderr || "").trim()}`);
+        const [top = "", prefix = ""] = (shown.stdout || "").split("\n");
+        const ownPath = prefix + gitPath;
+        fromName ??= ownPath;
+        toName ??= ownPath;
+
+        // Both revisions and both names in one `cat-file --batch-check`; a
+        // name holding a newline cannot travel in that line-based request and
+        // is looked up on its own.
+        const names = [fromName, toName];
+        const revs = [fromHash, toHash];
+        const request =
+          revs.map((r) => `${r}^{commit}\n`).join("") +
+          names.map((n, i) => (n.includes("\n") ? "" : `${revs[i]}^{commit}:${n}\n`)).join("");
+        const batch = spawnSync(GIT, ["cat-file", "--batch-check"], { cwd: top, encoding: "utf-8", input: request });
+        if (batch.status !== 0) throw new Error(`git cat-file failed: ${(batch.stderr || "").trim()}`);
+        const lines = (batch.stdout || "").split("\n");
+        let li = 0;
+        // `(oid, type)`, or null for `missing` / `ambiguous`.
+        const checkLine = (line) => {
+          if (line === undefined || line.endsWith(" missing") || line.endsWith(" ambiguous")) return null;
+          const [oid, kind] = line.split(" ");
+          return kind === undefined ? null : { oid, kind };
+        };
+        const commits = revs.map((r) => {
+          const found = checkLine(lines[li++]);
+          if (!found || found.kind !== "commit") throw badRequest(`unknown revision: ${r}`);
+          return found.oid;
+        });
+        const [fromType, toType] = names.map((n, i) => {
+          if (n.includes("\n")) {
+            const r = spawnSync(GIT, ["cat-file", "-t", `${commits[i]}:${n}`], { cwd: top, encoding: "utf-8" });
+            return r.status === 0 ? (r.stdout || "").trim() : null;
+          }
+          return checkLine(lines[li++])?.kind ?? null;
+        });
+        const [from, to] = commits;
+        if (fromType === null && toType === null) throw badRequest(`${filePath} not found at either commit`);
+        if (fromType === "tree" || toType === "tree") {
+          throw badRequest(`${filePath} is a directory, not a file`);
+        }
+        // Literal pathspecs; external diff, colour and textconv off — the
+        // output is parsed, never shown as is.
+        const args = ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-color", "--no-textconv"];
+        if (fromName !== toName && fromType !== null && toType !== null) {
+          // Renamed in between: blob to blob, so the hunks are the content change.
+          args.push(`${from}:${fromName}`, `${to}:${toName}`);
+        } else {
+          // One name, or only one side holds the file: a plain pathspec diff.
+          args.push(from, to, "--", fromType !== null ? fromName : toName);
+        }
+        // Stream via spawn, then cap like the Rust side: a whole-file rewrite
+        // between two distant commits can be large.
+        const { text: stdout, truncatedFromBytes } = truncateDiffOutput(
+          await gitSpawnBytes(args, top),
         );
 
-        const hunks = [];
-        let currentHunk = null;
-        let oldLineNo = 0;
-        let newLineNo = 0;
+        // Bounded hunk bodies: `--- x`/`+++ x` inside a hunk is content, and a
+        // "" past the counts never becomes a phantom context line (which would
+        // make `git apply` reject the patch). See devParseDiffHunks.
+        const { hunks } = devParseDiffHunks(await loadDevCore(), stdout);
 
-        const diffLines = stdout.split("\n");
-        for (const line of diffLines) {
-          if (line.startsWith("@@")) {
-            if (currentHunk) hunks.push(currentHunk);
-            const header = line;
-            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-            const oldStart = match ? parseInt(match[1]) : 0;
-            const oldCount = match ? parseInt(match[2] || "1") : 1;
-            const newStart = match ? parseInt(match[3]) : 0;
-            const newCount = match ? parseInt(match[4] || "1") : 1;
-            oldLineNo = oldStart;
-            newLineNo = newStart;
-            currentHunk = { header, oldStart, oldCount, newStart, newCount, lines: [] };
-          } else if (currentHunk) {
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              currentHunk.lines.push({ type: "add", content: line.substring(1), oldLineNo: null, newLineNo });
-              newLineNo++;
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              currentHunk.lines.push({ type: "delete", content: line.substring(1), oldLineNo, newLineNo: null });
-              oldLineNo++;
-            } else if (line.startsWith(" ")) {
-              // Real context line: space + content (possibly empty). An empty
-              // source-line renders as " " (length 1), not "" (length 0) — the
-              // truly-empty strings produced by split("\n") on the blank
-              // separator between diff sections are NOT context. Treating them
-              // as context adds a phantom line that corrupts the hunk counts
-              // and makes `git apply` reject the patch (with e.g. "new file X
-              // depends on old contents" for a purely-additive hunk).
-              currentHunk.lines.push({ type: "context", content: line.substring(1), oldLineNo, newLineNo });
-              oldLineNo++;
-              newLineNo++;
-            }
-            // else: skip. Covers "" blank separators, "\ No newline at end of
-            // file" markers, and anything else that isn't a real hunk line.
-          }
-        }
-        if (currentHunk) hunks.push(currentHunk);
-
-        return jsonResponse(req, res, { path: filePath, hunks });
+        const body = { path: filePath, hunks };
+        if (truncatedFromBytes !== undefined) body.truncatedFromBytes = truncatedFromBytes;
+        return jsonResponse(req, res, body);
       } catch (err) {
-        // Empty diff if identical
-        if (err.status === 0 || (err.stdout && err.stdout.trim() === "")) {
-          return jsonResponse(req, res, { path: filePath, hunks: [] });
-        }
-        return jsonResponse(req, res, { path: filePath, hunks: [] });
+        // Identical revisions exit 0 with no output and never land here. Report
+        // a failure (400 for a revision git cannot resolve), as the Rust command
+        // does, rather than an empty diff that reads as "no changes".
+        return jsonResponse(req, res, { error: err.message }, err.status ?? 500);
       }
     }
 
@@ -3449,88 +4461,43 @@ async function handleRequest(req, res) {
           resolvedCwd,
         );
 
-        const diffs = [];
-        let currentPath = null;
-        let currentHunk = null;
-        let currentHunks = [];
-        let oldLineNo = 0;
-        let newLineNo = 0;
-        // File-level extended header state — see Rust `git_show` for rationale.
-        // The frontend's patchBuilder needs to know whether a file was added
-        // (uses /dev/null as source) or deleted (uses /dev/null as target) or
-        // the `git apply --cached` during a split will fail.
-        let currentStatus = null;
-        let currentOldPath = null;
-
+        // Mirrors Rust's `parse_multi_file_diff`: split on `diff --git` lines
+        // (no hunk line can start with one — each carries a +/-/space prefix
+        // or is ""), then parse each file section with devParseDiffHunks, the
+        // same parser as /api/git-diff.
+        const sections = [];
         for (const line of stdout.split("\n")) {
-          if (line.startsWith("diff --git ")) {
-            if (currentHunk) currentHunks.push(currentHunk);
-            currentHunk = null;
-            if (currentPath) {
-              diffs.push({
-                path: currentPath,
-                hunks: currentHunks,
-                ...(currentStatus ? { status: currentStatus } : {}),
-                ...(currentOldPath ? { oldPath: currentOldPath } : {}),
-              });
-              currentHunks = [];
-            }
-            currentStatus = null;
-            currentOldPath = null;
-            const parts = line.split(" b/");
-            currentPath = parts.length >= 2 ? parts[1] : null;
-          } else if (line.startsWith("new file mode")) {
-            currentStatus = "added";
-          } else if (line.startsWith("deleted file mode")) {
-            currentStatus = "deleted";
-          } else if (line.startsWith("rename from ")) {
-            currentStatus = "renamed";
-            currentOldPath = line.substring("rename from ".length);
-          } else if (line.startsWith("rename to ") && !currentStatus) {
-            currentStatus = "renamed";
-          } else if (line.startsWith("@@")) {
-            if (currentHunk) currentHunks.push(currentHunk);
-
-            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-            const oldStart = match ? parseInt(match[1]) : 0;
-            const oldCount = match ? parseInt(match[2] || "1") : 1;
-            const newStart = match ? parseInt(match[3]) : 0;
-            const newCount = match ? parseInt(match[4] || "1") : 1;
-            oldLineNo = oldStart;
-            newLineNo = newStart;
-
-            currentHunk = { header: line, oldStart, oldCount, newStart, newCount, lines: [] };
-          } else if (currentHunk) {
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              currentHunk.lines.push({ type: "add", content: line.substring(1), oldLineNo: null, newLineNo });
-              newLineNo++;
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              currentHunk.lines.push({ type: "delete", content: line.substring(1), oldLineNo, newLineNo: null });
-              oldLineNo++;
-            } else if (line.startsWith(" ")) {
-              // Real context line: space + content (possibly empty). An empty
-              // source-line renders as " " (length 1), not "" (length 0) — the
-              // truly-empty strings produced by split("\n") on the blank
-              // separator between diff sections are NOT context. Treating them
-              // as context adds a phantom line that corrupts the hunk counts
-              // and makes `git apply` reject the patch (with e.g. "new file X
-              // depends on old contents" for a purely-additive hunk).
-              currentHunk.lines.push({ type: "context", content: line.substring(1), oldLineNo, newLineNo });
-              oldLineNo++;
-              newLineNo++;
-            }
-            // else: skip. Covers "" blank separators, "\ No newline at end of
-            // file" markers, and anything else that isn't a real hunk line.
-          }
+          if (line.startsWith("diff --git ")) sections.push([line]);
+          else if (sections.length > 0) sections[sections.length - 1].push(line);
         }
 
-        if (currentHunk) currentHunks.push(currentHunk);
-        if (currentPath) {
+        const core = await loadDevCore();
+        const diffs = [];
+        for (const section of sections) {
+          const parts = section[0].split(" b/");
+          if (parts.length < 2) continue;
+          // File-level extended headers, only before the first hunk — see Rust
+          // `git_show`. The frontend's patchBuilder needs to know whether a
+          // file was added (uses /dev/null as source) or deleted (uses
+          // /dev/null as target) or the `git apply --cached` during a split
+          // will fail.
+          let status = null;
+          let oldPath = null;
+          for (const line of section.slice(1)) {
+            if (line.startsWith("@@")) break;
+            if (line.startsWith("new file mode")) status = "added";
+            else if (line.startsWith("deleted file mode")) status = "deleted";
+            else if (line.startsWith("rename from ")) {
+              status = "renamed";
+              oldPath = line.substring("rename from ".length);
+            } else if (line.startsWith("rename to ") && !status) status = "renamed";
+          }
+          const { hunks } = devParseDiffHunks(core, section.join("\n"));
           diffs.push({
-            path: currentPath,
-            hunks: currentHunks,
-            ...(currentStatus ? { status: currentStatus } : {}),
-            ...(currentOldPath ? { oldPath: currentOldPath } : {}),
+            path: parts[1],
+            hunks,
+            ...(status ? { status } : {}),
+            ...(oldPath ? { oldPath } : {}),
           });
         }
 
@@ -3554,7 +4521,7 @@ async function handleRequest(req, res) {
         // Passed as a single argv element (no shell) — `mainName` can come
         // from a user-configured setting, so it must never be interpolated
         // into a shell string.
-        const format = `%(HEAD)%(refname:short)\x1f%(upstream:short)\x1f%(upstream:track,nobracket)\x1f%(objectname:short) %(subject)\x1f%(committerdate:iso-strict)\x1f%(ahead-behind:${mainName})`;
+        const format = `%(HEAD)%(refname)\x1f%(upstream:short)\x1f%(upstream:track,nobracket)\x1f%(objectname:short) %(subject)\x1f%(committerdate:iso-strict)\x1f%(ahead-behind:${mainName})\x1f%(symref)`;
         const branchResult = spawnSync(GIT, ["branch", "-a", `--format=${format}`], {
           cwd: resolvedCwd,
           encoding: "utf-8",
@@ -3575,14 +4542,16 @@ async function handleRequest(req, res) {
           const parts = rest.split("\x1f");
           if (parts.length < 4) continue;
 
-          const name = parts[0];
+          const fullRef = parts[0];
           const upstream = parts[1] || null;
           const trackInfo = parts[2] || "";
           const lastCommit = parts[3] || "";
           const lastCommitDate = parts[4] || "";
           const mainCount = parseInt((parts[5] || "0").split(/\s+/)[0], 10) || 0;
 
-          if (name.includes("HEAD ->") || name === "origin/HEAD") continue;
+          // Skip symbolic refs (`refs/remotes/<remote>/HEAD`) — not branches.
+          // KEEP IN SYNC with ops.rs.
+          if (parts[6]) continue;
 
           let ahead = 0, behind = 0;
           for (const part of trackInfo.split(", ")) {
@@ -3590,8 +4559,12 @@ async function handleRequest(req, res) {
             if (part.startsWith("behind ")) behind = parseInt(part.substring(7)) || 0;
           }
 
-          const isRemote = name.startsWith("origin/") || name.startsWith("remotes/");
-          const cleanName = name.startsWith("remotes/") ? name.slice(8) : name;
+          // Classify from the full refname (any remote, not only "origin") and
+          // strip it to the display name: refs/heads/x → x, refs/remotes/o/x → o/x.
+          const isRemote = fullRef.startsWith("refs/remotes/");
+          const cleanName = isRemote
+            ? fullRef.slice("refs/remotes/".length)
+            : fullRef.replace(/^refs\/heads\//, "");
 
           mainCounts.set(cleanName, mainCount);
 
@@ -3922,10 +4895,15 @@ async function handleRequest(req, res) {
       if (!cwd || !filePath) return jsonResponse(req, res, { error: "cwd and path required" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        const fmt = "%H\n%h\n%an\n%aI\n%s\n%b\n---END---";
-        const out = spawnSync(GIT, ["log", "--follow", "-n", String(count), `--format=${fmt}`, "--", filePath],
-          { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-        return jsonResponse(req, res, parseFileLog(out.stdout || ""));
+        // Mirrors `git_file_log`: names included (`--name-only -z`), literal pathspec.
+        const out = spawnSync(GIT, [
+          "-c", "diff.relative=false", "--literal-pathspecs", "log", "--follow", "--name-only", "-z", "-n", String(count),
+          FILE_LOG_NAMED_FORMAT, "--", filePath,
+        ], { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 }); // as git-author-line-stats: Rust has no cap
+        // Same failure as the Rust command, never an empty history.
+        if (out.error) return jsonResponse(req, res, { error: `git log failed: ${out.error.message}` }, 500);
+        if (out.status !== 0) return jsonResponse(req, res, { error: `git log failed: ${out.stderr || ""}` }, 500);
+        return jsonResponse(req, res, parseFileLogNamed(out.stdout || ""));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -3939,10 +4917,15 @@ async function handleRequest(req, res) {
       const mode = url.searchParams.get("mode") === "G" ? "-G" : "-S";
       if (!cwd || !filePath || !search) return jsonResponse(req, res, { error: "cwd, path, search required" }, 400);
       try {
-        const fmt = "%H\n%h\n%an\n%aI\n%s\n%b\n---END---";
-        const out = spawnSync(GIT, ["log", "--follow", mode, search, `--format=${fmt}`, "--", filePath],
-          { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-        return jsonResponse(req, res, parseFileLog(out.stdout || ""));
+        // Mirrors `git_file_log_pickaxe`: same named output as the file log.
+        const out = spawnSync(GIT, [
+          "-c", "diff.relative=false", "--literal-pathspecs", "log", "--follow", "--name-only", "-z", mode, search,
+          FILE_LOG_NAMED_FORMAT, "--", filePath,
+        ], { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 });
+        // Same failure as the Rust command, never an empty history.
+        if (out.error) return jsonResponse(req, res, { error: `git log pickaxe failed: ${out.error.message}` }, 500);
+        if (out.status !== 0) return jsonResponse(req, res, { error: `git log pickaxe failed: ${out.stderr || ""}` }, 500);
+        return jsonResponse(req, res, parseFileLogNamed(out.stdout || ""));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -4699,7 +5682,7 @@ async function handleRequest(req, res) {
         const pr = await prResp.json();
         const commit_id = pr.head?.sha;
         const payload = in_reply_to_id
-          ? { body: commentBody, in_reply_to_id }
+          ? { body: commentBody, in_reply_to: in_reply_to_id }
           : { body: commentBody, commit_id, path: filePath, line: line ?? 1, side: side ?? "RIGHT",
               ...(start_line ? { start_line, start_side: start_side ?? "RIGHT" } : {}) };
         const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${number}/comments`, {
@@ -5093,6 +6076,109 @@ async function handleRequest(req, res) {
     // OAuth. Mirrors the Rust commands `detect_claude_cli`, `claude_cli_prompt`
     // and `claude_cli_login`.
 
+    // GET/POST /api/ai-api-key — mirrors ai_api_key_hint / ai_api_key_set.
+    // The Rust backend keeps the key in the OS keychain; dev:web keeps it in
+    // this process's memory only, and likewise never returns it — just a hint.
+    if (url.pathname === "/api/ai-api-key") {
+      if (req.method === "GET") return jsonResponse(req, res, { info: devAiKeyInfo() });
+      if (req.method === "POST") {
+        const { key, endpoint } = await readBody(req);
+        const trimmed = String(key ?? "").trim();
+        if (!trimmed) {
+          devAiApiKey = "";
+          devAiApiKeyOrigin = null;
+          return jsonResponse(req, res, { info: null });
+        }
+        // Bound to the endpoint's origin, like `ai_api_key_set`.
+        if (!String(endpoint ?? "").trim()) {
+          return jsonResponse(req, res, { error: "An AI endpoint is required to store the API key" }, 400);
+        }
+        let origin;
+        try { origin = parseAiEndpoint(String(endpoint).trim()).origin; }
+        catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+        devAiApiKey = trimmed;
+        devAiApiKeyOrigin = origin;
+        return jsonResponse(req, res, { info: devAiKeyInfo() });
+      }
+    }
+
+    // POST /api/ai-http-request { method, url, body?, auth, timeoutSecs? }
+    // Mirrors commands::ai_http::ai_http_request: validation, key binding and
+    // error text included. Answers { status, body } whatever the upstream status.
+    if (url.pathname === "/api/ai-http-request" && req.method === "POST") {
+      const { method, url: target, body, auth, timeoutSecs } = await readBody(req);
+      let parsed;
+      try { parsed = parseAiEndpoint(target); }
+      catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+      if (method !== "GET" && method !== "POST") {
+        return jsonResponse(req, res, { error: `Unsupported method: ${method}` }, 400);
+      }
+      const headers = { Accept: "application/json" };
+      if (auth === "anthropic" || auth === "bearer") {
+        if (!devAiApiKey) return jsonResponse(req, res, { error: "No AI API key configured" }, 400);
+        // The key goes to the origin it is bound to, nowhere else.
+        if (devAiApiKeyOrigin !== parsed.origin) {
+          return jsonResponse(req, res, {
+            error: `The stored AI API key is tied to ${devAiApiKeyOrigin}; enter it again in Settings to use it with ${parsed.origin}`,
+          }, 400);
+        }
+        if (auth === "anthropic") {
+          headers["x-api-key"] = devAiApiKey;
+          headers["anthropic-version"] = "2023-06-01";
+        } else {
+          headers.Authorization = `Bearer ${devAiApiKey}`;
+        }
+      } else if (auth !== "none") {
+        return jsonResponse(req, res, { error: `Unknown AI auth scheme: ${auth}` }, 400);
+      }
+      if (body !== undefined && body !== null) headers["Content-Type"] = "application/json";
+      // No timeout given = a completion: generous ceiling, as COMPLETION_TIMEOUT_SECS.
+      const COMPLETION_TIMEOUT_SECS = 30 * 60;
+      const secs = Math.min(COMPLETION_TIMEOUT_SECS, Math.max(1, Number(timeoutSecs) || COMPLETION_TIMEOUT_SECS));
+      try {
+        const upstream = await fetch(parsed.href, {
+          method,
+          headers,
+          body: body ?? undefined,
+          redirect: "manual",
+          signal: AbortSignal.timeout(secs * 1000),
+        });
+        return jsonResponse(req, res, { status: upstream.status, body: await upstream.text() });
+      } catch (e) {
+        return jsonResponse(req, res, { error: `AI request failed: ${e.message}` }, 502);
+      }
+    }
+
+    // GET/POST /api/telemetry-state — mirrors telemetry_get_state /
+    // telemetry_set_enabled. dev:web never sends telemetry; the toggle is
+    // kept in memory so the Settings UI can be exercised.
+    if (url.pathname === "/api/telemetry-state") {
+      if (req.method === "POST") {
+        const { enabled } = await readBody(req);
+        devTelemetryEnabled = enabled !== false;
+        return jsonResponse(req, res, { ok: true });
+      }
+      const forced = ["DO_NOT_TRACK", "GITWAND_NO_TELEMETRY"].some((k) =>
+        ["1", "true", "yes"].includes(String(process.env[k] ?? "").trim().toLowerCase()));
+      return jsonResponse(req, res, { enabled: devTelemetryEnabled, forced_off_by_env: forced });
+    }
+
+    // GET/POST /api/software-rendering — mirrors software_rendering_get_state /
+    // software_rendering_set_enabled. dev:web has no webview to switch; the
+    // toggle is kept in memory so the Settings UI can be exercised.
+    if (url.pathname === "/api/software-rendering") {
+      if (req.method === "POST") {
+        const { enabled } = await readBody(req);
+        devSoftwareRendering = enabled === true;
+        return jsonResponse(req, res, { ok: true });
+      }
+      return jsonResponse(req, res, {
+        supported: process.platform === "linux",
+        enabled: devSoftwareRendering,
+        auto_enabled: false,
+      });
+    }
+
     // GET /api/claude-cli-detect
     if (url.pathname === "/api/claude-cli-detect" && req.method === "GET") {
       try {
@@ -5166,7 +6252,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/claude-cli-prompt  { prompt, systemPrompt?, cwd?, outputFormat?, model? }
+    // POST /api/claude-cli-prompt  { prompt, systemPrompt?, outputFormat?, model?, effort? } — runs in a fresh private dir
     if (url.pathname === "/api/claude-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5176,15 +6262,22 @@ async function handleRequest(req, res) {
           : (body.prompt || "");
         const fmt = body.outputFormat || "text";
         // v2.17 — explicit per-provider model selection.
-        const claudeArgs = ["-p", fullPrompt, "--output-format", fmt];
+        // Prompt on stdin, never argv; tools that act or reach the network
+        // denied. Mirrors claude_cli_prompt_inner.
+        const claudeArgs = ["-p", "--output-format", fmt];
         if (body.model && String(body.model).trim()) {
           claudeArgs.push("--model", String(body.model).trim());
         }
-        const r = spawnSync(CLAUDE, claudeArgs, {
-          cwd: body.cwd || undefined,
+        const claudeEffort = validEffort(body.effort);
+        if (claudeEffort) claudeArgs.push("--effort", claudeEffort);
+        const claudeCapsNow = await claudeCaps(CLAUDE);
+        claudeArgs.push(...claudeLockdownArgs(claudeCapsNow));
+        // Fresh per-run directory, never the repository (spawnAiSync).
+        const r = spawnAiSync(CLAUDE, claudeArgs, {
+          input: fullPrompt.replace(/\0/g, ""),
           encoding: "utf-8",
           maxBuffer: 20 * 1024 * 1024,
-          env: claudeSpawnEnv,
+          env: aiSpawnEnv("claude"),
         });
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() || "Claude CLI a échoué sans message";
@@ -5263,7 +6356,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/codex-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // POST /api/codex-cli-prompt  { prompt, systemPrompt?, model?, effort? } — runs in a fresh private dir
     if (url.pathname === "/api/codex-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5272,16 +6365,22 @@ async function handleRequest(req, res) {
           ? `# System\n${body.systemPrompt.trim()}\n\n# User\n${(body.prompt || "").trim()}`
           : (body.prompt || "");
         // v2.17 — model flag precedes the positional prompt on `codex exec`.
-        const codexArgs = ["exec"];
+        // Read-only sandbox, prompt on stdin (`-`). Mirrors codex_cli_prompt_inner.
+        const codexArgs = ["exec", "--sandbox", "read-only"];
         if (body.model && String(body.model).trim()) {
           codexArgs.push("--model", String(body.model).trim());
         }
-        codexArgs.push(fullPrompt);
-        const r = spawnSync(CODEX, codexArgs, {
-          cwd: body.cwd || undefined,
+        const codexEffort = validEffort(body.effort);
+        if (codexEffort) codexArgs.push("-c", `model_reasoning_effort=${codexEffort}`);
+        codexArgs.push("-");
+        // Fresh per-run git repository, never the repository (trusted
+        // projects' .codex/config.toml runs MCP servers). Mirrors codex_cli_prompt_inner.
+        const r = spawnAiSync(CODEX, codexArgs, {
+          input: fullPrompt.replace(/\0/g, ""),
+          env: aiSpawnEnv("codex"),
           encoding: "utf-8",
           maxBuffer: 20 * 1024 * 1024,
-        });
+        }, { gitRepo: true });
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() || "Codex CLI a échoué sans message";
           return jsonResponse(req, res, { error: detail }, 500);
@@ -5289,6 +6388,33 @@ async function handleRequest(req, res) {
         return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // GET /api/codex-models  → { models: { id, name, efforts }[] }
+    // `codex debug models` dumps the JSON catalog (refreshed, or bundled when
+    // offline) — same filtering and ordering as the Rust `parse_codex_models`.
+    if (url.pathname === "/api/codex-models" && req.method === "GET") {
+      try {
+        const CODEX = resolveBin("codex");
+        const r = spawnSync(CODEX, ["debug", "models"], { encoding: "utf-8", maxBuffer: 32 * 1024 * 1024, timeout: 15000 });
+        if (r.status !== 0) {
+          return jsonResponse(req, res, { models: [] });
+        }
+        const entries = JSON.parse(r.stdout || "{}").models ?? [];
+        const models = entries
+          .filter((m) => (m.visibility ?? "list") === "list" && typeof m.slug === "string" && m.slug.trim())
+          .sort((a, b) => (a.priority ?? Infinity) - (b.priority ?? Infinity))
+          .map((m) => ({
+            id: m.slug.trim(),
+            name: (m.display_name || "").trim() || m.slug.trim(),
+            efforts: (m.supported_reasoning_levels ?? [])
+              .map((l) => l?.effort)
+              .filter((e) => EFFORT_LEVELS.includes(e)),
+          }));
+        return jsonResponse(req, res, { models });
+      } catch {
+        return jsonResponse(req, res, { models: [] });
       }
     }
 
@@ -5340,7 +6466,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/opencode-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // POST /api/opencode-cli-prompt  { prompt, systemPrompt?, model? } — runs in a fresh private dir
     if (url.pathname === "/api/opencode-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5352,17 +6478,38 @@ async function handleRequest(req, res) {
         if (body.model && String(body.model).trim()) {
           ocArgs.push("--model", String(body.model).trim());
         }
-        ocArgs.push(fullPrompt);
-        const r = spawnSync(OPENCODE, ocArgs, {
-          cwd: body.cwd || undefined,
+        const prompt = fullPrompt.replace(/\0/g, "");
+        // Runs via spawnAiSync in a fresh per-run directory, never the
+        // repository (opencode.json MCP servers, .opencode plugins).
+        // Mirrors opencode_cli_prompt_inner / opencode_run_cmd.
+        const ocOpts = {
+          env: {
+            ...aiSpawnEnv("opencode"),
+            OPENCODE_PERMISSION: '{"edit":"deny","bash":"deny","webfetch":"deny"}',
+            OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+          },
           encoding: "utf-8",
           maxBuffer: 20 * 1024 * 1024,
-        });
-        if (r.status !== 0) {
-          const detail = (r.stderr || r.stdout || "").trim() || "opencode CLI a échoué sans message";
-          return jsonResponse(req, res, { error: detail }, 500);
+        };
+        // Prompt on stdin, off argv, no argv fallback. Mirrors `opencode_result`:
+        // a refused or empty answer is an error.
+        const r = spawnAiSync(OPENCODE, ocArgs, { ...ocOpts, input: prompt });
+        const ocStdout = String(r.stdout || "");
+        const ocStderr = String(r.stderr || "").trim();
+        const STDIN_HINT = "opencode n'a pas lu le prompt sur stdin (version trop ancienne ?) — mettez opencode à jour";
+        // Same order as opencode_result (ai.rs).
+        if (r.status === 0 && ocStdout.trim()) {
+          return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(ocStdout);
         }
-        return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
+        let ocError;
+        if (`${ocStderr}${ocStdout}`.includes("You must provide a message")) ocError = STDIN_HINT;
+        else if (r.status !== 0) ocError = ocStderr || ocStdout.trim() || "opencode CLI a échoué sans message";
+        else if (stderrLooksLikeError(ocStderr)) ocError = ocStderr;
+        else {
+          const tail = ocStderr ? ocStderr.split("\n").slice(-5).join("\n") : "";
+          ocError = tail ? `${STDIN_HINT}\n${tail}` : STDIN_HINT;
+        }
+        return jsonResponse(req, res, { error: ocError }, 500);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -5433,7 +6580,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/copilot-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // POST /api/copilot-cli-prompt  { prompt, systemPrompt?, model?, effort? } — runs in a fresh private dir
     if (url.pathname === "/api/copilot-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5445,11 +6592,11 @@ async function handleRequest(req, res) {
         if (body.model && String(body.model).trim()) {
           cpArgs.push("--model", String(body.model).trim());
         }
+        const cpEffort = validEffort(body.effort);
+        if (cpEffort) cpArgs.push("--reasoning-effort", cpEffort);
         cpArgs.push("-p", fullPrompt);
-        const cpEnv = { ...process.env };
-        delete cpEnv.COPILOT_ALLOW_ALL;
-        const r = spawnSync(COPILOT, cpArgs, {
-          cwd: body.cwd || undefined,
+        const cpEnv = aiSpawnEnv("copilot");
+        const r = spawnAiSync(COPILOT, cpArgs, { // fresh per-run dir — mirrors ai_prompt_cmd
           env: cpEnv,
           encoding: "utf-8",
           timeout: 5 * 60 * 1000,
@@ -5462,6 +6609,32 @@ async function handleRequest(req, res) {
         return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // GET /api/copilot-models  → { models: string[] }
+    // Copilot has no `models` command; the list is the `model` setting's
+    // `- "<id>"` lines in `copilot help config` — same parse as the Rust side.
+    if (url.pathname === "/api/copilot-models" && req.method === "GET") {
+      try {
+        const COPILOT = resolveBin("copilot");
+        const r = spawnSync(COPILOT, ["help", "config"], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, timeout: 15000 });
+        if (r.status !== 0) {
+          return jsonResponse(req, res, { models: [] });
+        }
+        const lines = (r.stdout || "").split(/\r?\n/);
+        const start = lines.findIndex((l) => l.trimStart().startsWith("`model`:"));
+        const models = [];
+        if (start !== -1) {
+          for (const l of lines.slice(start + 1)) {
+            const m = l.trim().match(/^- "([^"]+)"$/);
+            if (!m) break;
+            models.push(m[1]);
+          }
+        }
+        return jsonResponse(req, res, { models });
+      } catch {
+        return jsonResponse(req, res, { models: [] });
       }
     }
 
@@ -5512,7 +6685,27 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/antigravity-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // GET /api/antigravity-models  → { models: { id, name }[] }
+    if (url.pathname === "/api/antigravity-models" && req.method === "GET") {
+      try {
+        const AGY = resolveBin("agy");
+        const r = spawnSync(AGY, ["models"], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, timeout: 15000 });
+        if (r.status !== 0) {
+          return jsonResponse(req, res, { models: [] });
+        }
+        // `<id>\t<name>` per line; the "Fetching available models..." banner has no tab.
+        const models = (r.stdout || "")
+          .split(/\r?\n/)
+          .map((l) => l.split("\t"))
+          .filter((parts) => parts.length >= 2 && parts[0].trim())
+          .map(([id, name]) => ({ id: id.trim(), name: name.trim() || id.trim() }));
+        return jsonResponse(req, res, { models });
+      } catch {
+        return jsonResponse(req, res, { models: [] });
+      }
+    }
+
+    // POST /api/antigravity-cli-prompt  { prompt, systemPrompt?, model? } — runs in a fresh private dir
     if (url.pathname === "/api/antigravity-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5525,8 +6718,8 @@ async function handleRequest(req, res) {
           agyArgs.push("--model", String(body.model).trim());
         }
         agyArgs.push("-p", fullPrompt);
-        const r = spawnSync(AGY, agyArgs, {
-          cwd: body.cwd || undefined,
+        const r = spawnAiSync(AGY, agyArgs, { // fresh per-run dir — mirrors ai_prompt_cmd
+          env: aiSpawnEnv("antigravity"),
           encoding: "utf-8",
           timeout: 5 * 60 * 1000,
           maxBuffer: 20 * 1024 * 1024,
@@ -5688,6 +6881,54 @@ async function handleRequest(req, res) {
         return jsonResponse(req, res, { ok: true });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // GET /api/gh-pr-review-threads?cwd=&number=  → [{ thread_id, root_comment_id, resolved }]
+    if (url.pathname === "/api/gh-pr-review-threads" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      const number = url.searchParams.get("number");
+      if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const nwo = await resolvePrNwo(resolve(cwd), number, token);
+        if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
+        const [owner, name] = nwo.split("/");
+        const query = "query($owner: String!, $name: String!, $n: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $n) { reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { databaseId } } } } } } }";
+        const out = [];
+        let after = null;
+        for (let page = 0; page < 20; page++) {
+          const data = await githubGraphql(token, query, { owner, name, n: Number(number), after });
+          const threads = data?.repository?.pullRequest?.reviewThreads;
+          for (const t of threads?.nodes ?? []) {
+            const root = t.comments?.nodes?.[0]?.databaseId;
+            if (root == null) continue;
+            out.push({ thread_id: t.id, root_comment_id: root, resolved: !!t.isResolved });
+          }
+          if (!threads?.pageInfo?.hasNextPage) break;
+          after = threads.pageInfo.endCursor;
+        }
+        return jsonResponse(req, res, out);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // POST /api/gh-set-review-thread-resolved  { cwd, threadId, resolved }
+    if (url.pathname === "/api/gh-set-review-thread-resolved" && req.method === "POST") {
+      try {
+        const { threadId, resolved } = await readBody(req);
+        if (!threadId) return jsonResponse(req, res, { error: "Missing threadId" }, 400);
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const mutation = resolved
+          ? "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id } } }"
+          : "mutation($id: ID!) { unresolveReviewThread(input: { threadId: $id }) { thread { id } } }";
+        await githubGraphql(token, mutation, { id: threadId });
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
       }
     }
 
@@ -6922,13 +8163,26 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/git-reset-to-commit" && req.method === "POST") {
       const { cwd, sha, mode, snapshotsEnabled } = await readBody(req);
       if (!cwd || !sha) return jsonResponse(req, res, { error: "Missing cwd or sha" }, 400);
-      const flag = mode === "soft" ? "--soft" : mode === "hard" ? "--hard" : "--mixed";
+      const RESET_FLAGS = { soft: "--soft", mixed: "--mixed", hard: "--hard", keep: "--keep" };
+      const flag = RESET_FLAGS[mode];
+      if (!flag) return jsonResponse(req, res, { error: `Unknown reset mode: ${mode}` }, 400);
       try {
         const snapshot = snapshotBefore(resolve(cwd), snapshotsEnabled, "reset", `Reset ${mode} to ${sha}`);
-        execFileSync(GIT, ["reset", flag, sha], { cwd: resolve(cwd) });
+        execFileSync(GIT, ["reset", flag, sha], {
+          cwd: resolve(cwd),
+          stdio: ["ignore", "pipe", "pipe"],
+          // resetKeepBlockedFiles matches git's English wording; pin the
+          // locale for --keep only, other modes keep translated messages.
+          env: flag === "--keep" ? { ...process.env, LC_ALL: "C", LANGUAGE: "" } : process.env,
+        });
         return jsonResponse(req, res, { ok: true, snapshot });
       } catch (err) {
-        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+        const stderr = err.stderr?.toString() || "";
+        if (flag === "--keep") {
+          const files = resetKeepBlockedFiles(stderr);
+          if (files) return jsonResponse(req, res, { error: `reset-keep-blocked:${files.join("\n")}` }, 500);
+        }
+        return jsonResponse(req, res, { error: stderr || err.message }, 500);
       }
     }
 
@@ -7753,13 +9007,38 @@ async function handleRequest(req, res) {
         branchName = `gitwand-scratch-${slug}-${Math.floor(ts / 1000)}`;
       }
       const scratchPath = join(resolve(resolvedCwd, ".."), branchName);
-      const ref = sourceBranch ?? "HEAD";
+      // Same rule as Rust: a blank source means HEAD, i.e. an AI task.
+      const fromHead = !sourceBranch?.trim();
+      const ref = fromHead ? "HEAD" : sourceBranch;
       try {
         execFileSync("git", ["worktree", "add", "-b", branchName, scratchPath, ref], { cwd: resolvedCwd, encoding: "utf-8" });
+        // Mirror Rust: an AI task (no explicit source) records the commit it
+        // starts from, for merge-back's base guard; `branch -D` drops it.
+        if (fromHead) {
+          try {
+            const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: resolvedCwd, encoding: "utf-8" }).trim();
+            let source = base;
+            try {
+              source = execFileSync("git", ["symbolic-ref", "--short", "-q", "HEAD"], { cwd: resolvedCwd, encoding: "utf-8" }).trim() || base;
+            } catch {}
+            execFileSync("git", ["config", `branch.${branchName}.gitwandBase`, base], { cwd: resolvedCwd });
+            execFileSync("git", ["config", `branch.${branchName}.gitwandSource`, source], { cwd: resolvedCwd });
+          } catch (e) {
+            // As Rust does: no half-created task left behind.
+            try { execFileSync("git", ["worktree", "remove", "--force", scratchPath], { cwd: resolvedCwd }); } catch {}
+            try { execFileSync("git", ["branch", "-D", branchName], { cwd: resolvedCwd }); } catch {}
+            throw e;
+          }
+        } else {
+          // A stale record a same-named branch may have left.
+          for (const key of ["gitwandBase", "gitwandSource"]) {
+            try { execFileSync("git", ["config", "--unset", `branch.${branchName}.${key}`], { cwd: resolvedCwd }); } catch {}
+          }
+        }
         return jsonResponse(req, res, {
           path: scratchPath,
           branch: branchName,
-          source_branch: sourceBranch ?? "HEAD",
+          source_branch: ref,
           created_at: Math.floor(ts / 1000),
         });
       } catch (e) {

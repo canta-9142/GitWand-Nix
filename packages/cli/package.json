@@ -1,6 +1,6 @@
 {
   "name": "@gitwand/cli",
-  "version": "3.11.1",
+  "version": "3.12.3",
   "description": "GitWand CLI — resolve Git conflicts from your terminal or CI pipeline",
   "type": "module",
   "main": "dist/index.js",
@@ -41,7 +41,7 @@
   },
   "dependencies": {
     "@gitwand/core": "workspace:*",
-    "smol-toml": "^1.8.0",
+    "smol-toml": "^1.9.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

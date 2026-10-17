@@ -6,6 +6,12 @@ description: Technical articles on Git workflows, AI-powered conflict resolution
 # Blog
 
 <div class="blog-list">
+  <a href="/blog/reading-git-conflict-markers" class="blog-card">
+    <div class="blog-meta">October 13, 2026 · 8 min read</div>
+    <h2 class="blog-title">Reading a Git conflict marker: ours, theirs, base, diff3 and zdiff3</h2>
+    <p class="blog-excerpt">A reference for the few lines of text every merge tool is really reading. What sits between <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>, <code>|||||||</code>, <code>=======</code> and <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code>, why ours and theirs swap during a rebase, and why the <strong>base</strong> section Git hides by default changes which question a hunk is asking. One real conflict shown in all three styles, the one config line to set (<code>merge.conflictStyle zdiff3</code>), and how GitWand's engine uses the base: the same hunk is <code>complex</code> without it and resolved with it.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
   <a href="/blog/v3-11-three-outcomes-not-two" class="blog-card">
     <div class="blog-meta">September 21, 2026 · 9 min read</div>
     <h2 class="blog-title">Three outcomes, not two: what went into GitWand v3.11</h2>

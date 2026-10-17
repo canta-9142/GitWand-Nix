@@ -5,6 +5,158 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.12.3 — October 2026
+
+### Three safer ways to move a branch
+
+Resetting to a commit gets a fourth mode, **Keep**, beside soft, mixed and hard. It drops the commits like hard but keeps your uncommitted edits, and if one of them sits in a file the reset would have to rewrite, git refuses and nothing changes. The message names the files.
+
+With the new *Auto fast-forward* setting (off by default), the background fetch moves your current branch forward when it is simply behind its upstream: no local commits, no tracked edits, no conflict, no operation in progress. It never merges or rebases, and when something holds it back the sync button's tooltip says what.
+
+And when a file you track now matches a `.gitignore` rule, so the rule silently has no effect on it, the sidebar tells you and offers to untrack it. The file stays on disk; the removal is staged for you to commit.
+
+### Diffs that keep every line
+
+A removed line starting with `--`, a SQL or Lua comment for instance, or an added line starting with `++`, used to vanish from diffs, and every line number after it shifted by one. That touched the working-tree diff, the commit view, file history, pull requests and absorb, and the secrets scan could even file the lines that followed under the wrong name. All of them now share one parser per language that reads each hunk exactly as long as its header says.
+
+The Compare tab of file history, which had never worked in the desktop app, now does, and it follows the file across renames.
+
+### Pull requests and Markdown
+
+On GitHub you can reply to a review thread, edit or delete your own comments, resolve a conversation and copy a comment's link without leaving the PR. Markdown in READMEs, descriptions and comments is now rendered by GitWand itself and scrolls noticeably faster. Mark ready, merge, auto-merge and review requests act on the right PR when you work from a fork. Bitbucket PR lists show the right page.
+
+### Linux uses the GPU again
+
+GitWand used to force software rendering on every Linux launch to dodge a WebKitGTK crash. It now renders with the GPU, switches to software rendering only after a launch that died before showing its window, and lets you turn it on yourself in Settings → General.
+
+### The engine, and other fixes
+
+When both branches added the same lines, the `non_overlapping` resolver could write them twice from `diff3` markers; it now removes the shared lines first, as `zdiff3` does. The MCP server's `gitwand_resolve_hunk_llm` stops rejecting good answers in files with several conflicts, GitWand starts even when another app owns its global shortcut, and the AI review summary is generated once per PR update, even when several views ask for it at the same time.
+
+## v3.12.2 — October 2026
+
+### AI listens to your language and model again
+
+In v3.12.1, the language and template you picked for a repository from an AI menu could quietly vanish: saving settings from somewhere else in the app wrote an older copy of them back. That is fixed, and every AI feature, from commit messages to conflict explanations, now turns your chosen language into the prompt the same way.
+
+The commit AI menu's language chips now translate the message you already have. Shorten, Add detail and Regenerate are gone from that menu; a custom prompt template does the same job.
+
+### Tell the AI what the diff can't
+
+PR creation, PR updates and release notes get a "ctx" button next to their AI action. Whatever you type there, the ticket it closes, the tone you want, what to leave out, is added to the prompt and remembered for that repository. The branch selector can also create a branch with an AI-suggested name.
+
+### Fixes and polish
+
+Your remotes' `HEAD` no longer shows up as a branch called "origin" in the PR base picker, and branches from remotes other than `origin` are treated as remote, not offered for deletion as local ones. The identity menu is no longer cut off by the commit rail. Modals and Help share one close button and larger titles, settings checkboxes render correctly on Linux, dock badges are centred, and split-button dividers and the diff minimap stay visible in light mode. The test suite also passes on machines set to a language other than English.
+
+## v3.12.1 — October 2026
+
+### Merging an AI task back never loses work
+
+Merging an AI task back used to lay the task's files over your checkout. If `main` had moved since the task started, that quietly undid what `main` had gained, deleted files it had added and overwrote your uncommitted edits, with no snapshot to go back to. Merge-back now squash-merges the task branch, and only when it is safe: your checkout is not mid-merge or mid-rebase, the task has no unresolved conflict, your current commit is in the task's history, and you are still on the branch the task started from (or one that contains its starting point). Otherwise it refuses and says what to do, usually merging your branch into the task first. The merge applies as a whole or not at all, so it never overwrites an uncommitted edit, an untracked or ignored file, or a file swapped for a folder, and a Time Machine snapshot is taken first, once a dry run has shown git will accept it.
+
+Closing the task's terminal now really stops the agent: the whole process group gets a hangup, a moment to save, then is killed, so no leftover subprocess keeps writing to the task while it is being merged. And if the task's folder can't be removed afterwards, a locked worktree or a file held open on Windows, the merge still counts: the task closes and a notice tells you to delete the leftover folder by hand. Keeping the agent's individual commits comes with Agent Workspaces.
+
+### AI agents are kept at arm's length
+
+AI agents read diffs and PR descriptions written by other people, so GitWand now treats what they might be told to do as hostile. Claude Code, Codex, opencode, Copilot and Antigravity start from an empty environment: your forge tokens never reach them, only what their own provider and setup need. Each run happens in a fresh private folder that is deleted afterwards, never inside your repository, so a cloned repository can't slip them hooks, plugins or MCP servers, and nothing one run leaves behind reaches the next. Claude Code runs with no tools at all, Codex read-only, opencode without shell, edits or web access, and the prompt goes in through stdin rather than the process list.
+
+The Anthropic or OpenAI-compatible API key moves from the webview's storage to your system keychain. The webview never sees it again: requests go through the app's backend, which only attaches the key to the endpoint it was entered for. Your existing key moves over on first launch.
+
+Privacy gets its own settings. Images in PR descriptions, comments and READMEs no longer load from whatever host their author picked, which could tell that host when you read them: a "Show images" button reveals them for that PR, or for that project on a README. Gravatar lookups are off unless you turn them on, and the anonymous launch event can be switched off, or disabled machine-wide with `DO_NOT_TRACK=1`. File reads and writes now stay inside git repositories.
+
+### Settings take the whole window
+
+Settings is no longer a modal. It fills the window like Help, with the same left menu and a readable content column, and every tab opens with a title and a one-line description. The AI template kinds (commit message, pull request, release notes) get their own entries in the menu. Help now shares the same layout.
+
+### Each project remembers who you are
+
+If you keep several commit identities, Perso and Pro say, each repository now remembers its own choice instead of following one global setting you had to flip by hand. It applies to the commit only, without touching the repository's git config, and a profile's GPG key now travels with its name and email, so commits no longer show as Unverified on GitHub or GitLab.
+
+### Work in progress is a row of the Git Tree
+
+The WIP tab that v3.12.0 glued to the Git Tree is gone, and so is the "Hide WIP when clean" setting. Your uncommitted changes are a row at the top of the graph, shown only when there are any. Selecting it turns the right rail into the files and commit pane, and a diff opens only once you pick a file, as when browsing a commit. The row previews the commit summary you are writing, or shows that the AI is drafting one, and AI-written commit messages and PR descriptions now survive navigating away while they generate.
+
+### AI that edits your PRs, and listens to your settings
+
+A PR's description can now be redrafted by the AI from its commits and diff, with the repository's template and language, in an editor where nothing reaches the forge until you apply it. Titles and descriptions can also be edited by hand, on GitHub, GitLab, Bitbucket, Gitea and Azure DevOps. Images and videos in the old description are kept out of the model's reach and put back untouched.
+
+The reasoning effort set in Settings was never actually passed to the AI CLIs; now it is. The model pickers list Codex, Copilot and Antigravity models instead of a free-text field. Commit messages, PR descriptions and release notes share one template system and one picker, with an output language you choose per kind and per repository, and release notes keep their draft when you close the window.
+
+### Smaller things, and fixes
+
+After rebasing a branch you had already pushed, the main action becomes Force Push instead of Sync, and the push refuses if someone else pushed in the meantime. The header fits narrow windows in every language, collapsing its secondary actions to icons one at a time. Tooltips across the sidebar, the graph and the dock are the app's own, wrapping long text. Discarding the Changes section no longer throws away the staged half of a partially staged file. The terminal shows the agents' logos, and Ctrl+F no longer reaches the program running in it.
+
+In the Git Tree, merge edges curve into the merged branch, one highlight spans the graph and the commit row, light mode keeps its colours, the lane column stops twitching, and tags, branches, stashes and rebases refresh it at once. A stash's untracked files show in its diff. Continue no longer looks dead on an unresolved rebase conflict, a branch whose upstream was force-pushed updates cleanly, and long diff lines wrap. The dock's icon-only buttons are square again.
+
+Two dependency alerts are closed: `shell-quote`, used only by a development tool, and the MCP SDK, whose affected OAuth client GitWand's server does not use.
+
+## v3.12.0 — October 2026
+
+### A terminal of our own
+
+The integrated terminal used xterm.js. Its WebGL renderer is fast on a real GPU, but wherever the webview falls back to software GL, which is common on Linux, it repainted the whole canvas on every keystroke, and typing crawled. GitWand now draws the terminal itself. A small VT emulator keeps the screen, and each row is a plain line of the page that is rebuilt only when its content changes, at most once per frame. An echoed keystroke touches one row.
+
+The emulator covers what a shell and the AI CLIs actually use: 16, 256 and truecolor, scroll regions, the alternate screen, bracketed paste, mouse and focus reporting, synchronized output, and the startup queries Claude Code, Codex, Gemini, Copilot and Antigravity wait for before they draw. Selection, copy, paste, search, clickable links and scrollback work as before, and Shift+Enter inserts a newline in an AI CLI tab. Nerd Font icons from prompt themes, `eza` or `lsd` now show up without installing anything: GitWand ships Symbols Nerd Font Mono and fetches it only once an icon is drawn. The terminal also sits on the same surface as its tab and follows the light and dark themes. xterm.js and its four add-ons are gone from the dependencies.
+
+### Your work in progress lives in the Git Tree
+
+The dock's Changes entry is now a WIP tab attached to the Git Tree. Clicking it, or the WIP row at the top of the graph, selects your uncommitted changes: the right rail becomes the files and commit pane, and the selected file's diff covers the graph until you close it, which brings the graph back with the WIP still selected. Going back and forth no longer wipes the commit summary and description you were writing, including one the AI drafted.
+
+### Cherry-pick, but don't commit yet
+
+The commit menu gains "Cherry-pick as WIP". The commit's changes land in your index and working tree without being committed, so you can trim them, split them or fold them into your own work first. If the pick conflicts, the conflicted files open for resolution like any other change: in this mode git leaves no cherry-pick in progress, so there is nothing to continue or abort.
+
+### The graph follows a reset right away
+
+After a hard reset to an older commit, the Git Tree could keep showing the old branch and HEAD labels for half a minute. The log reload skipped itself whenever the newest commit had not changed, and with the remote branch still pointing at it, it never had. Reset and checkout now force the reload, and a forced reload fetches what you are looking at plus one page instead of the whole prefetched history, so it is quick too. Switching the branch or author filter, or the monorepo scope, no longer lets a page from the previous view land in the new one.
+
+### Discard works on staged files
+
+Discard used to be hidden on staged files. It now unstages them and restores the working tree. Testing it turned up two cases that also broke "Discard section": a staged rename, which left the old path deleted and the new one untracked, and a file added then edited, which made git refuse the whole batch so none of its files were discarded. Both now come back cleanly, and the discard snapshot is still there to undo it.
+
+### Smaller things
+
+On main or master with uncommitted changes, the WIP node now sits at the top of the trunk's lane instead of beside it. In Changes, a conflicted file no longer flashes its raw diff before the merge editor opens. And the monorepo scope is remembered in the app, per repository, instead of being written into the repository's `.gitwand-workspace.json`.
+
+### A dependency security pass
+
+The desktop app moves to rustls 0.23.45, which fixes how TLS 1.3 handshake messages were accepted across encryption levels; rustls carries the app's update checks. `@gitwand/mcp` picks up patched versions of `proxy-addr` (rated critical), `hono`, `ip-address` and `fast-uri`. They come with the MCP SDK's HTTP transport, which GitWand's stdio server does not use, but they are installed with the package. DOMPurify, which sanitizes rendered PR descriptions and markdown, moves to 3.4.16 for its upstream hardening.
+
+## v3.11.2 — October 2026
+
+### The File Explorer becomes a file browser
+
+The panel behind the dock's Files tile already let you open, edit and blame a file. It now lets you find one. The tree lists your working tree the way Finder or Explorer would, and every changed file carries a badge. So does every folder above it, even one you never opened, so a change three levels down is visible from the top. The badges are landmarks: the tree is for getting around the whole repository, not just its diff.
+
+It also opens from the command palette ("Toggle File Explorer") and, on macOS, from the View menu. The separate Browse view that briefly existed during development is gone. There is one file browser, and it can edit.
+
+### One folder at a time, and fast
+
+Before, the panel loaded the whole repository once, up to 20,000 entries, and never refreshed. Now each folder is listed the first time you open it, capped at 5,000 entries, and the tree says so when it hits the cap. Ignored files are classified in process with libgit2 instead of asking git about each one. On a `microsoft/vscode` checkout, a 6,000-file folder lists in 66 ms, where `git check-ignore` takes 1.6 s. A file you force-added is not shown as ignored. Ignored files stay hidden until you tick "Show ignored", and then they appear greyed out.
+
+The Live Repo watcher keeps the tree current. When a file appears or disappears, only the folders that changed are listed again.
+
+### Built for the keyboard
+
+The tree has a single tab stop and behaves like a tree. The arrow keys expand, collapse, descend and climb, Home and End jump to the ends, and typing a name jumps to it. Enter opens a file in the preview tab, a double click pins it, and ⇧F10 opens the context menu. That menu has Open in editor, Copy path and Reveal in Finder (or Explorer, or your file manager) on a file, and Scope here on a folder. The tree is virtualized, so a huge folder scrolls as smoothly as a small one.
+
+### Diff or file, per tab
+
+A changed file opens on its inline diff, and a Diff | File toggle switches to the editor and back. When a file is both staged and modified, a Working tree | Index switch picks which change you see. The diff always shows what is on disk, so while a tab has unsaved edits, Diff waits and says "Save to see the diff". A conflicted file offers to open the merge editor, and a file deleted on disk says so instead of pretending.
+
+"Scope here" narrows the whole app to a folder, and the tree re-roots on it with a "Whole repo" button to go back. If the folder is deleted, the panel falls back to the whole repository and tells you why. Expanded folders, the selection and "Show ignored" are remembered per repository.
+
+### Fixes that rode along
+
+Three diff panels never appeared in the packaged app: the "diff truncated at 5 MB" banner, the untracked-directory panel and the nested-repository panel. The desktop bridge dropped every field except the path and the hunks, while `pnpm dev:web` kept them all. It now passes them through. An untracked file over 5 MB is now cut like any other diff instead of streaming its whole content to the UI. And virtualized lists, such as the inline PR diff, no longer stop growing after their first render.
+
+On Linux, the AppImage now starts for any user. Its launcher used to ship as `0770`, so `firejail --appimage`, which mounts the image as root, got "Permission denied", and so did the AppImage catalog's test. The launcher is now `0755`, and the CI build fails if that ever regresses.
+
+### Paths stay inside the repository
+
+`git_diff` and `write_file` now refuse a path outside the repository, including one that gets out through a symlink. Before, a `../` or an absolute path could make the untracked-file diff render a file from elsewhere on disk, and a write could follow a dangling symlink and create its target. Both now go through the same check, which resolves paths on the filesystem rather than as text and refuses anything below a dangling, looping or unreadable symlink.
+
 ## v3.11.1 — September 2026
 
 ### The model now knows why each side changed the code

@@ -25,7 +25,7 @@ function setLocale(code: Locale) {
 }
 
 // ── Smart download URL (OS detection) ─────────────────────────────────────
-const LATEST = '3.11.1'
+const LATEST = '3.12.3'
 const RELEASES = 'https://github.com/devlint/GitWand/releases'
 
 // SSR-safe: start with the generic releases page, then switch to the
@@ -101,7 +101,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Natif (sans Electron)",
     mcRow4: "Serveur MCP pour agents",
     agentsCta: "Découvrir IA & agents →",
-    heroAnnounce: "Nouveau dans la v3.11 — l'IA sait enfin pourquoi chaque côté a modifié le code en conflit",
+    heroAnnounce: "Nouveau dans la v3.12 — reset --keep, fast-forward automatique, des diffs qui gardent chaque ligne",
     heroPoint1: "8 patterns déterministes — zéro pari sur ton code",
     heroPoint2: "100 % local — ton code ne quitte jamais ta machine",
     heroPoint3: "Un seul moteur — Desktop, CLI, VS Code & agents IA",
@@ -118,7 +118,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "Ce petit coup au moral quand 12 fichiers passent au rouge ? Terminé. GitWand classe chaque hunk avec 8 patterns déterministes — sans deviner, sans halluciner — résout tout seul ceux qui n'étaient pas des décisions, et ne te rend que ce qui mérite ton cerveau. Natif, gratuit, MIT.",
     download: 'Télécharger',
     github: 'GitHub',
-    whatsNew: 'Nouveautés v3.11',
+    whatsNew: 'Nouveautés v3.12',
     docs: 'Documentation →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -201,7 +201,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Native (no Electron)",
     mcRow4: "MCP server for agents",
     agentsCta: "Explore AI & agents →",
-    heroAnnounce: "New in v3.11 — the AI now knows why each side changed the conflicting code",
+    heroAnnounce: "New in v3.12 — reset --keep, auto fast-forward, diffs that keep every line",
     heroPoint1: "8 deterministic patterns — zero gambling with your code",
     heroPoint2: "100% local — your code never leaves your machine",
     heroPoint3: "One engine — Desktop, CLI, VS Code & AI agents",
@@ -218,7 +218,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "That sinking feeling when 12 files turn red? Gone. GitWand classifies every hunk with 8 deterministic patterns — no guessing, no hallucinations — auto-resolves the ones that were never decisions, and hands you only what's worth your brain. Native, free, MIT.",
     download: 'Download',
     github: 'GitHub',
-    whatsNew: "What's new in v3.11",
+    whatsNew: "What's new in v3.12",
     docs: 'Documentation →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -301,7 +301,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Nativo (sin Electron)",
     mcRow4: "Servidor MCP para agentes",
     agentsCta: "Explorar IA y agentes →",
-    heroAnnounce: "Nuevo en la v3.11 — la IA ya sabe por qué cada lado cambió el código en conflicto",
+    heroAnnounce: "Nuevo en la v3.12 — reset --keep, fast-forward automático, diffs que conservan cada línea",
     heroPoint1: "8 patrones deterministas — cero apuestas con tu código",
     heroPoint2: "100 % local — tu código nunca sale de tu máquina",
     heroPoint3: "Un solo motor — Desktop, CLI, VS Code y agentes de IA",
@@ -318,7 +318,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "¿Esa sensación de vacío cuando 12 archivos se ponen en rojo? Se acabó. GitWand clasifica cada hunk con 8 patrones deterministas — sin adivinar, sin alucinar — resuelve solo los que nunca fueron decisiones y te entrega únicamente lo que merece tu cerebro. Nativo, gratis, MIT.",
     download: 'Descargar',
     github: 'GitHub',
-    whatsNew: 'Novedades v3.11',
+    whatsNew: 'Novedades v3.12',
     docs: 'Documentación →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -401,7 +401,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Nativo (sem Electron)",
     mcRow4: "Servidor MCP para agentes",
     agentsCta: "Explorar IA e agentes →",
-    heroAnnounce: "Novidade na v3.11 — a IA agora sabe por que cada lado alterou o código em conflito",
+    heroAnnounce: "Novidade na v3.12 — reset --keep, fast-forward automático, diffs que mantêm cada linha",
     heroPoint1: "8 padrões deterministas — zero aposta com seu código",
     heroPoint2: "100 % local — seu código nunca sai da sua máquina",
     heroPoint3: "Um único motor — Desktop, CLI, VS Code e agentes de IA",
@@ -418,7 +418,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "Aquele frio na barriga quando 12 arquivos ficam vermelhos? Acabou. O GitWand classifica cada hunk com 8 padrões deterministas — sem chutar, sem alucinar — resolve sozinho os que nunca foram decisões e devolve só o que merece seu cérebro. Nativo, gratuito, MIT.",
     download: 'Baixar',
     github: 'GitHub',
-    whatsNew: 'Novidades v3.11',
+    whatsNew: 'Novidades v3.12',
     docs: 'Documentação →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -501,7 +501,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "原生（无 Electron）",
     mcRow4: "面向代理的 MCP 服务器",
     agentsCta: "探索 AI 与代理 →",
-    heroAnnounce: "v3.11 新功能 — AI 现在知道每一方为何修改了冲突代码",
+    heroAnnounce: "v3.12 新功能 — reset --keep、自动快进、不再丢行的 diff",
     heroPoint1: "8 种确定性模式 — 绝不拿你的代码赌运气",
     heroPoint2: "100% 本地运行 — 代码永不离开你的机器",
     heroPoint3: "一个引擎 — 桌面端、CLI、VS Code 与 AI 代理",
@@ -518,7 +518,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "12 个文件同时变红的那种心凉？不会再有。GitWand 用 8 种确定性模式分类每个 hunk——不猜测、无幻觉——自动解决那些本就无需决定的冲突，只把真正值得你思考的部分交还给你。原生、免费、MIT。",
     download: '下载',
     github: 'GitHub',
-    whatsNew: 'v3.11 新特性',
+    whatsNew: 'v3.12 新特性',
     docs: '文档 →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: '命令行',
@@ -587,7 +587,7 @@ const t = computed(() => i18n[locale.value])
 // `t` sert les sections historiques, `nt` les nouvelles.
 const NC: Record<Locale, any> = {
   en: {
-    badge: 'v3.11 — the AI now knows why each side changed the conflicting code',
+    badge: 'v3.12 — reset --keep, auto fast-forward, diffs that keep every line',
     h1a: 'The merge ends', h1b: 'without you', h1c: '.',
     sub: 'Eight deterministic patterns classify every hunk, settle the ones that carried no decision, and hand you back only what deserves your attention. Native, local, MIT.',
     cta: 'Download GitWand',
@@ -639,7 +639,7 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   fr: {
-    badge: "v3.11 — l'IA sait enfin pourquoi chaque côté a modifié le code en conflit",
+    badge: 'v3.12 — reset --keep, fast-forward automatique, des diffs qui gardent chaque ligne',
     h1a: 'Le merge se termine', h1b: 'sans toi', h1c: '.',
     sub: 'Huit patterns déterministes classent chaque hunk, règlent ceux qui ne demandaient aucune décision, et te laissent uniquement ce qui vaut ton attention. Natif, local, MIT.',
     cta: 'Télécharger GitWand',
@@ -691,7 +691,7 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   es: {
-    badge: 'v3.11 — la IA ya sabe por qué cada lado cambió el código en conflicto',
+    badge: 'v3.12 — reset --keep, fast-forward automático, diffs que conservan cada línea',
     h1a: 'El merge termina', h1b: 'sin ti', h1c: '.',
     sub: 'Ocho patrones deterministas clasifican cada hunk, resuelven los que no exigían ninguna decisión y te devuelven solo lo que merece tu atención. Nativo, local, MIT.',
     cta: 'Descargar GitWand',
@@ -743,7 +743,7 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   'pt-BR': {
-    badge: 'v3.11 — a IA agora sabe por que cada lado alterou o código em conflito',
+    badge: 'v3.12 — reset --keep, fast-forward automático, diffs que mantêm cada linha',
     h1a: 'O merge termina', h1b: 'sem você', h1c: '.',
     sub: 'Oito padrões determinísticos classificam cada hunk, resolvem os que não exigiam decisão nenhuma e devolvem só o que merece a sua atenção. Nativo, local, MIT.',
     cta: 'Baixar o GitWand',
@@ -795,7 +795,7 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   'zh-CN': {
-    badge: 'v3.11 — AI 现在知道每一方为何修改了冲突代码',
+    badge: 'v3.12 — reset --keep、自动快进、不再丢行的 diff',
     h1a: '合并结束时', h1b: '不必再找你', h1c: '。',
     sub: '八种确定性模式为每个 hunk 分类，自动处理那些本就无需决策的部分，只把值得你关注的留给你。原生、本地、MIT。',
     cta: '下载 GitWand',
@@ -983,21 +983,6 @@ onMounted(() => {
 <template>
   <div class="gw-landing">
 
-    <!-- Language picker (mirrors the 5 locales of the desktop app) -->
-    <div class="lang-picker" role="group" aria-label="Language">
-      <button
-        v-for="L in LOCALES"
-        :key="L.code"
-        class="lang-pill"
-        :class="{ 'lang-pill--active': locale === L.code }"
-        :title="L.title"
-        :aria-pressed="locale === L.code"
-        @click="setLocale(L.code)"
-      >
-        {{ L.label }}
-      </button>
-    </div>
-
     <!-- ══════════════════════════════════════
          1 · HERO
     ══════════════════════════════════════ -->
@@ -1009,11 +994,28 @@ onMounted(() => {
       </div>
 
       <div class="nc-wrap nc-hero__body">
-        <a class="nc-pill" href="/changelog">
-          <span class="nc-pill__dot"></span>
-          {{ nt.badge }}
-          <span class="nc-pill__arrow">→</span>
-        </a>
+        <div class="nc-hero__top">
+          <a class="nc-pill" href="/changelog">
+            <span class="nc-pill__dot"></span>
+            {{ nt.badge }}
+            <span class="nc-pill__arrow">→</span>
+          </a>
+
+          <!-- Language picker (mirrors the 5 locales of the desktop app) -->
+          <div class="lang-picker" role="group" aria-label="Language">
+            <button
+              v-for="L in LOCALES"
+              :key="L.code"
+              class="lang-pill"
+              :class="{ 'lang-pill--active': locale === L.code }"
+              :title="L.title"
+              :aria-pressed="locale === L.code"
+              @click="setLocale(L.code)"
+            >
+              {{ L.label }}
+            </button>
+          </div>
+        </div>
 
         <h1 class="nc-h1">
           {{ nt.h1a }} <span class="nc-shine">{{ nt.h1b }}</span>{{ nt.h1c }}
@@ -1346,10 +1348,10 @@ onMounted(() => {
         <div class="blog-teaser-header">
           <span class="blog-teaser-label">From the blog</span>
         </div>
-        <a href="/blog/v3-11-three-outcomes-not-two" class="blog-teaser-card">
-          <div class="blog-teaser-meta">September 21, 2026 · 9 min read</div>
-          <h3 class="blog-teaser-title">Three outcomes, not two: what went into GitWand v3.11</h3>
-          <p class="blog-teaser-excerpt">The Conflict Predictor stopped predicting and started running the merge, stopping on what needs a person. And a two-line bug report about an "Abort merge" button that lied led to the real fix: an operation ends three ways, not two. It completes, it halts on a further conflict, or it fails.</p>
+        <a href="/blog/reading-git-conflict-markers" class="blog-teaser-card">
+          <div class="blog-teaser-meta">October 13, 2026 · 8 min read</div>
+          <h3 class="blog-teaser-title">Reading a Git conflict marker: ours, theirs, base, diff3 and zdiff3</h3>
+          <p class="blog-teaser-excerpt">What sits between the markers Git writes into a conflicted file, why ours and theirs swap during a rebase, and the base section Git hides by default. One conflict in all three styles, the one config line to set, and how GitWand's engine uses the base to tell a trivial hunk from a real decision.</p>
           <span class="blog-teaser-cta">Read article →</span>
         </a>
       </div>
@@ -1447,10 +1449,6 @@ onMounted(() => {
    Language picker (5 locales, segmented)
 ─────────────────────────────────────────── */
 .lang-picker {
-  position: fixed;
-  top: 78px;
-  right: 20px;
-  z-index: 100;
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -2109,11 +2107,20 @@ onMounted(() => {
 .nc-hero__orb-a { top: -320px; left: 50%; width: 1100px; height: 760px; margin-left: -550px; }
 .nc-hero__orb-b { top: -220px; right: -180px; width: 760px; height: 620px; }
 .nc-hero__body {
-  padding-top: 64px;
+  padding-top: 24px;
   display: flex;
   flex-direction: column;
   gap: 22px;
 }
+
+.nc-hero__top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.nc-hero__top .nc-pill { align-self: center; }
 
 .nc-pill {
   align-self: flex-start;
@@ -2152,7 +2159,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 13px 14px;
+  padding: 13px 10px 13px 14px;
   font-family: var(--nc-font-mono);
   font-size: 13px;
   color: var(--nc-neutral-300);
@@ -2169,7 +2176,7 @@ onMounted(() => {
   color: var(--nc-neutral-400);
   border-left: 1px solid var(--nc-neutral-800);
   padding-left: 10px;
-  min-width: 4.5em;
+  min-width: 5ch;
   text-align: left;
 }
 
@@ -2682,7 +2689,26 @@ onMounted(() => {
   font-weight: 400;
 }
 .btn-ghost:hover { border-color: var(--nc-accent-500); color: var(--nc-accent-200); }
-.btn-split__main { border-right-color: color-mix(in srgb, var(--nc-accent-300) 45%, transparent); }
+/* Bouton scindé : le cadre (bordure, rayon, halo) porte sur le conteneur,
+   pas sur chaque moitié — sinon l'override .btn-primary ci-dessus redonne à
+   chacune ses propres coins et bordure, et on voit deux boutons accolés. */
+.btn-split {
+  border: 1px solid var(--nc-accent-300);
+  border-radius: var(--nc-radius-md);
+  box-shadow: var(--nc-glow);
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+.btn-split:hover { border-color: var(--nc-accent-200); }
+.btn-split > .btn-primary {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+.btn-split > .btn-primary:hover { transform: none; }
+.btn-split > .btn-split__aside {
+  border-left: 1px solid color-mix(in srgb, var(--nc-accent-300) 45%, transparent);
+}
 
 /* Sélecteur de langue */
 .lang-pill {

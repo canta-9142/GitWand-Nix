@@ -410,6 +410,51 @@ export async function listRepoTree(cwd: string): Promise<RepoTreeResult> {
   return res.json();
 }
 
+// ─── One working-tree directory (Files view, v3.11.2) ────────────────
+
+/** One entry of `listRepoDir`. `path` is repo-relative with `/` separators. */
+export interface RepoDirEntry {
+  name: string;
+  path: string;
+  /** Symlinks are reported, never followed. */
+  kind: "file" | "dir" | "symlink";
+  /** Matched by an ignore rule and not tracked. Only returned when requested. */
+  ignored: boolean;
+  /** Byte length for files; 0 for directories and symlinks. */
+  size: number;
+}
+
+export interface RepoDirListing {
+  entries: RepoDirEntry[];
+  /** More than 5,000 listable entries: only the first 5,000 are returned. */
+  truncated: boolean;
+}
+
+/**
+ * List one directory of the working tree (`dir` is repo-relative, "" for the
+ * root). `.git` is never listed. Ignored entries are dropped unless
+ * `includeIgnored`, in which case they come back with `ignored: true`.
+ */
+export async function listRepoDir(
+  cwd: string,
+  dir: string,
+  includeIgnored: boolean,
+): Promise<RepoDirListing> {
+  if (isTauri()) {
+    return tauriInvoke<RepoDirListing>("list_repo_dir", { cwd, dir, includeIgnored });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/list-repo-dir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, dir, includeIgnored }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `list_repo_dir failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 // ─── Git status ────────────────────────────────────────────
 
 export interface FileChange {
@@ -558,6 +603,12 @@ export async function getGitDiff(
   if (isTauri()) {
     const raw = await tauriInvoke<{
       path: string;
+      status?: GitDiff["status"];
+      oldPath?: string;
+      truncatedFromBytes?: number;
+      isDirectory?: boolean;
+      newFiles?: string[];
+      nestedRepo?: boolean;
       hunks: Array<{
         header: string;
         old_start: number;
@@ -575,6 +626,15 @@ export async function getGitDiff(
 
     return {
       path: raw.path,
+      // Already camelCase on the wire (explicit serde renames in types.rs).
+      // Dropping them hid the 5 MB truncation banner and the untracked-
+      // directory / nested-repo panel (issue #183) in the packaged app only.
+      status: raw.status,
+      oldPath: raw.oldPath,
+      truncatedFromBytes: raw.truncatedFromBytes,
+      isDirectory: raw.isDirectory,
+      newFiles: raw.newFiles,
+      nestedRepo: raw.nestedRepo,
       hunks: raw.hunks.map((h) => ({
         header: h.header,
         oldStart: h.old_start,
@@ -741,6 +801,44 @@ export async function gitStage(cwd: string, paths: string[]): Promise<void> {
   if (!res.ok) throw new Error(`Failed to stage files: ${res.status}`);
 }
 
+/** Tracked paths that match an ignore rule (`git ls-files -ci --exclude-standard`). */
+export interface TrackedIgnored {
+  /** At most 500 repo-relative paths. */
+  paths: string[];
+  /** Uncapped number of matching tracked paths. */
+  total: number;
+  /** True when `paths` is shorter than `total`. */
+  truncated: boolean;
+}
+
+/**
+ * List tracked files that now match `.gitignore` / `.git/info/exclude`.
+ */
+export async function gitTrackedIgnored(cwd: string): Promise<TrackedIgnored> {
+  if (isTauri()) {
+    return tauriInvoke<TrackedIgnored>("git_tracked_ignored", { cwd });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-tracked-ignored?cwd=${encodeURIComponent(cwd)}`);
+  if (!res.ok) throw new Error(`Failed to list tracked ignored files: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Untrack files (git rm --cached): they stay on disk, the removal is staged.
+ */
+export async function gitUntrackPaths(cwd: string, paths: string[]): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("git_untrack_paths", { cwd, paths });
+    return;
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-untrack-paths`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, paths }),
+  });
+  if (!res.ok) throw new Error(`Failed to untrack files: ${res.status}`);
+}
+
 /**
  * Unstage files (git reset HEAD).
  */
@@ -794,16 +892,26 @@ export async function gitUnstagePatch(cwd: string, patch: string): Promise<void>
 // ─── Git commit ───────────────────────────────────────────────
 
 /**
- * Create a commit with the given message. Returns the short hash.
+ * Commit staged changes; returns the short hash. When `identity` is given
+ * (see `commitIdentityFor`), it is injected as `-c user.name=… -c
+ * user.email=…` — plus `user.signingkey` when set — for this commit only:
+ * the repo's git config is left untouched.
  */
-export async function gitCommit(cwd: string, message: string): Promise<string> {
+export async function gitCommit(
+  cwd: string,
+  message: string,
+  identity?: { name: string; email: string; signingKey?: string | null } | null,
+): Promise<string> {
+  const identityName = identity?.name ?? null;
+  const identityEmail = identity?.email ?? null;
+  const identitySigningKey = identity?.signingKey ?? null;
   if (isTauri()) {
-    return tauriInvoke<string>("git_commit", { cwd, message });
+    return tauriInvoke<string>("git_commit", { cwd, message, identityName, identityEmail, identitySigningKey });
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-commit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, message }),
+    body: JSON.stringify({ cwd, message, identityName, identityEmail, identitySigningKey }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -894,19 +1002,30 @@ export interface GitPushPullResult {
  * which publishes the current branch to a same-named branch on origin and
  * records it as the upstream. Used when pushing a branch that has no
  * tracking configured yet.
+ *
+ * `force` pushes with `--force-with-lease`. With `lease`, the lease is explicit
+ * (`--force-with-lease=refs/heads/<branch>:<sha>`): the push is refused unless
+ * the remote branch still sits on `sha`, whatever a later fetch brought in.
  */
 export async function gitPush(
   cwd: string,
   setUpstream: boolean = false,
   force: boolean = false,
+  lease?: { branch: string; sha: string },
 ): Promise<GitPushPullResult> {
+  const leaseBranch = lease?.branch ?? null;
+  const leaseSha = lease?.sha ?? null;
   if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_push", { cwd, setUpstream, force }, IPC_TIMEOUT.NETWORK);
+    return tauriInvoke<GitPushPullResult>(
+      "git_push",
+      { cwd, setUpstream, force, leaseBranch, leaseSha },
+      IPC_TIMEOUT.NETWORK,
+    );
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-push`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, setUpstream, force }),
+    body: JSON.stringify({ cwd, setUpstream, force, leaseBranch, leaseSha }),
   });
   return res.json();
 }
@@ -937,6 +1056,34 @@ export async function gitPull(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ cwd, strategy, autostash }),
+  });
+  return res.json();
+}
+
+/** Result of `gitFastForwardToUpstream`. A refusal is a result, never a throw. */
+export interface FastForwardResult {
+  fastForwarded: boolean;
+  /** `operation | detached | noUpstream | conflicts | localCommits | trackedEdits | gitRefused | upToDate` */
+  reason?: string;
+  /** git's own message when it refused the fast-forward. */
+  stderr?: string;
+  /** Commits advanced by (or behind by, when refused). */
+  behind: number;
+  branch?: string | null;
+}
+
+/**
+ * Opt-in auto fast-forward: under the repo write lock, re-check every
+ * repo-side condition and only then `merge --ff-only @{upstream}`.
+ */
+export async function gitFastForwardToUpstream(cwd: string): Promise<FastForwardResult> {
+  if (isTauri()) {
+    return tauriInvoke<FastForwardResult>("git_fast_forward_to_upstream", { cwd });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-fast-forward-to-upstream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd }),
   });
   return res.json();
 }
@@ -1201,6 +1348,12 @@ export async function getGitBlame(cwd: string, path: string, algorithm: BlameAlg
 // ─── Git file log ────────────────────────────────────────────
 
 export interface FileLogEntry {
+  /**
+   * The file's repo-root-relative name at this commit, from the `--follow`
+   * walk (the old name before a rename). Set by `getGitFileLog` and
+   * `getGitFileLogPickaxe`; absent from range results and merge commits.
+   */
+  path?: string;
   hashFull: string;
   hash: string;
   author: string;
@@ -1214,8 +1367,8 @@ export interface FileLogEntry {
  */
 export async function getGitFileLog(cwd: string, path: string, count = 50): Promise<FileLogEntry[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<Array<{ hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log", { cwd, path, count });
-    return raw.map(r => ({ hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
+    const raw = await tauriInvoke<Array<{ path?: string; hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log", { cwd, path, count });
+    return raw.map(r => ({ ...(r.path !== undefined ? { path: r.path } : {}), hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
   }
   const qs = `?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}&count=${count}`;
   const res = await devFetch(`${DEV_SERVER}/api/git-file-log${qs}`);
@@ -1231,8 +1384,8 @@ export type PickaxeMode = "S" | "G";
  */
 export async function getGitFileLogPickaxe(cwd: string, path: string, search: string, mode: PickaxeMode = "S"): Promise<FileLogEntry[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<Array<{ hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log_pickaxe", { cwd, path, search, mode });
-    return raw.map(r => ({ hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
+    const raw = await tauriInvoke<Array<{ path?: string; hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log_pickaxe", { cwd, path, search, mode });
+    return raw.map(r => ({ ...(r.path !== undefined ? { path: r.path } : {}), hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
   }
   const qs = `?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}&search=${encodeURIComponent(search)}&mode=${mode}`;
   const res = await devFetch(`${DEV_SERVER}/api/git-file-log-pickaxe${qs}`);
@@ -1259,16 +1412,23 @@ export async function getGitFileLogRange(cwd: string, path: string, startLine: n
 
 /**
  * Get diff for a specific file between two commits (time-travel diff).
+ *
+ * `fromPath` / `toPath`: the file's repo-root-relative name at each commit,
+ * as `getGitFileLog` reported it (`FileLogEntry.path`). They are how a rename
+ * between the two commits is followed; omitted, both default to `path`.
  */
 export async function getGitFileDiff(
   cwd: string,
   path: string,
   fromHash: string,
   toHash: string,
+  fromPath?: string,
+  toPath?: string,
 ): Promise<GitDiff> {
   if (isTauri()) {
     const raw = await tauriInvoke<{
       path: string;
+      truncatedFromBytes?: number;
       hunks: Array<{
         header: string;
         old_start: number;
@@ -1282,10 +1442,12 @@ export async function getGitFileDiff(
           new_line_no?: number;
         }>;
       }>;
-    }>("git_file_diff", { cwd, path, fromHash, toHash });
+    }>("git_file_diff", { cwd, path, fromHash, toHash, fromPath, toPath });
 
     return {
       path: raw.path,
+      // Already camelCase on the wire (serde rename in types.rs), like git_diff.
+      truncatedFromBytes: raw.truncatedFromBytes,
       hunks: raw.hunks.map((h) => ({
         header: h.header,
         oldStart: h.old_start,
@@ -1302,9 +1464,14 @@ export async function getGitFileDiff(
     };
   }
 
-  const qs = `?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}&from=${encodeURIComponent(fromHash)}&to=${encodeURIComponent(toHash)}`;
-  const res = await devFetch(`${DEV_SERVER}/api/git-file-diff${qs}`);
-  if (!res.ok) throw new Error(`Failed to get file diff: ${res.status}`);
+  const params = new URLSearchParams({ cwd, path, from: fromHash, to: toHash });
+  if (fromPath !== undefined) params.set("fromPath", fromPath);
+  if (toPath !== undefined) params.set("toPath", toPath);
+  const res = await devFetch(`${DEV_SERVER}/api/git-file-diff?${params}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to get file diff: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -1510,6 +1677,27 @@ export async function openInEditor(cwd: string, path: string, editor: string = "
 }
 
 /**
+ * Show a working-tree path in the OS file manager (Files view, v3.11.2):
+ * selected in Finder / Explorer, its folder opened on Linux. Throws with the
+ * backend's message when the path is missing or outside the repo.
+ */
+export async function revealInFileManager(cwd: string, path: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("reveal_in_file_manager", { cwd, path });
+    return;
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/reveal-in-file-manager`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, path }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `reveal_in_file_manager failed: ${res.status}`);
+  }
+}
+
+/**
  * Configure the git binary path used by all Rust git commands.
  * Pass an empty string to reset to the system default ("git").
  */
@@ -1708,16 +1896,22 @@ export async function gitConflictCheck(cwd: string, targetBranch: string): Promi
 // ─── Cherry-pick (Phase 8.2) ───────────────────────────────
 
 /**
- * Cherry-pick one or more commits onto the current branch.
+ * Cherry-pick `hashes` onto HEAD. With `noCommit`, the changes are applied to
+ * the index and working tree without committing (`--no-commit`), leaving them
+ * as WIP for the user to edit, unstage or split before committing.
  */
-export async function gitCherryPick(cwd: string, hashes: string[]): Promise<GitPushPullResult> {
+export async function gitCherryPick(
+  cwd: string,
+  hashes: string[],
+  noCommit = false,
+): Promise<GitPushPullResult> {
   if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_cherry_pick", { cwd, hashes });
+    return tauriInvoke<GitPushPullResult>("git_cherry_pick", { cwd, hashes, noCommit });
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-cherry-pick`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, hashes }),
+    body: JSON.stringify({ cwd, hashes, noCommit }),
   });
   return res.json();
 }
@@ -1845,7 +2039,7 @@ export async function snapshotPrune(
  * affordance can target this exact point rather than "whatever is newest by
  * the time the user clicks".
  */
-export async function gitResetToCommit(cwd: string, sha: string, mode: "soft" | "mixed" | "hard", snapshotsEnabled?: boolean): Promise<SnapshotMeta | null> {
+export async function gitResetToCommit(cwd: string, sha: string, mode: "soft" | "mixed" | "hard" | "keep", snapshotsEnabled?: boolean): Promise<SnapshotMeta | null> {
   if (isTauri()) {
     return await tauriInvoke("git_reset_to_commit", { cwd, sha, mode, snapshotsEnabled });
   }
@@ -2719,6 +2913,16 @@ export async function scratchWorktreeCreate(
   return res.json() as Promise<ScratchWorktree>;
 }
 
+/** Résultat d'un merge-back réussi. */
+export interface ScratchMergeBackOutcome {
+  /**
+   * Erreur de la suppression du scratch, faite après coup : le merge-back a
+   * réussi, mais le worktree est resté sur le disque (verrouillé, fichier
+   * ouvert sous Windows). `null` quand tout a été nettoyé.
+   */
+  cleanup_warning: string | null;
+}
+
 /**
  * Ramène les changements résolus du worktree scratch dans le checkout principal
  * en une opération, puis supprime + prune le scratch.
@@ -2726,8 +2930,13 @@ export async function scratchWorktreeCreate(
 export async function scratchWorktreeMergeBack(
   cwd: string,
   scratchPath: string,
-): Promise<void> {
-  await tauriInvoke<void>("scratch_worktree_merge_back", { cwd, scratchPath });
+  snapshotsEnabled?: boolean,
+): Promise<ScratchMergeBackOutcome> {
+  return tauriInvoke<ScratchMergeBackOutcome>("scratch_worktree_merge_back", {
+    cwd,
+    scratchPath,
+    snapshotsEnabled,
+  });
 }
 
 /** Abandonne le worktree scratch (remove --force + prune), sans rien ramener. */
@@ -3961,6 +4170,23 @@ export async function gitCommitTemplatePath(cwd: string): Promise<string | null>
   if (!res.ok) return null;
   const data = await res.json();
   return data?.path ?? null;
+}
+
+/**
+ * Read the commit.template configured for the repo, or null if unset. The
+ * backend resolves the path from git config itself: the template usually
+ * lives outside the repo (`~/.gitmessage`), where `readFile` refuses to read.
+ */
+export async function readCommitTemplate(cwd: string): Promise<string | null> {
+  if (isTauri()) return tauriInvoke<string | null>("read_commit_template", { cwd });
+  const res = await devFetch(`${DEV_SERVER}/api/read-commit-template`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error || "read_commit_template failed");
+  return data?.content ?? null;
 }
 
 // ─── Re-exports from per-domain sub-modules (v2.11) ──────────────────────────
