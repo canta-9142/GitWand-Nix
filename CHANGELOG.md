@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.12.4] - 2026-10-19
+
+### Added
+- **A security policy (#272).** `SECURITY.md` says how to report a vulnerability privately and which versions get security fixes (the latest release only).
+
 ### Fixed
-- **GitWand starts on a Windows without the Visual C++ Redistributable.** From v3.11.2 the Windows build imported `VCRUNTIME140.dll`, so on a clean machine the app quit at launch with `STATUS_DLL_NOT_FOUND`, and winget's validation rejected v3.11.2 to v3.12.3. The C runtime is now linked statically, and the release fails if the exe depends on it again.
+- **GitWand starts on a Windows without the Visual C++ Redistributable (#273).** From v3.11.2 the Windows build imported `VCRUNTIME140.dll`, so on a clean machine the app quit at launch with `STATUS_DLL_NOT_FOUND`, and winget's validation rejected v3.11.2 to v3.12.3. The C runtime is now linked statically, and the release fails if the exe depends on it again.
+- **The release really re-uploads missing installers (#273).** The step that re-uploads an asset GitHub failed to store looked in a folder the build never writes to, so it never checked anything.
 
 ## [3.12.3] - 2026-10-14
 
@@ -1687,7 +1693,8 @@ Design-system foundations — the app header and every overlay now ride on a sha
 - CI pipeline via GitHub Actions (Node 18, 20, 22)
 - 28 tests covering all patterns + real-world scenarios (package.json, Laravel routes, Vue SFC, CSS, .env files)
 
-[Unreleased]: https://github.com/devlint/GitWand/compare/v3.12.1...HEAD
+[Unreleased]: https://github.com/devlint/GitWand/compare/v3.12.4...HEAD
+[3.12.4]: https://github.com/devlint/GitWand/compare/v3.12.3...v3.12.4
 [3.12.3]: https://github.com/devlint/GitWand/compare/v3.12.2...v3.12.3
 [3.12.2]: https://github.com/devlint/GitWand/compare/v3.12.1...v3.12.2
 [3.12.1]: https://github.com/devlint/GitWand/compare/v3.12.0...v3.12.1

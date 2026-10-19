@@ -5,6 +5,16 @@ description: Release history for GitWand — the native Git client with AI confl
 
 # Changelog
 
+## v3.12.4 — October 2026
+
+### GitWand starts on every Windows again
+
+Since v3.11.2, the Windows app quietly relied on Microsoft's Visual C++ runtime. Most developer machines have it installed, so it went unnoticed, but on a clean Windows GitWand closed the moment it opened, and winget refused to publish v3.11.2 to v3.12.3. The runtime is now built into the app, so nothing extra has to be installed, and every release now checks the Windows build for this dependency before it goes out.
+
+### A security policy
+
+GitWand now has a `SECURITY.md`: report a vulnerability privately by email rather than in a public issue. Security fixes go to the latest release.
+
 ## v3.12.3 — October 2026
 
 ### Three safer ways to move a branch
