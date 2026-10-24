@@ -7,9 +7,14 @@ import {
   copilotCliPrompt,
   antigravityCliPrompt,
   listOpencodeModels,
+  listAntigravityModels,
+  listCopilotModels,
+  listCodexModels,
   detectClaudeCli,
+  aiHttpRequest,
 } from "../utils/backend";
 import { t } from "./useI18n";
+import { ensureAiApiKeyLoaded, isAiApiKeyConfigured } from "./useAiApiKey";
 
 /**
  * AI provider types matching SettingsPanel configuration.
@@ -68,7 +73,6 @@ export const CLI_AGENT_PROVIDERS: CliAgentProvider[] = [
 export interface AISettings {
   aiEnabled: boolean;
   aiProvider: AIProvider;
-  aiApiKey: string;
   aiApiEndpoint: string;
   aiModel: string;
   aiOllamaUrl: string;
@@ -80,6 +84,13 @@ export interface AISettings {
    * empty value means "let the CLI use its own configured default".
    */
   aiModelByProvider: Partial<Record<AIProvider, string>>;
+  /**
+   * Per-provider reasoning effort (`low` … `max`). Keyed like
+   * `aiModelByProvider`; empty means "the model's / CLI's own default".
+   * Used by the Claude API (`output_config.effort`) and the CLIs that take
+   * an effort flag (Claude Code, Codex, Copilot).
+   */
+  aiEffortByProvider: Partial<Record<AIProvider, string>>;
 }
 
 export interface ConflictContext {
@@ -119,12 +130,12 @@ function loadAISettings(): AISettings {
   const defaults: AISettings = {
     aiEnabled: false,
     aiProvider: "none",
-    aiApiKey: "",
     aiApiEndpoint: "https://api.anthropic.com",
-    aiModel: "claude-sonnet-4-20250514",
+    aiModel: DEFAULT_CLAUDE_API_MODEL,
     aiOllamaUrl: "http://localhost:11434",
     aiOllamaModel: "codellama",
     aiModelByProvider: {},
+    aiEffortByProvider: {},
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -182,6 +193,11 @@ export function buildUserPrompt(ctx: ConflictContext): string {
   return prompt;
 }
 
+/** 2xx — the backend answers every upstream status, errors included. */
+function isOk(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
 /**
  * Call the Anthropic Messages API.
  */
@@ -190,28 +206,22 @@ async function callClaude(
   systemPrompt: string,
   userPrompt: string,
 ): Promise<string> {
-  const res = await fetch(`${settings.aiApiEndpoint}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": settings.aiApiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: settings.aiModel,
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userPrompt }],
-    }),
+  // Through the backend, which signs the request with the keychain-held key.
+  const res = await aiHttpRequest("POST", `${settings.aiApiEndpoint}/v1/messages`, "anthropic", {
+    model: settings.aiModel,
+    max_tokens: 4096,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
+    ...(effortForProvider(settings, "claude")
+      ? { output_config: { effort: effortForProvider(settings, "claude") } }
+      : {}),
   });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${body}`);
+  if (!isOk(res.status)) {
+    throw new Error(`Anthropic API error ${res.status}: ${res.body}`);
   }
 
-  const data = await res.json();
+  const data = JSON.parse(res.body);
   const textBlock = data.content?.find((b: any) => b.type === "text");
   if (!textBlock) throw new Error("No text content in Anthropic response");
   return textBlock.text;
@@ -226,28 +236,20 @@ async function callOpenAICompat(
   userPrompt: string,
 ): Promise<string> {
   const endpoint = settings.aiApiEndpoint.replace(/\/+$/, "");
-  const res = await fetch(`${endpoint}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${settings.aiApiKey}`,
-    },
-    body: JSON.stringify({
-      model: settings.aiModel,
-      max_tokens: 4096,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    }),
+  const res = await aiHttpRequest("POST", `${endpoint}/chat/completions`, "bearer", {
+    model: settings.aiModel,
+    max_tokens: 4096,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
   });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`API error ${res.status}: ${body}`);
+  if (!isOk(res.status)) {
+    throw new Error(`API error ${res.status}: ${res.body}`);
   }
 
-  const data = await res.json();
+  const data = JSON.parse(res.body);
   return data.choices?.[0]?.message?.content ?? "";
 }
 
@@ -259,8 +261,9 @@ async function callClaudeCodeCli(
   systemPrompt: string,
   userPrompt: string,
   model?: string,
+  effort?: string,
 ): Promise<string> {
-  const result = await claudeCliPrompt(userPrompt, systemPrompt, undefined, "text", model);
+  const result = await claudeCliPrompt(userPrompt, systemPrompt, "text", model, effort);
   return result ?? "";
 }
 
@@ -272,8 +275,9 @@ async function callCodexCli(
   systemPrompt: string,
   userPrompt: string,
   model?: string,
+  effort?: string,
 ): Promise<string> {
-  const result = await codexCliPrompt(userPrompt, systemPrompt, undefined, model);
+  const result = await codexCliPrompt(userPrompt, systemPrompt, model, effort);
   return result ?? "";
 }
 
@@ -287,7 +291,7 @@ async function callOpencodeCli(
   userPrompt: string,
   model?: string,
 ): Promise<string> {
-  const result = await opencodeCliPrompt(userPrompt, systemPrompt, undefined, model);
+  const result = await opencodeCliPrompt(userPrompt, systemPrompt, model);
   return result ?? "";
 }
 
@@ -299,8 +303,9 @@ async function callCopilotCli(
   systemPrompt: string,
   userPrompt: string,
   model?: string,
+  effort?: string,
 ): Promise<string> {
-  const result = await copilotCliPrompt(userPrompt, systemPrompt, undefined, model);
+  const result = await copilotCliPrompt(userPrompt, systemPrompt, model, effort);
   return result ?? "";
 }
 
@@ -313,19 +318,93 @@ async function callAntigravityCli(
   userPrompt: string,
   model?: string,
 ): Promise<string> {
-  const result = await antigravityCliPrompt(userPrompt, systemPrompt, undefined, model);
+  const result = await antigravityCliPrompt(userPrompt, systemPrompt, model);
   return result ?? "";
 }
 
 // ─── Per-provider model selection (v2.17) ───────────────
 //
-// The three CLI agents each expose a second model picker. opencode can
-// enumerate its catalog dynamically (`opencode models`); Claude Code accepts
-// stable aliases; Codex model slugs are volatile, so it falls back to
-// free-text entry (empty curated list → the Settings panel renders an input).
+// Each provider exposes a model picker fed by whatever the provider can
+// enumerate: the Claude API and OpenAI-compatible endpoints are fetched
+// (`GET /v1/models`, `GET /models`), the CLIs are asked through their own
+// commands (`opencode models`, `agy models`, `copilot help config`, `codex
+// debug models`), and Claude Code accepts stable aliases. An empty list (CLI
+// missing, command failed) makes the Settings panel render a free-text input.
+
+/** Every effort level, in increasing order. */
+export const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+
+/** A model the Settings picker can offer. */
+export interface AIModelOption {
+  /** Value sent to the provider (`model` field / `--model` flag). */
+  id: string;
+  /** Human-readable name with its version, e.g. "Claude Opus 5.5". */
+  name: string;
+  /**
+   * Effort levels this model accepts, in increasing order. Empty when the
+   * provider takes no effort parameter, or bakes it into the id (Antigravity).
+   */
+  efforts: string[];
+}
+
+/** `copilot --reasoning-effort` possible values. */
+const COPILOT_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Effort levels every current Claude model accepts. */
+const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+/** Default model for the Claude API provider. */
+export const DEFAULT_CLAUDE_API_MODEL = "claude-opus-5-5";
+
+/**
+ * Current-generation Claude API models — what the picker shows before a key
+ * is entered, or when `GET /v1/models` fails. With a working key the live
+ * list replaces it.
+ */
+export const CLAUDE_API_MODELS: AIModelOption[] = [
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5", efforts: CLAUDE_EFFORTS },
+  { id: "claude-fable-5-1", name: "Claude Fable 5.1", efforts: CLAUDE_EFFORTS },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", efforts: CLAUDE_EFFORTS },
+  // Haiku 4.5 does not support the effort parameter.
+  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", efforts: [] },
+];
+
+/**
+ * The list to show when a provider's own list is unavailable (no key yet,
+ * fetch failed). Empty = free-text entry.
+ */
+export function fallbackModelsForProvider(provider: AIProvider): AIModelOption[] {
+  return provider === "claude" ? CLAUDE_API_MODELS : [];
+}
+
+/** Effort levels `claude --effort` accepts. */
+const CLAUDE_CODE_EFFORTS = CLAUDE_EFFORTS;
 
 /** Stable model aliases accepted by `claude --model`. */
-export const CLAUDE_CODE_MODELS: string[] = ["sonnet", "opus", "haiku"];
+export const CLAUDE_CODE_MODELS: AIModelOption[] = [
+  { id: "fable", name: "Fable (latest)", efforts: CLAUDE_CODE_EFFORTS },
+  { id: "opus", name: "Opus (latest)", efforts: CLAUDE_CODE_EFFORTS },
+  { id: "sonnet", name: "Sonnet (latest)", efforts: CLAUDE_CODE_EFFORTS },
+  { id: "haiku", name: "Haiku (latest)", efforts: [] },
+];
+
+/**
+ * Effort levels a provider accepts when the model list cannot say — free-text
+ * models (Codex, Copilot) or a model typed by hand. Empty = no effort picker.
+ */
+export function providerEfforts(provider: AIProvider): string[] {
+  switch (provider) {
+    case "claude-code-cli":
+      return CLAUDE_CODE_EFFORTS;
+    case "copilot-cli":
+      return COPILOT_EFFORTS;
+    case "codex-cli":
+      // For a model typed by hand: the levels every catalog model accepts.
+      return ["low", "medium", "high"];
+    default:
+      return [];
+  }
+}
 
 /**
  * Resolve the model string to pass to a CLI provider, or `undefined` to let
@@ -337,13 +416,7 @@ export function modelForProvider(
   s: AISettings,
   provider: AIProvider,
 ): string | undefined {
-  if (
-    provider === "claude-code-cli" ||
-    provider === "codex-cli" ||
-    provider === "opencode-cli" ||
-    provider === "copilot-cli" ||
-    provider === "antigravity-cli"
-  ) {
+  if ((CLI_AGENT_PROVIDERS as readonly string[]).includes(provider)) {
     const m = s.aiModelByProvider?.[provider];
     return m && m.trim() ? m.trim() : undefined;
   }
@@ -351,20 +424,126 @@ export function modelForProvider(
 }
 
 /**
- * List the models a CLI agent advertises, for the Settings model picker.
+ * Resolve the effort to send to a provider, or `undefined` to keep the
+ * model's own default. Unknown values are dropped rather than forwarded.
+ */
+export function effortForProvider(
+  s: AISettings,
+  provider: AIProvider,
+): string | undefined {
+  const e = s.aiEffortByProvider?.[provider]?.trim();
+  return e && (EFFORT_LEVELS as readonly string[]).includes(e) ? e : undefined;
+}
+
+/**
+ * True for a complete http(s) URL with a host. Gates the model fetch that
+ * carries the API key: a half-typed endpoint must not receive it.
+ */
+export function isFetchableEndpoint(endpoint: string): boolean {
+  try {
+    const u = new URL(endpoint.trim());
+    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname !== "";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A saved effort the current model no longer accepts. Only judged once the
+ * model list has loaded: while it is loading or empty the options are not
+ * known yet. An empty option list on a loaded list is meaningful (Haiku 4.5
+ * accepts no effort).
+ */
+export function isStaleEffort(effort: string, options: string[], listLoaded: boolean): boolean {
+  return listLoaded && effort !== "" && !options.includes(effort);
+}
+
+/** Effort levels a Claude `/v1/models` entry reports as supported. */
+function anthropicEfforts(capabilities: any): string[] {
+  const effort = capabilities?.effort;
+  if (!effort?.supported) return [];
+  return EFFORT_LEVELS.filter((level) => effort[level]?.supported === true);
+}
+
+/**
+ * Fetch the models the Anthropic API key can use (`GET /v1/models`), newest
+ * first as the API returns them.
+ */
+export async function fetchAnthropicModels(endpoint: string): Promise<AIModelOption[]> {
+  const base = (endpoint || "https://api.anthropic.com").replace(/\/+$/, "");
+  const models: AIModelOption[] = [];
+  let afterId: string | undefined;
+  // Paginate defensively; a handful of pages at most in practice.
+  for (let page = 0; page < 10; page++) {
+    const url = new URL(`${base}/v1/models`);
+    url.searchParams.set("limit", "1000");
+    if (afterId) url.searchParams.set("after_id", afterId);
+    const res = await aiHttpRequest("GET", url.toString(), "anthropic", undefined, 10);
+    if (!isOk(res.status)) {
+      throw new Error(`Anthropic API error ${res.status}: ${res.body}`);
+    }
+    const body = JSON.parse(res.body);
+    for (const m of body.data ?? []) {
+      if (!m?.id) continue;
+      models.push({
+        id: m.id,
+        name: m.display_name || m.id,
+        efforts: anthropicEfforts(m.capabilities),
+      });
+    }
+    if (!body.has_more || !body.last_id) break;
+    afterId = body.last_id;
+  }
+  return models;
+}
+
+/**
+ * Fetch the models an OpenAI-compatible endpoint serves (`GET /models`).
+ * The endpoint reports ids only — no display name, no effort support.
+ */
+export async function fetchOpenAICompatModels(endpoint: string): Promise<AIModelOption[]> {
+  const base = endpoint.replace(/\/+$/, "");
+  const auth = isAiApiKeyConfigured() ? "bearer" : "none";
+  const res = await aiHttpRequest("GET", `${base}/models`, auth, undefined, 10);
+  if (!isOk(res.status)) {
+    throw new Error(`API error ${res.status}: ${res.body}`);
+  }
+  const body = JSON.parse(res.body);
+  return (body.data ?? [])
+    .map((m: any) => m?.id)
+    .filter((id: unknown): id is string => typeof id === "string" && id.length > 0)
+    .sort((a: string, b: string) => a.localeCompare(b))
+    .map((id: string) => ({ id, name: id, efforts: [] }));
+}
+
+/**
+ * List the models a provider advertises, for the Settings model picker.
  * Returns an empty array (→ free-text fallback) when no list is available.
+ * The API providers need the endpoint and key from `s`; a failed fetch
+ * throws so the panel can say why the list is empty.
  */
 export async function listModelsForProvider(
   provider: AIProvider,
-): Promise<string[]> {
+  s?: Pick<AISettings, "aiApiEndpoint">,
+): Promise<AIModelOption[]> {
   switch (provider) {
+    case "claude":
+      if (!isAiApiKeyConfigured()) return CLAUDE_API_MODELS;
+      return fetchAnthropicModels(s?.aiApiEndpoint ?? "");
+    case "openai-compat":
+      if (!s?.aiApiEndpoint) return [];
+      return fetchOpenAICompatModels(s.aiApiEndpoint);
     case "opencode-cli":
-      return listOpencodeModels();
+      return (await listOpencodeModels()).map((id) => ({ id, name: id, efforts: [] }));
+    case "antigravity-cli":
+      return (await listAntigravityModels()).map((m) => ({ id: m.id, name: m.name, efforts: [] }));
+    case "copilot-cli":
+      // Copilot reports ids only, and one effort range for every model.
+      return (await listCopilotModels()).map((id) => ({ id, name: id, efforts: COPILOT_EFFORTS }));
+    case "codex-cli":
+      return listCodexModels();
     case "claude-code-cli":
       return CLAUDE_CODE_MODELS;
-    // Codex slugs change frequently and the CLI has no enumeration command —
-    // fall back to free-text entry.
-    case "codex-cli":
     default:
       return [];
   }
@@ -379,25 +558,20 @@ async function callOllama(
   userPrompt: string,
 ): Promise<string> {
   const url = (settings.aiOllamaUrl || "http://localhost:11434").replace(/\/+$/, "");
-  const res = await fetch(`${url}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: settings.aiOllamaModel || "codellama",
-      stream: false,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    }),
+  const res = await aiHttpRequest("POST", `${url}/api/chat`, "none", {
+    model: settings.aiOllamaModel || "codellama",
+    stream: false,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
   });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Ollama error ${res.status}: ${body}`);
+  if (!isOk(res.status)) {
+    throw new Error(`Ollama error ${res.status}: ${res.body}`);
   }
 
-  const data = await res.json();
+  const data = JSON.parse(res.body);
   return data.message?.content ?? "";
 }
 
@@ -437,6 +611,10 @@ detectClaudeCli().then(info => {
   _claudeCliAvailable.value = false;
 });
 
+// The API key lives in the keychain; load whether one is stored so the
+// `isAiApiKeyConfigured()` guards below see it (they are reactive on it).
+void ensureAiApiKeyLoaded();
+
 // ─── Composable ─────────────────────────────────────────
 const isLoading = ref(false);
 const lastError = ref<string | null>(null);
@@ -448,8 +626,8 @@ export function useAIProvider() {
   const isAvailable = computed(() => {
     const s = settings.value;
     if (s.aiEnabled) {
-      if (s.aiProvider === "claude" && s.aiApiKey) return true;
-      if (s.aiProvider === "openai-compat" && s.aiApiKey && s.aiApiEndpoint) return true;
+      if (s.aiProvider === "claude" && isAiApiKeyConfigured()) return true;
+      if (s.aiProvider === "openai-compat" && isAiApiKeyConfigured() && s.aiApiEndpoint) return true;
       if (s.aiProvider === "ollama") return true;
       if (s.aiProvider === "claude-code-cli") return true;
       if (s.aiProvider === "codex-cli") return true;
@@ -481,28 +659,29 @@ export function useAIProvider() {
       const misconfigured =
         !s.aiEnabled ||
         s.aiProvider === "none" ||
-        (s.aiProvider === "claude" && !s.aiApiKey) ||
-        (s.aiProvider === "openai-compat" && (!s.aiApiKey || !s.aiApiEndpoint));
+        (s.aiProvider === "claude" && !isAiApiKeyConfigured()) ||
+        (s.aiProvider === "openai-compat" && (!isAiApiKeyConfigured() || !s.aiApiEndpoint));
       const provider = misconfigured && _claudeCliAvailable.value
         ? "claude-code-cli"
         : s.aiProvider;
       const model = modelForProvider(s, provider);
+      const effort = effortForProvider(s, provider);
 
       switch (provider) {
         case "claude":
           rawResponse = await callClaude(s, systemPrompt, userPrompt);
           break;
         case "claude-code-cli":
-          rawResponse = await callClaudeCodeCli(systemPrompt, userPrompt, model);
+          rawResponse = await callClaudeCodeCli(systemPrompt, userPrompt, model, effort);
           break;
         case "codex-cli":
-          rawResponse = await callCodexCli(systemPrompt, userPrompt, model);
+          rawResponse = await callCodexCli(systemPrompt, userPrompt, model, effort);
           break;
         case "opencode-cli":
           rawResponse = await callOpencodeCli(systemPrompt, userPrompt, model);
           break;
         case "copilot-cli":
-          rawResponse = await callCopilotCli(systemPrompt, userPrompt, model);
+          rawResponse = await callCopilotCli(systemPrompt, userPrompt, model, effort);
           break;
         case "antigravity-cli":
           rawResponse = await callAntigravityCli(systemPrompt, userPrompt, model);
@@ -541,23 +720,24 @@ export function useAIProvider() {
     const misconfigured =
       !s.aiEnabled ||
       s.aiProvider === "none" ||
-      (s.aiProvider === "claude" && !s.aiApiKey) ||
-      (s.aiProvider === "openai-compat" && (!s.aiApiKey || !s.aiApiEndpoint));
+      (s.aiProvider === "claude" && !isAiApiKeyConfigured()) ||
+      (s.aiProvider === "openai-compat" && (!isAiApiKeyConfigured() || !s.aiApiEndpoint));
     const provider = misconfigured && _claudeCliAvailable.value
       ? "claude-code-cli"
       : s.aiProvider;
     const model = modelForProvider(s, provider);
+    const effort = effortForProvider(s, provider);
     switch (provider) {
       case "claude":
         return callClaude(s, systemPrompt, userPrompt);
       case "claude-code-cli":
-        return callClaudeCodeCli(systemPrompt, userPrompt, model);
+        return callClaudeCodeCli(systemPrompt, userPrompt, model, effort);
       case "codex-cli":
-        return callCodexCli(systemPrompt, userPrompt, model);
+        return callCodexCli(systemPrompt, userPrompt, model, effort);
       case "opencode-cli":
         return callOpencodeCli(systemPrompt, userPrompt, model);
       case "copilot-cli":
-        return callCopilotCli(systemPrompt, userPrompt, model);
+        return callCopilotCli(systemPrompt, userPrompt, model, effort);
       case "antigravity-cli":
         return callAntigravityCli(systemPrompt, userPrompt, model);
       case "openai-compat":
@@ -576,7 +756,7 @@ export function useAIProvider() {
    *   - AI is globally disabled (`aiEnabled === false`)
    *   - No provider is selected (`aiProvider === "none"`)
    *   - The selected provider needs configuration the user hasn't supplied
-   *     (Claude API without `aiApiKey`, OpenAI-compat without endpoint/key…)
+   *     (Claude API without a stored key, OpenAI-compat without endpoint/key…)
    *   - The provider is `"mcp"` — the actual wiring is deferred to §5.2 of
    *     PLAN-v2.5-tie-in (Phase 2). For now this lands in `null` so the
    *     LLM fallback is silently skipped instead of hitting the default
@@ -593,8 +773,8 @@ export function useAIProvider() {
     const s = loadAISettings();
     if (!s.aiEnabled || s.aiProvider === "none") return null;
     if (s.aiProvider === "mcp") return null; // wired in PLAN §5.2 (Phase 2)
-    if (s.aiProvider === "claude" && !s.aiApiKey) return null;
-    if (s.aiProvider === "openai-compat" && (!s.aiApiKey || !s.aiApiEndpoint)) return null;
+    if (s.aiProvider === "claude" && !isAiApiKeyConfigured()) return null;
+    if (s.aiProvider === "openai-compat" && (!isAiApiKeyConfigured() || !s.aiApiEndpoint)) return null;
     return {
       async call(prompt: string): Promise<string> {
         // Forward the core's prompt verbatim — it already contains the

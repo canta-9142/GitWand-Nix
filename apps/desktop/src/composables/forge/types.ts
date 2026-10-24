@@ -28,6 +28,7 @@ import type {
   Issue,
   AutoMergeState,
   AutoMergeSupport,
+  PrEdit,
 } from "../../utils/backend";
 import type { Account } from "../useAccounts";
 
@@ -49,6 +50,7 @@ export type {
   Account,
   AutoMergeState,
   AutoMergeSupport,
+  PrEdit,
 };
 
 // ─── Options / Inputs ───────────────────────────────────────────────────────
@@ -225,6 +227,14 @@ export interface ForgeProvider {
   /** Convert a draft PR/MR to "ready for review". */
   convertDraftToReady(cwd: string, number: number): Promise<void>;
 
+  /**
+   * Edit the PR/MR title and/or description (Markdown body); a field left out
+   * of `edit` is unchanged. Optional: forges without a write API for it
+   * (Cursor) omit it, and callers hide the action — see `forgeSupportsEdit`
+   * in `usePrPanel`.
+   */
+  updatePR?(cwd: string, number: number, edit: PrEdit): Promise<void>;
+
   // ── Comments ──────────────────────────────────────────────────────────────
 
   listComments(cwd: string, prNumber: number): Promise<PrReviewComment[]>;
@@ -259,6 +269,14 @@ export interface ForgeProvider {
    * and hide the action rather than surface an error banner.
    */
   dismissReview?(cwd: string, prNumber: number, reviewId: number, message?: string): Promise<void>;
+
+  /**
+   * Resolve or unresolve a review thread by its forge id
+   * (`PrReviewComment.thread_id`, "Resolve conversation"). Optional — same
+   * unsupported-hides-the-action contract as `dismissReview`. Only GitHub
+   * implements it for now.
+   */
+  setThreadResolved?(cwd: string, threadId: string, resolved: boolean): Promise<void>;
 
   /** Request reviewers on an existing PR/MR (B4, v3.6.0). Optional — same
    *  unsupported-hides-the-action contract as `dismissReview`. */

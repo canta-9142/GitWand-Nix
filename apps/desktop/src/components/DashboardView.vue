@@ -14,9 +14,12 @@ import {
 import type { ViewMode } from "../composables/useGitRepo";
 import { useI18n } from "../composables/useI18n";
 import { useSettings } from "../composables/useSettings";
+import { isGeneratingReleaseNotes } from "../composables/releaseNotesState";
 import Avatar from "./Avatar.vue";
 import { useAIProvider } from "../composables/useAIProvider";
-import { renderMarkdown, safeHtml } from "../composables/useSafeHtml";
+import { renderMarkdown, safeHtml, hasBlockedRemoteImages } from "../composables/useSafeHtml";
+import { useRepoRemoteImages } from "../composables/useRemoteImages";
+import RemoteImagesNotice from "./RemoteImagesNotice.vue";
 import AiSparkle from "./AiSparkle.vue";
 import BaseModal from "./BaseModal.vue";
 import { forgeForRepo, isForgeConnected } from "../composables/forge/useForge";
@@ -28,6 +31,7 @@ const { settings } = useSettings();
 const ai = useAIProvider();
 // ─── Release notes modal (shared with TagsPanel) ──────────
 const releaseNotesOpen = ref(false);
+const releaseNotesBusy = computed(() => isGeneratingReleaseNotes(props.cwd));
 
 const props = defineProps<{
   cwd: string;
@@ -827,21 +831,28 @@ function formatDate(dateStr: string): string {
 
 // ─── README rendering ──────────────────────────────────────
 // Markdown parsing is delegated to the shared `useSafeHtml` composable
-// (markdown-it + DOMPurify). The only README-specific step kept here is
+// (`utils/markdown.ts` + DOMPurify). The only README-specific step kept here is
 // `extractReadmeHeader`, which promotes the HTML block that many
 // projects ship at the top of their README (title, tagline, nav links,
 // shields.io badges) into a dedicated styled header. Anything below
-// that block is run through the standard markdown-it renderer.
-function renderReadme(md: string): string {
+// that block is run through the standard markdown renderer.
+function renderReadme(md: string, allowRemoteImages: boolean): string {
   const { headerHtml, rest } = extractReadmeHeader(md);
-  // Strip HTML comments early — READMEs often use them as section
-  // dividers, and we don't want them rendered as text. markdown-it's
-  // `html: false` mode escapes them, which looks noisy in the UI.
-  const cleaned = rest.replace(/<!--[\s\S]*?-->/g, "");
   // READMEs soft-wrap single newlines (GitHub behaviour) — disable `breaks` so
   // wrapped prose isn't broken up with spurious <br> tags.
-  return headerHtml + renderMarkdown(cleaned, { breaks: false });
+  return headerHtml + renderMarkdown(rest, { breaks: false, allowRemoteImages });
 }
+
+// Remote images in the README (badges, screenshots) are withheld unless the
+// user accepted them for this project — a choice remembered per repository.
+const readmeRemoteImages = useRepoRemoteImages(computed(() => props.cwd));
+// Rendered once per content / consent change, not on every re-render.
+const readmeHtml = computed(() => {
+  if (readmeContent.value === null) return "";
+  const allow = readmeRemoteImages.allowed.value;
+  return safeHtml(renderReadme(readmeContent.value, allow), { allowRemoteImages: allow });
+});
+const readmeImagesBlocked = computed(() => hasBlockedRemoteImages(readmeHtml.value));
 
 // The README is injected via `v-html`, so its anchors are plain DOM links the
 // Tauri webview can't act on by itself: `http(s)` links would navigate the app
@@ -1253,8 +1264,8 @@ watch(
                 @click="releaseNotesOpen = true"
               >
                 <span class="dv-ai-label">
-                  <AiSparkle :size="13" />
-                  {{ t('dashboard.releaseNotes') }}
+                  <AiSparkle :size="13" :busy="releaseNotesBusy" />
+                  <span :class="{ 'ai-loading': releaseNotesBusy }">{{ t('dashboard.releaseNotes') }}</span>
                 </span>
               </button>
             </div>
@@ -1322,12 +1333,17 @@ watch(
           </div>
         </div>
         <div class="readme-body">
+          <RemoteImagesNotice
+            v-if="readmeTab === 'formatted' && readmeImagesBlocked"
+            per-project
+            @allow="readmeRemoteImages.allowForRepo()"
+          />
           <div
             v-if="readmeTab === 'formatted'"
             ref="readmeFormattedEl"
             class="readme-formatted"
             @click="onReadmeLinkClick"
-            v-html="safeHtml(renderReadme(readmeContent))"
+            v-html="readmeHtml"
           />
           <pre v-else class="readme-raw"><code>{{ readmeContent }}</code></pre>
         </div>
@@ -1773,8 +1789,10 @@ watch(
 }
 
 .contrib {
-  flex: 0 0 calc((100% - var(--space-3) * 3) / 4);
-  min-width: 150px;
+  /* Below ~280px the stats column squeezes the name and line counts down to
+     an ellipsis: cards never go narrower — the rail scrolls instead. */
+  --contrib-min-width: 280px;
+  flex: 0 0 max(var(--contrib-min-width), calc((100% - var(--space-3) * 3) / 4));
   scroll-snap-align: start;
   display: grid;
   grid-template-columns: 28px 1fr auto;
@@ -1789,7 +1807,7 @@ watch(
 
 /* >4 contributors: shrink cards so more fit and a partial card peeks in. */
 .contributors-scroll--dense .contrib {
-  flex-basis: calc((100% - var(--space-3) * 4) / 6);
+  flex-basis: max(var(--contrib-min-width), calc((100% - var(--space-3) * 5) / 6));
 }
 
 .contrib:hover {
@@ -1799,12 +1817,17 @@ watch(
 
 .contrib-body { min-width: 0; }
 
+/* Merged identities read "Name A / Name B": allow two lines before clipping
+   (the card's title attribute keeps the full name). */
 .contrib-name {
   font-size: var(--font-size-sm);
   color: var(--color-text);
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .contrib-bar {
@@ -2336,6 +2359,11 @@ watch(
      aren't clipped at the card boundary. The outer dashboard scroll
      handles vertical overflow. */
   overflow: visible;
+  /* No drop shadow on this card only: a long README makes it tens of
+     thousands of px tall, and WebKitGTK repaints the `.card` shadow over its
+     full height on every scroll frame — measured ~78 ms/frame with it, 16 ms
+     without. (`contain: paint` would clip the deliberate overflow above.) */
+  box-shadow: none;
 }
 
 .readme-tabs {
@@ -2512,17 +2540,8 @@ watch(
 }
 
 .readme-formatted :deep(.md-check) {
-  list-style: none;
   margin-left: calc(-1 * var(--space-7));
   padding-left: 0;
-}
-.readme-formatted :deep(.md-check::before) {
-  content: "☐ ";
-  color: var(--color-text-muted);
-}
-.readme-formatted :deep(.md-checked::before) {
-  content: "☑ ";
-  color: var(--color-success);
 }
 
 .readme-formatted :deep(.md-img),
