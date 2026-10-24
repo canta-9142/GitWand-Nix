@@ -6,7 +6,7 @@
  * commit right-click menu exposes in CommitLog → RepoSidebar → App.
  *
  * Usage:
- *   const commitActions = useCommitActions({ repoFolderPath, repoError, loadLog, loadBranches, repoRefresh });
+ *   const commitActions = useCommitActions({ repoFolderPath, repoError, loadBranches, repoRefresh });
  *   // spread handlers on the template: v-bind="commitActions.handlers"
  */
 
@@ -34,10 +34,34 @@ import { useBranchName } from "./useBranchName";
 
 // ─── Types ───────────────────────────────────────────────
 
+export type ResetMode = "soft" | "mixed" | "hard" | "keep";
+
+/** Matches RESET_KEEP_BLOCKED_PREFIX in src-tauri/src/commands/ops.rs and dev-server.mjs. */
+const RESET_KEEP_BLOCKED_PREFIX = "reset-keep-blocked:";
+
+/**
+ * Turn a reset failure into the message shown in the dialog. A `--keep`
+ * refusal (a local edit would be overwritten) becomes a translated sentence
+ * naming the blocking files; anything else keeps git's own text.
+ */
+export function describeResetError(err: unknown, t: (key: any, ...args: any[]) => string): string {
+  const raw: string = (err as any)?.message ?? String(err);
+  const at = raw.indexOf(RESET_KEEP_BLOCKED_PREFIX);
+  if (at === -1) return raw;
+  const files = raw
+    .slice(at + RESET_KEEP_BLOCKED_PREFIX.length)
+    .split("\n")
+    .map((f: string) => f.trim())
+    .filter(Boolean);
+  return files.length
+    ? t("commitCtx.resetKeepBlocked", files.join(", "))
+    : t("commitCtx.resetKeepBlockedGeneric");
+}
+
 export interface CommitActionModal {
   type: "checkout" | "reset" | "createBranch" | "tag" | "deleteBranch" | "deleteTag" | null;
   entry: GitLogEntry | null;
-  resetMode: "soft" | "mixed" | "hard";
+  resetMode: ResetMode;
   branchName: string;
   tagName: string;
   tagMessage: string;
@@ -59,12 +83,17 @@ export interface CommitActionModal {
 interface Deps {
   repoFolderPath: Ref<string | null>;
   repoError: Ref<string | null>;
-  loadLog: () => Promise<void>;
   loadBranches: () => void;
-  repoRefresh: () => Promise<void>;
+  /**
+   * `forceLog` bypasses the log's unchanged-top-commit fast path. Anything that
+   * moves HEAD must pass it: with `origin/<branch>` (or any other ref) still on
+   * the newest commit, the all-refs log's top is unchanged and the Git Tree
+   * would keep the old branch/HEAD labels until the next periodic fetch.
+   */
+  repoRefresh: (forceLog?: boolean) => Promise<void>;
   onReset?: () => void;
   /** cherry-pick one or more commits (owned by useGitRepo — handles conflict flow). */
-  cherryPick: (hashes: string[]) => Promise<void>;
+  cherryPick: (hashes: string[], opts?: { noCommit?: boolean }) => Promise<void>;
   /** Branch deletion actions (owned by useGitRepo) */
   deleteBranch: (name: string) => Promise<void>;
   deleteRemoteBranch: (remote: string, name: string) => Promise<void>;
@@ -80,7 +109,6 @@ export function useCommitActions(deps: Deps) {
   const {
     repoFolderPath,
     repoError,
-    loadLog,
     loadBranches,
     repoRefresh,
     cherryPick,
@@ -162,7 +190,8 @@ export function useCommitActions(deps: Deps) {
         await deleteRemoteBranch(remote, branch);
       }
       closeModal();
-      await Promise.all([loadBranches(), repoRefresh()]);
+      // Force: deleted refs change the log's labels without moving HEAD.
+      await Promise.all([loadBranches(), repoRefresh(true)]);
     } catch (err: any) {
       modal.value.error = err?.message ?? String(err);
     } finally {
@@ -192,8 +221,8 @@ export function useCommitActions(deps: Deps) {
       // 3. Remote delete (best effort, ignore if already gone)
       await gitDeleteRemoteTag(cwd, remote, name).catch(() => {});
 
-      // 4. Final refresh
-      await repoRefresh();
+      // 4. Final refresh — force: tag refs change without HEAD moving.
+      await repoRefresh(true);
     } catch (err: any) {
       repoError.value = err?.message ?? String(err);
     }
@@ -217,7 +246,7 @@ export function useCommitActions(deps: Deps) {
         useUndoToast().show(t("timeMachine.toastCheckout", entry.hash), snapshot?.id);
       }
       closeModal();
-      await Promise.all([loadLog(), repoRefresh()]);
+      await repoRefresh(true);
       loadBranches();
     } catch (err: any) {
       modal.value.error = err?.message ?? String(err);
@@ -228,7 +257,7 @@ export function useCommitActions(deps: Deps) {
 
   // ── Reset to commit ────────────────────────────────────
 
-  function handleResetToCommit(entry: GitLogEntry, mode?: "soft" | "mixed" | "hard") {
+  function handleResetToCommit(entry: GitLogEntry, mode?: ResetMode) {
     modal.value = { ...modal.value, type: "reset", entry, resetMode: mode || "mixed", error: "" };
     // If a mode was explicitly provided (e.g. from a context sub-menu),
     // we assume the user wants to trigger it immediately.
@@ -254,12 +283,13 @@ export function useCommitActions(deps: Deps) {
         useUndoToast().show(t("timeMachine.toastReset", entry.hash), snapshot?.id);
       }
       closeModal();
-      // repoRefresh reloads staged/unstaged status — critical for --hard.
-      await Promise.all([loadLog(), repoRefresh()]);
+      // repoRefresh reloads staged/unstaged status — critical for --hard —
+      // and the forced log, so the Git Tree shows the branch at its new commit.
+      await repoRefresh(true);
       loadBranches();
       deps.onReset?.();
     } catch (err: any) {
-      modal.value.error = err?.message ?? String(err);
+      modal.value.error = describeResetError(err, t);
     } finally {
       modal.value.busy = false;
     }
@@ -278,7 +308,9 @@ export function useCommitActions(deps: Deps) {
           ? t("commitCtx.revertConflicts")
           : result.message || t("commitCtx.revertFailed");
       }
-      await repoRefresh();
+      // Force: the all-refs log's top commit may belong to another branch,
+      // so a HEAD move alone doesn't invalidate the cached log.
+      await repoRefresh(true);
     } catch (err: any) {
       repoError.value = err?.message ?? String(err);
     }
@@ -299,7 +331,8 @@ export function useCommitActions(deps: Deps) {
     try {
       await gitCreateBranch(cwd, name, true, entry.hashFull);
       closeModal();
-      await Promise.all([repoRefresh(), loadBranches()]);
+      // Force: the new branch ref adds a label without moving the top commit.
+      await Promise.all([repoRefresh(true), loadBranches()]);
     } catch (err: any) {
       modal.value.error = err?.message ?? String(err);
     } finally {
@@ -353,7 +386,8 @@ export function useCommitActions(deps: Deps) {
     try {
       await gitCreateTag(cwd, name, entry.hashFull, modal.value.tagMessage || undefined);
       closeModal();
-      await repoRefresh();
+      // Force: a new tag adds a ref without moving HEAD.
+      await repoRefresh(true);
     } catch (err: any) {
       modal.value.error = err?.message ?? String(err);
     } finally {
@@ -367,6 +401,11 @@ export function useCommitActions(deps: Deps) {
 
   async function handleCherryPickCommit(entry: GitLogEntry) {
     await cherryPick([entry.hashFull]);
+  }
+
+  /** Cherry-pick without committing — the changes land as WIP in the index. */
+  async function handleCherryPickCommitAsWip(entry: GitLogEntry) {
+    await cherryPick([entry.hashFull], { noCommit: true });
   }
 
   // ── View on forge (fire-and-forget) ───────────────────
@@ -403,6 +442,7 @@ export function useCommitActions(deps: Deps) {
     handleCreateBranchFromCommit,
     handleTagCommit,
     handleCherryPickCommit,
+    handleCherryPickCommitAsWip,
     handleViewOnForge,
     handleDeleteBranchRequest,
     handleDeleteTagRequest,

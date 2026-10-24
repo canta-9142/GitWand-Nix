@@ -3,6 +3,7 @@ import { ref, computed, defineAsyncComponent, nextTick, watch, onMounted, onUnmo
 import { TOGGLE_GIT_TREE_KEY } from "../composables/branchPickerBridge";
 import type { GitDiff, DiffLine } from "../utils/backend";
 import { useI18n } from "../composables/useI18n";
+import { useTheme } from "../composables/useTheme";
 import type { DiffMode } from "../utils/diffMode";
 import { detectLanguage, highlightLine } from "../utils/highlight";
 import { safeHtml } from "../composables/useSafeHtml";
@@ -591,11 +592,17 @@ function drawMinimap() {
     const visibleRatio = contentArea.clientHeight / contentArea.scrollHeight;
     const vpY = ratio * containerHeight;
     const vpH = Math.max(visibleRatio * containerHeight, 10);
-    ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+    // Tint with the theme's text color: light over the dark theme, dark over
+    // the light one (a white tint vanishes on the light minimap background).
+    const tint = getComputedStyle(canvas).getPropertyValue("--color-text").trim() || "#ffffff";
+    ctx.fillStyle = tint;
+    ctx.strokeStyle = tint;
+    ctx.globalAlpha = 0.12;
     ctx.fillRect(0, vpY, MINIMAP_WIDTH, vpH);
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+    ctx.globalAlpha = 0.2;
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, vpY + 0.5, MINIMAP_WIDTH - 1, vpH - 1);
+    ctx.globalAlpha = 1;
   }
 }
 
@@ -633,6 +640,8 @@ function onMinimapMouseDown(e: MouseEvent) {
 
 // Redraw minimap on diff change or scroll
 watch(allLineTypes, () => nextTick(drawMinimap));
+// The viewport tint follows the theme; repaint when it flips.
+watch(useTheme().theme, () => nextTick(drawMinimap));
 
 function onDiffScroll() {
   drawMinimap();
@@ -1367,11 +1376,12 @@ function onDiffScroll() {
 }
 
 .line-content {
+  vertical-align: top;
   padding: 0 12px;
   font-size: var(--text-base);
-  white-space: pre;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Never truncate code: soft-wrap long lines, keep indentation. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .diff-line--add .line-content {
@@ -1404,9 +1414,8 @@ function onDiffScroll() {
   width: calc(50% - 60px);
   padding: 0 8px;
   font-size: var(--text-base);
-  white-space: pre;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .sbs-gutter {

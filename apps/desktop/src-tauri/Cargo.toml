@@ -1,6 +1,6 @@
 [package]
 name = "gitwand-desktop"
-version = "3.11.1"
+version = "3.12.4"
 description = "GitWand Desktop — standalone merge conflict resolution"
 authors = ["Laurent Guitton <lb.guitton@gmail.com>"]
 license = "MIT"
@@ -76,6 +76,11 @@ portable-pty = "0.9"
 # need our own classification pass anyway, and one dependency is enough.
 notify = "8.2.0"
 
+# Reads the user's Codex `config.toml` (commands/ai.rs) to forward the env
+# variables its custom providers name. Already in the tree through
+# tauri-utils (same major, default features), so no new crate is compiled.
+toml = "1"
+
 # libgit2 bindings for in-process git operations (P3.3). Used in the
 # workspace_*_all hot paths to read branch + ahead/behind + file statuses
 # without spawning git subprocesses (5-15ms each on macOS). Vendored to
@@ -114,6 +119,14 @@ uuid = { version = "1", features = ["v4"] }
 # patterns from `.gitwandrc`. Mirrored by a pure-RegExp TS engine in
 # @gitwand/core; see commands/secrets.rs.
 regex = "1"
+
+# libc: `killpg` to stop a terminal's whole process tree, not just its shell
+# (an agent's child could otherwise keep writing to a merged-back AI task),
+# and getuid / killpg for the AI CLI helpers (commands/ai.rs): ownership
+# check of the private working directory, killing a timed-out probe's
+# process group. Already in the graph through portable-pty: no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # tokio is already in the tree (tauri depends on it) — this entry only makes

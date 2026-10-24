@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { ref, onBeforeUnmount, watch, nextTick, computed, onMounted, onActivated, watchEffect } from "vue";
-import { useTerminalSessions, type TerminalTab } from "../composables/useTerminalSessions";
+import { useTerminalSessions, resolveTerminalShortcut, type TerminalTab } from "../composables/useTerminalSessions";
 import { useI18n } from "../composables/useI18n";
 import { useSettings } from "../composables/useSettings";
 import { useDraggableResizable } from "../composables/useDraggableResizable";
-import { clipboardReadText, clipboardWriteText } from "../utils/backend";
+import { clipboardReadText, clipboardWriteText, openExternalUrl } from "../utils/backend";
+import { DomTerminal, IS_MAC } from "../utils/vt/DomTerminal";
+import AiSparkle from "./AiSparkle.vue";
+import AgentIcon from "./AgentIcon.vue";
 
 const props = defineProps<{ repoPath: string }>();
 const emit = defineEmits<{
@@ -34,9 +37,18 @@ watchEffect((onCleanup) => {
   onCleanup(() => document.removeEventListener("click", close));
 });
 
-function openDropdown(e: MouseEvent) {
+const menuRef = ref<HTMLElement | null>(null);
+/** The panel is docked at the bottom: when it is short, open the menu upward. */
+const menuUp = ref(false);
+
+async function openDropdown(e: MouseEvent) {
   e.stopPropagation();
   showDropdown.value = !showDropdown.value;
+  if (!showDropdown.value) return;
+  menuUp.value = false;
+  await nextTick();
+  const menu = menuRef.value;
+  if (menu && menu.getBoundingClientRect().bottom > window.innerHeight - 8) menuUp.value = true;
 }
 
 function selectDropdownItem(action: () => void) {
@@ -59,13 +71,16 @@ watchEffect((onCleanup) => {
   onCleanup(() => document.removeEventListener("click", close));
 });
 
-// Write the clipboard contents to a tab's PTY (the running shell), mirroring how
-// typed input flows through term.onData → sessions.write.
+// Paste the clipboard into a tab through its terminal, so bracketed paste is
+// honoured and the text then flows through onData → sessions.write like typing.
 async function pasteInto(tabId: number) {
   const tab = tabs.value.find((t) => t.id === tabId);
   if (!tab || tab.sessionId < 0) return;
   const text = await clipboardReadText();
-  if (text) sessions.write(tab.sessionId, text);
+  if (!text) return;
+  const entry = terms.get(tabId);
+  if (entry) entry.term.paste(text);
+  else sessions.write(tab.sessionId, text);
 }
 
 function onContextMenu(e: MouseEvent, tab: TerminalTab) {
@@ -86,7 +101,7 @@ function closeCtxMenu() { ctxMenu.value.visible = false; }
 
 function ctxEntry() {
   const id = ctxMenu.value.tabId;
-  return id == null ? undefined : xterms.get(id);
+  return id == null ? undefined : terms.get(id);
 }
 
 function ctxCopy() {
@@ -103,23 +118,16 @@ function ctxClear() { ctxEntry()?.term.clear(); closeCtxMenu(); }
 function ctxSelectAll() { ctxEntry()?.term.selectAll(); closeCtxMenu(); }
 function ctxSearch() { openSearch(); closeCtxMenu(); }
 
-// xterm instances kept OUTSIDE Vue reactivity — plain Map only.
-type XtermEntry = {
-  term: any;
-  fit: any;
-  search: any;       // SearchAddon — used by the search bar
+// Terminal instances kept OUTSIDE Vue reactivity — plain Map only.
+type TermEntry = {
+  term: DomTerminal;
   ro: ResizeObserver;
   sessionId: number;
 };
-const xterms = new Map<number, XtermEntry>(); // key = tab.id (local)
-let XtermCtor: any = null;
-let FitCtor: any = null;
-let WebglCtor: any = null;
-let SearchCtor: any = null;
-let WebLinksCtor: any = null;
+const terms = new Map<number, TermEntry>(); // key = tab.id (local)
 
-// Pending buffer for output chunks that arrive before the xterm is mounted.
-// Keyed by tab.id (same key space as xterms). Not reactive — plain Map.
+// Pending buffer for output chunks that arrive before the terminal is mounted.
+// Keyed by tab.id (same key space as terms). Not reactive — plain Map.
 const pendingChunks = new Map<number, string[]>();
 
 // Keystroke input buffer for keystrokes typed before the PTY is ready
@@ -202,29 +210,6 @@ const panelStyle = computed(() => {
   };
 });
 
-async function ensureXtermLibs() {
-  if (XtermCtor) return;
-  const [
-    { Terminal },
-    { FitAddon },
-    { WebglAddon },
-    { SearchAddon },
-    { WebLinksAddon },
-  ] = await Promise.all([
-    import("@xterm/xterm"),
-    import("@xterm/addon-fit"),
-    import("@xterm/addon-webgl"),
-    import("@xterm/addon-search"),
-    import("@xterm/addon-web-links"),
-  ]);
-  XtermCtor = Terminal;
-  FitCtor = FitAddon;
-  WebglCtor = WebglAddon;
-  SearchCtor = SearchAddon;
-  WebLinksCtor = WebLinksAddon;
-  await import("@xterm/xterm/css/xterm.css");
-}
-
 // Tabs whose PTY has already received the post-boot resize kick (see below).
 const kicked = new Set<number>();
 
@@ -245,9 +230,9 @@ const kicked = new Set<number>();
 // terminal stays blank until a manual resize. A held delay guarantees two
 // distinct SIGWINCH the child must act on.
 function kickResize(tab: TerminalTab) {
-  const entry = xterms.get(tab.id);
+  const entry = terms.get(tab.id);
   if (!entry || tab.sessionId < 0) return;
-  entry.fit.fit();
+  entry.term.fit();
   const { cols, rows } = entry.term;
   if (!cols || !rows) return;
   sessions.resize(tab.sessionId, cols, Math.max(1, rows - 1));
@@ -261,13 +246,13 @@ function kickResize(tab: TerminalTab) {
 // unpredictable frame after a remount (v-if toggle, async component, fonts), so
 // a single rAF is unreliable. Stops as soon as one fit lands on a sized host.
 function refitWhenSized(tabId: number, el: HTMLElement, attempt = 0) {
-  const entry = xterms.get(tabId);
+  const entry = terms.get(tabId);
   if (!entry) return; // tab closed mid-retry
   if (el.offsetWidth === 0 || el.offsetHeight === 0) {
     if (attempt < 20) setTimeout(() => refitWhenSized(tabId, el, attempt + 1), 100);
     return;
   }
-  entry.fit.fit();
+  entry.term.fit();
   const tab = tabs.value.find((t) => t.id === tabId);
   if (tab && tab.sessionId >= 0) {
     sessions.resize(tab.sessionId, entry.term.cols, entry.term.rows);
@@ -276,37 +261,31 @@ function refitWhenSized(tabId: number, el: HTMLElement, attempt = 0) {
 }
 
 // Guards against concurrent mountTab() invocations for the same tab. Two watch
-// runs can overlap (the first awaits the dynamic xterm import) and would
-// otherwise both pass the `xterms.has` check and mount two terminals.
+// runs can overlap (the first awaits nextTick) and would otherwise both pass
+// the `terms.has` check and mount two terminals.
 const mounting = new Set<number>();
 
 async function mountTab(tab: TerminalTab) {
-  if (xterms.has(tab.id) || mounting.has(tab.id)) return;
+  if (terms.has(tab.id) || mounting.has(tab.id)) return;
   mounting.add(tab.id);
   try {
-    await ensureXtermLibs();
     await nextTick();
     const el = hostRefs.value[tab.id];
-    if (!el || xterms.has(tab.id)) return;
+    if (!el || terms.has(tab.id)) return;
 
-  const term = new XtermCtor({ fontSize: settings.value.terminalFontSize ?? 13, cursorBlink: true });
-  const fit = new FitCtor();
-  const search = new SearchCtor();
-  term.loadAddon(fit);
-  term.loadAddon(search);
-  term.loadAddon(new WebLinksCtor());
+  // Built-in renderer (utils/vt): DOM rows patched per frame, no WebGL.
+  const term = new DomTerminal({
+    fontSize: settings.value.terminalFontSize ?? 13,
+    // AI CLIs take Shift+Enter as "newline in the prompt"; shells get a plain CR.
+    shiftEnterNewline: tab.type !== "shell",
+    // App-level terminal shortcuts (new / close / switch tab, search) never
+    // reach the PTY — Ctrl+F would otherwise also send ^F (page down in vim/less).
+    customKeyHandler: (e) => resolveTerminalShortcut(e, true) === null && !isSearchChord(e),
+    readClipboard: clipboardReadText,
+    writeClipboard: clipboardWriteText,
+    onLinkOpen: (url) => { openExternalUrl(url); },
+  });
   term.open(el);
-
-  // WebGL2 renderer — GPU-accelerated rendering like Terax.
-  // Falls back silently to the built-in canvas renderer if WebGL2 is unavailable.
-  const webgl = new WebglCtor();
-  try {
-    term.loadAddon(webgl);
-  } catch {
-    webgl.dispose();
-  }
-
-  fit.fit();
 
   // Fix 6 — Buffer keystrokes when the PTY is not yet ready (sessionId is -1).
   // Keystrokes typed while awaiting terminalOpen would otherwise call
@@ -333,7 +312,7 @@ async function mountTab(tab: TerminalTab) {
   });
 
   const ro = new ResizeObserver(() => {
-    fit.fit();
+    term.fit();
     // Only sync the PTY once it actually exists. During the window before
     // terminalOpen resolves (sessionId === -1) a resize would call resize(-1),
     // which the backend rejects as "session not found" and the early layout is
@@ -343,9 +322,9 @@ async function mountTab(tab: TerminalTab) {
   });
   ro.observe(el);
 
-  xterms.set(tab.id, { term, fit, search, ro, sessionId: tab.sessionId });
+  terms.set(tab.id, { term, ro, sessionId: tab.sessionId });
 
-  // Flush any output that arrived before the xterm was mounted.
+  // Flush any output that arrived before the terminal was mounted.
   const buffered = pendingChunks.get(tab.id);
   if (buffered) {
     for (const chunk of buffered) term.write(chunk);
@@ -367,11 +346,23 @@ async function mountTab(tab: TerminalTab) {
   }
 }
 
-// Exposed so App.vue can route PTY chunks to the correct xterm instance.
-// Routes by stable tab.id (the Map key). If the xterm is not yet mounted,
+// Font-size changes from Settings apply live to every open tab.
+watch(
+  () => settings.value.terminalFontSize,
+  (px) => {
+    for (const [id, entry] of terms) {
+      entry.term.setFontSize(px ?? 13);
+      const tab = tabs.value.find((t) => t.id === id);
+      if (tab && tab.sessionId >= 0) sessions.resize(tab.sessionId, entry.term.cols, entry.term.rows);
+    }
+  },
+);
+
+// Exposed so App.vue can route PTY chunks to the correct terminal instance.
+// Routes by stable tab.id (the Map key). If the terminal is not yet mounted,
 // buffers the chunk so it is flushed when mountTab completes.
 function writeChunk(tabId: number, chunk: string) {
-  const entry = xterms.get(tabId);
+  const entry = terms.get(tabId);
   if (entry) {
     entry.term.write(chunk);
     // First output from the child → it has booted and the host is laid out.
@@ -393,7 +384,7 @@ watch(
     // Mount new tabs and refresh sessionId on existing ones.
     for (const tab of tabs.value) {
       await mountTab(tab);
-      const entry = xterms.get(tab.id);
+      const entry = terms.get(tab.id);
       if (entry && entry.sessionId !== tab.sessionId && tab.sessionId >= 0) {
         entry.sessionId = tab.sessionId;
         // Flush any keystrokes buffered while sessionId was -1.
@@ -411,19 +402,19 @@ watch(
         if (el) refitWhenSized(tab.id, el);
       }
     }
-    // Dispose xterms for closed tabs.
-    for (const id of [...xterms.keys()]) {
+    // Dispose terminals for closed tabs.
+    for (const id of [...terms.keys()]) {
       if (!tabs.value.some((t) => t.id === id)) {
-        const entry = xterms.get(id);
+        const entry = terms.get(id);
         entry?.ro.disconnect();
         entry?.term.dispose();
-        xterms.delete(id);
+        terms.delete(id);
         kicked.delete(id);
         pendingChunks.delete(id);
         pendingInput.delete(id); // Fix 6 — purge input buffer for closed tabs
       }
     }
-    // Purge buffered chunks for tabs that closed before their xterm mounted.
+    // Purge buffered chunks for tabs that closed before their terminal mounted.
     for (const id of pendingChunks.keys()) {
       if (!tabs.value.some((t) => t.id === id)) pendingChunks.delete(id);
     }
@@ -435,12 +426,12 @@ watch(
   { immediate: true },
 );
 
-// KeepAlive: the panel is deactivated (not unmounted) when hidden, so xterm
+// KeepAlive: the panel is deactivated (not unmounted) when hidden, so terminal
 // instances and their buffers survive a hide/show cycle. On re-show the host
-// elements are re-attached at a possibly different size and the WebGL renderer
-// needs a repaint, so refit every mounted tab once its host is sized again.
+// elements are re-attached at a possibly different size and need a repaint, so
+// refit every mounted tab once its host is sized again.
 onActivated(() => {
-  for (const id of xterms.keys()) {
+  for (const id of terms.keys()) {
     const el = hostRefs.value[id];
     if (el) refitWhenSized(id, el);
   }
@@ -458,6 +449,11 @@ const searchVisible = ref(false);
 const searchQuery = ref("");
 const searchHasResult = ref(true);
 
+/** Shortcut shown in the search button's tooltip (see onKeyDown). */
+const searchShortcut = IS_MAC ? "⌘F" : "Ctrl+F";
+/** The same shortcut for assistive tech (aria-keyshortcuts syntax). */
+const searchKeyShortcuts = IS_MAC ? "Meta+F" : "Control+F";
+
 function openSearch() {
   searchVisible.value = true;
   nextTick(() => {
@@ -474,17 +470,23 @@ function closeSearch() {
 function doSearch(direction: "next" | "prev") {
   const active = tabs.value.find(t => t.id === activeId.value);
   if (!active) return;
-  const entry = xterms.get(active.id);
-  if (!entry?.search || !searchQuery.value) return;
+  const entry = terms.get(active.id);
+  if (!entry || !searchQuery.value) return;
+  const opts = { regex: false, caseSensitive: false };
   const found =
     direction === "next"
-      ? entry.search.findNext(searchQuery.value, { regex: false, caseSensitive: false })
-      : entry.search.findPrevious(searchQuery.value, { regex: false, caseSensitive: false });
+      ? entry.term.findNext(searchQuery.value, opts)
+      : entry.term.findPrevious(searchQuery.value, opts);
   searchHasResult.value = found !== false;
 }
 
+/** ⌘F / Ctrl+F — opens the terminal search (see onKeyDown). */
+function isSearchChord(e: KeyboardEvent): boolean {
+  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f";
+}
+
 function onKeyDown(e: KeyboardEvent) {
-  if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+  if (isSearchChord(e)) {
     e.preventDefault();
     openSearch();
   }
@@ -508,11 +510,11 @@ function commitRename(tab: TerminalTab) {
 }
 
 onBeforeUnmount(() => {
-  for (const [, entry] of xterms) {
+  for (const [, entry] of terms) {
     entry.ro.disconnect();
     entry.term.dispose();
   }
-  xterms.clear();
+  terms.clear();
   // No manual removeEventListener for the dropdown — watchEffect cleans it up
   // automatically when the component unmounts.
 });
@@ -549,9 +551,10 @@ onBeforeUnmount(() => {
           @blur="commitRename(tab)"
         />
         <span v-else class="tp__tab-label">
-          <span class="tp__tab-icon" :class="`tp__tab-icon--${tab.type}`">
-            {{ tab.type === 'claude' ? 'C' : tab.type === 'codex' ? '⚡' : tab.type === 'opencode' ? 'O' : tab.type === 'antigravity' ? '↑' : '$' }}
-          </span>
+          <svg v-if="tab.type === 'shell'" class="tp__tab-icon tp__tab-icon--shell" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+          </svg>
+          <AgentIcon v-else class="tp__tab-icon" :agent="tab.type" />
           {{ tab.title }}
           <span v-if="tab.hasUnread && tab.id !== activeId" class="tp__unread" />
         </span>
@@ -564,34 +567,66 @@ onBeforeUnmount(() => {
       </button>
 
       <div class="tp__new-wrap">
-        <button class="tp__new" :title="t('terminal.newTab')" @click="openDropdown">+</button>
-        <div v-if="showDropdown" class="tp__menu" @click.stop>
-          <button class="tp__menu-item" @click="selectDropdownItem(() => emit('new'))">
+        <button
+          class="tp__new"
+          v-tooltip="t('terminal.newTab')"
+          :aria-label="t('terminal.newTab')"
+          aria-haspopup="menu"
+          :aria-expanded="showDropdown"
+          @click="openDropdown"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
+        <div
+          v-if="showDropdown"
+          ref="menuRef"
+          class="gw-menu tp__menu"
+          :class="{ 'tp__menu--up': menuUp }"
+          role="menu"
+          @click.stop
+        >
+          <button class="gw-menu__item tp__menu-item" role="menuitem" @click="selectDropdownItem(() => emit('new'))">
+            <svg class="tp__menu-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
             {{ t('terminal.menuShell') }}
           </button>
-          <button class="tp__menu-item" @click="selectDropdownItem(() => emit('new-agent', 'claude'))">
+          <button class="gw-menu__item tp__menu-item" role="menuitem" @click="selectDropdownItem(() => emit('new-agent', 'claude'))">
+            <AgentIcon class="tp__menu-icon" agent="claude" />
             {{ t('terminal.menuClaude') }}
           </button>
-          <button class="tp__menu-item" @click="selectDropdownItem(() => emit('new-agent', 'codex'))">
+          <button class="gw-menu__item tp__menu-item" role="menuitem" @click="selectDropdownItem(() => emit('new-agent', 'codex'))">
+            <AgentIcon class="tp__menu-icon" agent="codex" />
             {{ t('terminal.menuCodex') }}
           </button>
-          <button class="tp__menu-item" @click="selectDropdownItem(() => emit('new-agent', 'opencode'))">
+          <button class="gw-menu__item tp__menu-item" role="menuitem" @click="selectDropdownItem(() => emit('new-agent', 'opencode'))">
+            <AgentIcon class="tp__menu-icon" agent="opencode" />
             {{ t('terminal.menuOpenCode') }}
           </button>
-          <button class="tp__menu-item" @click="selectDropdownItem(() => emit('new-agent', 'antigravity'))">
+          <button class="gw-menu__item tp__menu-item" role="menuitem" @click="selectDropdownItem(() => emit('new-agent', 'antigravity'))">
+            <AgentIcon class="tp__menu-icon" agent="antigravity" />
             {{ t('terminal.menuAntigravity') }}
           </button>
-          <button class="tp__menu-item" @click="selectDropdownItem(() => emit('open-sessions'))">
+          <div class="gw-menu__separator" role="separator"></div>
+          <button class="gw-menu__item tp__menu-item" role="menuitem" @click="selectDropdownItem(() => emit('open-sessions'))">
+            <svg class="tp__menu-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/>
+              <circle cx="4.5" cy="6" r="1"/><circle cx="4.5" cy="12" r="1"/><circle cx="4.5" cy="18" r="1"/>
+            </svg>
             {{ t('terminal.menuSessions') }}
           </button>
-          <button class="tp__menu-item tp__menu-item--accent" @click="selectDropdownItem(() => emit('new-ai-task'))">
+          <div class="gw-menu__separator" role="separator"></div>
+          <button class="gw-menu__item tp__menu-item tp__menu-item--ai" role="menuitem" @click="selectDropdownItem(() => emit('new-ai-task'))">
+            <AiSparkle class="tp__menu-icon" :size="14" :animated="false" />
             {{ t('terminal.menuNewAiTask') }}
           </button>
         </div>
       </div>
       <button
         class="tp__full"
-        :title="fullscreen ? t('terminal.exitFullscreen') : t('terminal.fullscreen')"
+        v-tooltip="fullscreen ? t('terminal.exitFullscreen') : t('terminal.fullscreen')"
         :aria-label="fullscreen ? t('terminal.exitFullscreen') : t('terminal.fullscreen')"
         @click="toggleFullscreen"
       >
@@ -604,7 +639,11 @@ onBeforeUnmount(() => {
           <line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/>
         </svg>
       </button>
-      <button class="tp__hide" :title="t('terminal.hide')" @click="emit('close')">✕</button>
+      <button class="tp__hide" v-tooltip="t('terminal.hide')" :aria-label="t('terminal.hide')" @click="emit('close')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
     </div>
 
     <!-- Width / corner resize handles — floating mode only (fullscreen and
@@ -654,7 +693,7 @@ onBeforeUnmount(() => {
       />
     </template>
 
-    <!-- xterm host elements — one per tab, visibility toggled via v-show -->
+    <!-- Terminal host elements — one per tab, visibility toggled via v-show -->
     <div class="tp__body">
       <!-- Search bar — shown when searchVisible is true -->
       <div v-if="searchVisible" class="tp__search">
@@ -666,10 +705,10 @@ onBeforeUnmount(() => {
           @keyup.enter="doSearch('next')"
           @keyup.shift.enter="doSearch('prev')"
         />
-        <button class="tp__search-btn" @click="doSearch('prev')" :title="t('terminal.searchPrev')">↑</button>
-        <button class="tp__search-btn" @click="doSearch('next')" :title="t('terminal.searchNext')">↓</button>
+        <button class="tp__search-btn" @click="doSearch('prev')" v-tooltip="t('terminal.searchPrev')" :aria-label="t('terminal.searchPrev')">↑</button>
+        <button class="tp__search-btn" @click="doSearch('next')" v-tooltip="t('terminal.searchNext')" :aria-label="t('terminal.searchNext')">↓</button>
         <span v-if="!searchHasResult" class="tp__search-noresult">{{ t('terminal.searchNoResult') }}</span>
-        <button class="tp__search-close" @click="closeSearch">×</button>
+        <button class="tp__search-close" @click="closeSearch" v-tooltip="t('terminal.searchClose')" :aria-label="t('terminal.searchClose')">×</button>
       </div>
       <div class="tp__hosts">
         <div
@@ -690,12 +729,13 @@ onBeforeUnmount(() => {
         <button
           v-if="tabs.length && !searchVisible"
           class="tp__search-fab"
-          :title="t('terminal.ctxSearch')"
+          v-tooltip="t('terminal.searchOpen', searchShortcut)"
           :aria-label="t('terminal.ctxSearch')"
+          :aria-keyshortcuts="searchKeyShortcuts"
           @click="openSearch"
         >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="10" cy="10" r="7"/><line x1="20" y1="20" x2="14.95" y2="14.95"/>
           </svg>
         </button>
       </div>
@@ -831,7 +871,9 @@ onBeforeUnmount(() => {
 .tp__tabs {
   display: flex;
   gap: 2px;
-  align-items: center;
+  /* Stretch, not center: the + button takes the tabs' full height so it sits
+     flush on the terminal surface like a tab does. */
+  align-items: stretch;
   padding: 1px 6px 0px;
   margin-bottom: 0px;
   flex-shrink: 0;
@@ -879,47 +921,41 @@ onBeforeUnmount(() => {
 }
 
 .tp__new {
-  border: none;
-  cursor: pointer;
-  padding: 3.5px 20px;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  color: inherit;
-  font-size: var(--font-size-2xl);
-  font-weight: var(--font-weight-bold);
-  background: var(--bg-base, var(--color-bg));
-  opacity: 0.7;
-}
-
-.tp__full {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-left: auto;
   border: none;
+  cursor: pointer;
+  padding: 0 16px;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  color: inherit;
   background: var(--bg-base, var(--color-bg));
   opacity: 0.7;
-  cursor: pointer;
-  padding: 7px 9px;
-  border-radius: var(--radius-sm);
-  color: inherit;
-  position: relative;
-  top: -2px;
 }
 
+/* Fullscreen + hide: identical square buttons, centred in the tab bar and
+   nudged up so they read as part of the bar rather than the tabs' baseline. */
+.tp__full,
 .tp__hide {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  align-self: center;
+  position: relative;
+  top: -3px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border: none;
   background: var(--bg-base, var(--color-bg));
   opacity: 0.7;
   cursor: pointer;
-  padding: 4px 9px;
   border-radius: var(--radius-sm);
   color: inherit;
-  font-size: var(--font-size-xl);
-  position: relative;
-  top: -2px;
+}
+
+.tp__full {
+  margin-left: auto;
 }
 
 .tp__new:hover,
@@ -996,8 +1032,11 @@ onBeforeUnmount(() => {
 .tp__host {
   position: absolute;
   inset: 0px 6px 7px;
-  padding: 0px 7px;
-  background-color: black;
+  /* Small top gap so the first line doesn't touch the tab bar. The terminal
+     fits its rows to the remaining height (DomTerminal.fit). */
+  padding: 6px 7px 0;
+  /* Same surface as the active tab, so tab and terminal read as one sheet. */
+  background-color: var(--bg-base, var(--color-bg));
   border-radius: 0px var(--radius-sm) var(--radius-sm) var(--radius-sm);
 }
 
@@ -1036,7 +1075,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background-color: black;
+  /* Same surface as a terminal tab (.tp__host), in both themes. */
+  background-color: var(--bg-base, var(--color-bg));
   border-radius: 0px var(--radius-sm) var(--radius-sm) var(--radius-sm);
   color: var(--color-text-muted);
   font-size: var(--font-size-xl);
@@ -1059,44 +1099,49 @@ onBeforeUnmount(() => {
 
 .tp__new-wrap {
   position: relative;
+  display: flex;
 }
 
+/* "+" menu — look from the shared .gw-menu / .gw-menu__item (main.css),
+   the same as the tab bar's "+" menu (RepoTabStrip). */
 .tp__menu {
   position: absolute;
-  top: 100%;
+  top: calc(100% + 4px);
   left: 0;
-  background: var(--bg-elevated, var(--color-bg-secondary));
-  border: 1px solid var(--border, var(--color-border));
-  border-radius: var(--radius-sm);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
   z-index: 100;
-  min-width: 140px;
-  padding: 2px 0;
+  min-width: 200px;
 }
 
-.tp__menu-item {
-  display: block;
-  width: 100%;
-  padding: 6px 12px;
-  text-align: left;
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 14px;
-  color: var(--text, var(--color-text));
-  white-space: nowrap;
+.tp__menu--up {
+  top: auto;
+  bottom: calc(100% + 4px);
 }
 
-.tp__menu-item:hover {
-  background: var(--hover, var(--color-hover));
+/* Left icon slot — one 14px column for every item. */
+.tp__menu-icon {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: var(--color-text-muted);
 }
 
-.tp__menu-item--accent {
+.tp__menu-item:hover svg.tp__menu-icon {
   color: var(--color-accent);
-  font-weight: 500;
-  border-top: 1px solid var(--color-border);
-  margin-top: 2px;
-  padding-top: 8px;
+}
+
+/* AI entry: the AI colour, like every other AI action (see AiSparkle). */
+.tp__menu-item--ai,
+.tp__menu-item--ai .tp__menu-icon {
+  color: var(--color-ai);
+}
+
+.tp__menu-item--ai:hover {
+  background: var(--color-ai-soft);
+}
+
+.tp__menu-item--ai:hover,
+.tp__menu-item--ai:hover .tp__menu-icon {
+  color: var(--color-ai-hover);
 }
 
 /* Right-click context menu — teleported to <body>, positioned at the cursor. */
@@ -1187,37 +1232,15 @@ onBeforeUnmount(() => {
 .tp__tab-label {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
 }
 
 .tp__tab-icon {
-  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.tp__tab-icon--shell {
   opacity: 0.6;
-  font-family: monospace;
-  min-width: 12px;
-}
-
-.tp__tab-icon--claude {
-  color: var(--color-accent);
-  opacity: 1;
-  font-weight: bold;
-}
-
-.tp__tab-icon--codex {
-  color: #a370f7;
-  opacity: 1;
-}
-
-.tp__tab-icon--opencode {
-  color: #3b82f6;
-  opacity: 1;
-  font-weight: bold;
-}
-
-.tp__tab-icon--antigravity {
-  color: #10b981;
-  opacity: 1;
-  font-weight: bold;
 }
 
 .tp__unread {
