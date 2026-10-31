@@ -18,7 +18,7 @@ use std::time::Instant;
 /// "no opinion" and snapshots; only an explicit `Some(false)` opts out. App
 /// settings live in exactly one place (the frontend), as everywhere else in
 /// this codebase, so Rust never reads them itself.
-fn snapshot_before(
+pub(crate) fn snapshot_before(
     cwd: &str,
     enabled: Option<bool>,
     kind: &str,
@@ -134,17 +134,24 @@ pub(crate) async fn git_commit(
     message: String,
     identity_name: Option<String>,
     identity_email: Option<String>,
+    identity_signing_key: Option<String>,
 ) -> Result<String, String> {
     let _repo = repo_lock::write(&cwd);
     let _t0 = Instant::now();
     let mut cmd = git_cmd();
-    // Inject identity overrides before the `commit` sub-command so git sees them.
-    if let (Some(ref name), Some(ref email)) = (&identity_name, &identity_email) {
-        if !name.is_empty() && !email.is_empty() {
-            cmd.arg("-c")
-                .arg(format!("user.name={}", name))
-                .arg("-c")
-                .arg(format!("user.email={}", email));
+    // Inject identity overrides before the `commit` sub-command so git sees
+    // them. The profile's signing key goes with them: the overridden email
+    // signed with the global key shows as Unverified on the forges.
+    let name = identity_name.as_deref().map(str::trim).unwrap_or("");
+    let email = identity_email.as_deref().map(str::trim).unwrap_or("");
+    if !name.is_empty() && !email.is_empty() {
+        cmd.arg("-c")
+            .arg(format!("user.name={}", name))
+            .arg("-c")
+            .arg(format!("user.email={}", email));
+        let key = identity_signing_key.as_deref().map(str::trim).unwrap_or("");
+        if !key.is_empty() {
+            cmd.arg("-c").arg(format!("user.signingkey={}", key));
         }
     }
     let output = cmd
@@ -414,12 +421,48 @@ pub(crate) async fn git_split_commit(
 
 // ─── Git push / pull / merge ─────────────────────────────────
 
+/// Build `--force-with-lease=refs/heads/<branch>:<sha>`: the push is refused
+/// unless the remote branch still sits exactly on `sha`. Both parts are
+/// validated — the sha must be a full hex object name, the branch free of
+/// characters git forbids in ref names (and of a leading `-`).
+fn force_with_lease_arg(branch: &str, sha: &str) -> Result<String, String> {
+    let sha_ok = matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit());
+    if !sha_ok {
+        return Err("invalid lease sha".to_string());
+    }
+    let branch_ok = !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.ends_with('.')
+        && !branch.contains("..")
+        && !branch.contains("//")
+        && !branch.contains("@{")
+        && !branch
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c));
+    if !branch_ok {
+        return Err("invalid lease branch".to_string());
+    }
+    Ok(format!("--force-with-lease=refs/heads/{}:{}", branch, sha))
+}
+
 #[tauri::command]
 pub(crate) async fn git_push(
     cwd: String,
     set_upstream: Option<bool>,
     force: Option<bool>,
+    lease_branch: Option<String>,
+    lease_sha: Option<String>,
 ) -> Result<GitPushPullResult, String> {
+    // Explicit lease (branch + the remote tip the user was shown). Validated
+    // before anything runs: a malformed value must never degrade into a bare
+    // `--force-with-lease`, which trusts whatever the last fetch brought in.
+    let lease_arg = match (lease_branch.as_deref(), lease_sha.as_deref()) {
+        (None, None) => None,
+        (Some(branch), Some(sha)) => Some(force_with_lease_arg(branch, sha)?),
+        _ => return Err("lease_branch and lease_sha must be given together".to_string()),
+    };
     // Shared guard: push is network-bound and touches only refs, not the
     // index/worktree, so it need not exclude reads — but it must not overlap a
     // writer (checkout/pull/rebase) mutating the refs it is about to publish.
@@ -429,7 +472,10 @@ pub(crate) async fn git_push(
         args.extend(["--set-upstream", "origin", "HEAD"]);
     }
     if force.unwrap_or(false) {
-        args.push("--force-with-lease");
+        match lease_arg.as_deref() {
+            Some(lease) => args.push(lease),
+            None => args.push("--force-with-lease"),
+        }
     }
     let _t0 = Instant::now();
     let output = git_cmd()
@@ -620,6 +666,173 @@ pub(crate) async fn git_pull(
         },
         conflicts: None,
     })
+}
+
+// ─── Auto fast-forward (opt-in, background) ────────────────────
+
+/// Outcome of `git_fast_forward_to_upstream`. `reason` uses the same keys as
+/// the TypeScript `AutoFfBlockReason` (`detached`, `noUpstream`, `operation`,
+/// `conflicts`, `localCommits`, `trackedEdits`, `gitRefused`) plus `upToDate`
+/// for "nothing to do". A refusal is a normal result, never an `Err`: the
+/// caller is a background action and must not raise a modal.
+#[derive(serde::Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FastForwardResult {
+    pub fast_forwarded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    /// Commits the branch advanced by (or was behind by when refused).
+    pub behind: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+fn ff_refused(reason: &str, behind: u32) -> FastForwardResult {
+    FastForwardResult {
+        fast_forwarded: false,
+        reason: Some(reason.to_string()),
+        stderr: None,
+        behind,
+        branch: None,
+    }
+}
+
+/// Porcelain v1 XY codes of an unmerged path.
+const FF_UNMERGED: &[&str] = &["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
+
+/// Re-check, then fast-forward. Caller holds the repo write lock.
+///
+/// Conditions are evaluated in a fixed order and the first failing one is the
+/// reported reason (same order as `evaluateAutoFastForward` in the frontend,
+/// minus `busy`, which only the frontend can know). The sole write is
+/// `merge --ff-only`: it cannot create a merge commit, rebase or stash.
+pub(crate) fn fast_forward_to_upstream_locked(cwd: &str) -> Result<FastForwardResult, String> {
+    let run = |args: &[&str]| -> Result<std::process::Output, String> {
+        git_cmd()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| format!("Failed to run git {}: {}", args.join(" "), e))
+    };
+
+    // An operation in progress: merge, rebase, cherry-pick, revert, bisect.
+    // Checked first: a rebase detaches HEAD, and "a rebase is running" is the
+    // cause worth naming, not the "detached" it produces.
+    let git_dir = resolve_git_dir(cwd)?;
+    if [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+    ]
+    .iter()
+    .any(|f| git_dir.join(f).exists())
+    {
+        return Ok(ff_refused("operation", 0));
+    }
+
+    if !run(&["symbolic-ref", "-q", "HEAD"])?.status.success() {
+        return Ok(ff_refused("detached", 0));
+    }
+    let up = run(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ])?;
+    if !up.status.success() || String::from_utf8_lossy(&up.stdout).trim().is_empty() {
+        return Ok(ff_refused("noUpstream", 0));
+    }
+
+    let counts = run(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])?;
+    let (mut ahead, mut behind) = (0u32, 0u32);
+    if counts.status.success() {
+        let text = String::from_utf8_lossy(&counts.stdout).to_string();
+        let mut it = text
+            .split_whitespace()
+            .map(|n| n.parse::<u32>().unwrap_or(0));
+        ahead = it.next().unwrap_or(0);
+        behind = it.next().unwrap_or(0);
+    }
+    if behind == 0 {
+        return Ok(ff_refused("upToDate", 0));
+    }
+
+    // `--no-optional-locks`: this runs on a background tick and must not
+    // rewrite the index (see the note in useRepoPoller).
+    let status = run(&[
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+    ])?;
+    let status_out = String::from_utf8_lossy(&status.stdout).to_string();
+    let mut tracked_edits = !status.status.success(); // unreadable is not "clean"
+    let mut conflicts = false;
+    for line in status_out.lines().filter(|l| l.len() >= 3) {
+        tracked_edits = true;
+        if FF_UNMERGED.contains(&&line[..2]) {
+            conflicts = true;
+        }
+    }
+    if conflicts {
+        return Ok(ff_refused("conflicts", behind));
+    }
+    if ahead > 0 {
+        return Ok(ff_refused("localCommits", behind));
+    }
+    if tracked_edits {
+        return Ok(ff_refused("trackedEdits", behind));
+    }
+
+    let branch = run(&["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|b| !b.is_empty());
+    let merge = run(&["merge", "--ff-only", "--no-stat", "@{upstream}"])?;
+    if merge.status.success() {
+        return Ok(FastForwardResult {
+            fast_forwarded: true,
+            reason: None,
+            stderr: None,
+            behind,
+            branch,
+        });
+    }
+    let stderr = String::from_utf8_lossy(&merge.stderr).trim().to_string();
+    Ok(FastForwardResult {
+        fast_forwarded: false,
+        reason: Some("gitRefused".to_string()),
+        stderr: Some(if stderr.is_empty() {
+            String::from_utf8_lossy(&merge.stdout).trim().to_string()
+        } else {
+            stderr
+        }),
+        behind,
+        branch,
+    })
+}
+
+/// Opt-in auto fast-forward (background, after the periodic fetch).
+///
+/// Takes the repo write lock, re-checks every repo-side condition under it,
+/// and only then runs `git merge --ff-only --no-stat @{upstream}`. Holding the
+/// lock is the point: multi-step write commands (snapshot then reset, …)
+/// serialize on it, and a background merge must not interleave inside one.
+#[tauri::command]
+pub(crate) async fn git_fast_forward_to_upstream(cwd: String) -> Result<FastForwardResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let canon = safe_repo_path(cwd.trim(), ".").map_err(|e| format!("invalid cwd: {e}"))?;
+        let canon = canon.to_str().ok_or("cwd is not valid UTF-8")?.to_string();
+        let _repo = repo_lock::write(&cwd);
+        fast_forward_to_upstream_locked(&canon)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─── Git rebase ────────────────────────────────────────────────
@@ -1023,7 +1236,7 @@ pub(crate) async fn git_branches(
             // KEEP IN SYNC with the same format/parse in dev-server.mjs
             // (handleRequest branch listing). Field order is positional — any
             // field add/reorder must be mirrored there and in the parser below.
-            &format!("--format=%(HEAD)%(refname:short)\x1f%(upstream:short)\x1f%(upstream:track,nobracket)\x1f%(objectname:short) %(subject)\x1f%(committerdate:iso-strict)\x1f%(ahead-behind:{})", main_name),
+            &format!("--format=%(HEAD)%(refname)\x1f%(upstream:short)\x1f%(upstream:track,nobracket)\x1f%(objectname:short) %(subject)\x1f%(committerdate:iso-strict)\x1f%(ahead-behind:{})\x1f%(symref)", main_name),
         ])
         .current_dir(&cwd)
         .output()
@@ -1052,7 +1265,7 @@ pub(crate) async fn git_branches(
             continue;
         }
 
-        let name = parts[0].to_string();
+        let full_ref = parts[0];
         let upstream = if parts[1].is_empty() {
             None
         } else {
@@ -1098,15 +1311,22 @@ pub(crate) async fn git_branches(
             0
         };
 
-        if name.contains("HEAD ->") || name == "origin/HEAD" {
+        // Skip symbolic refs (`refs/remotes/<remote>/HEAD`) — not branches.
+        if parts.get(6).is_some_and(|s| !s.is_empty()) {
             continue;
         }
 
-        let is_remote = name.starts_with("origin/") || name.starts_with("remotes/");
-        let clean_name = if name.starts_with("remotes/") {
-            name.strip_prefix("remotes/").unwrap_or(&name).to_string()
-        } else {
-            name.clone()
+        // Classify from the full refname (any remote, not only "origin") and
+        // strip it to the display name: refs/heads/x → x, refs/remotes/o/x → o/x.
+        let (clean_name, is_remote) = match full_ref.strip_prefix("refs/remotes/") {
+            Some(n) => (n.to_string(), true),
+            None => (
+                full_ref
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(full_ref)
+                    .to_string(),
+                false,
+            ),
         };
 
         main_counts.insert(clean_name.clone(), main_count);
@@ -1498,10 +1718,20 @@ pub(crate) async fn git_stash_show(cwd: String, index: usize) -> Result<String, 
 pub(crate) async fn git_cherry_pick(
     cwd: String,
     hashes: Vec<String>,
+    no_commit: Option<bool>,
 ) -> Result<GitPushPullResult, String> {
     let _repo = repo_lock::write(&cwd);
     let git = git_binary();
     let mut args = vec!["cherry-pick".to_string()];
+    // `--no-commit` lands the picked changes in the index and working tree
+    // instead of committing them ("cherry-pick as WIP"), so the user can
+    // reshape them before committing. Git records no CHERRY_PICK_HEAD in this
+    // mode, so there is no operation left in progress afterwards — even on a
+    // conflict: the conflicted files are left to resolve as plain WIP, and
+    // `cherry-pick --continue/--abort` has nothing to act on.
+    if no_commit.unwrap_or(false) {
+        args.push("--no-commit".to_string());
+    }
     args.extend(hashes);
 
     let _t0 = Instant::now();
@@ -1568,6 +1798,51 @@ pub(crate) async fn git_checkout_commit(
     Ok(snapshot)
 }
 
+/// Prefix of the error `git_reset_to_commit` returns when `--keep` refuses
+/// because a local edit would be overwritten. What follows is the blocking
+/// paths, one per line; the frontend turns it into a translated message.
+pub(crate) const RESET_KEEP_BLOCKED_PREFIX: &str = "reset-keep-blocked:";
+
+/// Paths git named when `reset --keep` refused, or None when the failure is
+/// something else. Understands both the `Entry '…' not uptodate` and the
+/// `Your local changes to the following files would be overwritten` forms.
+fn reset_keep_blocked_files(stderr: &str) -> Option<Vec<String>> {
+    let mut files: Vec<String> = Vec::new();
+    let mut blocked = false;
+    let mut in_list = false;
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_prefix("error: Entry '") {
+            if let Some(end) = rest.rfind("' ") {
+                blocked = true;
+                in_list = false;
+                files.push(rest[..end].to_string());
+                continue;
+            }
+        }
+        if line.starts_with("error: Your local changes to the following files would be overwritten")
+            || line.starts_with(
+                "error: The following untracked working tree files would be overwritten",
+            )
+        {
+            blocked = true;
+            in_list = true;
+            continue;
+        }
+        if in_list {
+            if let Some(path) = line.strip_prefix('\t') {
+                files.push(path.to_string());
+            } else {
+                in_list = false;
+            }
+        }
+    }
+    if blocked {
+        Some(files)
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn git_reset_to_commit(
     cwd: String,
@@ -1575,6 +1850,13 @@ pub(crate) async fn git_reset_to_commit(
     mode: String,
     snapshots_enabled: Option<bool>,
 ) -> Result<Option<crate::git::snapshot::SnapshotMeta>, String> {
+    let flag = match mode.as_str() {
+        "soft" => "--soft",
+        "mixed" => "--mixed",
+        "hard" => "--hard",
+        "keep" => "--keep",
+        other => return Err(format!("Unknown reset mode: {}", other)),
+    };
     let _repo = repo_lock::write(&cwd);
     let snapshot = snapshot_before(
         &cwd,
@@ -1582,15 +1864,15 @@ pub(crate) async fn git_reset_to_commit(
         "reset",
         &format!("Reset {} to {}", mode, sha),
     );
-    let flag = match mode.as_str() {
-        "soft" => "--soft",
-        "hard" => "--hard",
-        _ => "--mixed",
-    };
     let _t0 = Instant::now();
-    let output = git_cmd()
-        .args(["reset", flag, &sha])
-        .current_dir(&cwd)
+    let mut cmd = git_cmd();
+    cmd.args(["reset", flag, &sha]).current_dir(&cwd);
+    if flag == "--keep" {
+        // The --keep stderr parser matches git's English wording, so pin the
+        // locale there only; other modes keep the user's translated messages.
+        cmd.env("LC_ALL", "C").env("LANGUAGE", "");
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to reset: {}", e))?;
     record_cmd(
@@ -1600,11 +1882,13 @@ pub(crate) async fn git_reset_to_commit(
         output.status.code().unwrap_or(-1),
     );
     if !output.status.success() {
-        return Err(format!(
-            "git reset {} failed: {}",
-            flag,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if flag == "--keep" {
+            if let Some(files) = reset_keep_blocked_files(&stderr) {
+                return Err(format!("{}{}", RESET_KEEP_BLOCKED_PREFIX, files.join("\n")));
+            }
+        }
+        return Err(format!("git reset {} failed: {}", flag, stderr));
     }
     Ok(snapshot)
 }
@@ -4738,6 +5022,96 @@ pub(crate) async fn open_in_editor(
     Ok(())
 }
 
+// ─── Reveal in the OS file manager (Files view, v3.11.2) ─────
+
+/// What `reveal_in_file_manager` opens, after `safe_repo_path`: a path that
+/// exists inside the repo. A symlink leading out of the repo canonicalizes
+/// outside it and is refused like any other escape.
+fn reveal_target(cwd: &str, path: &str) -> Result<std::path::PathBuf, String> {
+    let full = safe_repo_path(cwd, path)?;
+    if !full.exists() {
+        return Err(format!("Path not found: {}", path));
+    }
+    Ok(full)
+}
+
+/// The forge tokens `hidden_cmd` hands to every child (for `gh`/`glab`). A
+/// file manager has no use for them, so reveal strips them (AGENTS.md: pass
+/// only the env a child process needs).
+const FORGE_TOKEN_VARS: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "GITLAB_ACCESS_TOKEN",
+];
+
+fn strip_forge_tokens(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for var in FORGE_TOKEN_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Show a working-tree path in the OS file manager. macOS and Windows select
+/// the item; Linux has no portable "select", so it opens the parent folder
+/// through the same opener chain as `open_url` (AppImage-safe env, exit
+/// status checked).
+#[tauri::command]
+pub(crate) async fn reveal_in_file_manager(cwd: String, path: String) -> Result<(), String> {
+    let target = reveal_target(&cwd, &path)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        strip_forge_tokens(&mut hidden_cmd("open"))
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("Failed to reveal {}: {}", path, e))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // `canonicalize` yields a verbatim `\\?\C:\…` path, which Explorer
+        // does not understand.
+        let raw = target.to_string_lossy().to_string();
+        let plain = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{}", rest)
+        } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            raw
+        };
+        // Explorer parses its own command line: `/select,` must be followed by
+        // the quoted path inside the same argument, which `arg()` would wrap
+        // in quotes as a whole. A Windows path cannot contain `"`.
+        strip_forge_tokens(&mut hidden_cmd("explorer"))
+            .raw_arg(format!("/select,\"{}\"", plain))
+            .spawn()
+            .map_err(|e| format!("Failed to reveal {}: {}", path, e))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = target.parent().unwrap_or(&target).to_path_buf();
+        let openers: [(&str, &[&str]); 3] =
+            [("xdg-open", &[]), ("gio", &["open"]), ("kde-open5", &[])];
+        let mut errors: Vec<String> = Vec::new();
+        for (bin, prefix) in openers {
+            let mut cmd = hidden_cmd(bin);
+            strip_forge_tokens(&mut cmd).args(prefix).arg(&dir);
+            sanitize_appimage_search_paths(&mut cmd);
+            match try_open_linux(cmd, bin) {
+                Ok(()) => return Ok(()),
+                Err(e) => errors.push(e),
+            }
+        }
+        Err(format!("Failed to reveal {}: {}", path, errors.join("; ")))
+    }
+}
+
 // ─── Transparent command log ──────────────────────────────────
 
 #[tauri::command]
@@ -5452,6 +5826,59 @@ mod default_branch_setting_tests {
     }
 
     #[test]
+    fn git_branches_skips_remote_head_symref() {
+        let repo = TempRepo::new_trunk();
+        let bare = make_bare_remote("gitwand-remote-head-bare");
+        repo.git_ok(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        repo.git_ok(&["push", "-q", "-u", "origin", "trunk"]);
+        // Creates refs/remotes/origin/HEAD -> origin/trunk, which
+        // `%(refname:short)` renders as the bare "origin".
+        repo.git_ok(&["remote", "set-head", "origin", "trunk"]);
+
+        let branches = tauri::async_runtime::block_on(git_branches(repo.cwd(), None))
+            .expect("git_branches must succeed");
+        assert!(
+            !branches
+                .iter()
+                .any(|b| b.name == "origin" || b.name == "origin/HEAD"),
+            "remote HEAD symref must not be listed as a branch: {:?}",
+            branches.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        assert!(branches
+            .iter()
+            .any(|b| b.is_remote && b.name == "origin/trunk"));
+
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn git_branches_flags_non_origin_remote_branches_as_remote() {
+        let repo = TempRepo::new_trunk();
+        let bare = make_bare_remote("gitwand-upstream-remote-bare");
+        repo.git_ok(&["remote", "add", "upstream", bare.to_str().unwrap()]);
+        repo.git_ok(&["push", "-q", "upstream", "trunk"]);
+        repo.git_ok(&["fetch", "-q", "upstream"]);
+
+        let branches = tauri::async_runtime::block_on(git_branches(repo.cwd(), None))
+            .expect("git_branches must succeed");
+        let up = branches
+            .iter()
+            .find(|b| b.name == "upstream/trunk")
+            .expect("upstream/trunk listed");
+        assert!(
+            up.is_remote,
+            "branch of a non-origin remote must be flagged remote"
+        );
+        let local = branches
+            .iter()
+            .find(|b| b.name == "trunk")
+            .expect("trunk listed");
+        assert!(!local.is_remote);
+
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
     fn git_branch_top_authors_no_longer_fails_when_mainline_is_not_main_or_master() {
         let repo = TempRepo::new_trunk();
         repo.git_ok(&["checkout", "-q", "-b", "feature"]);
@@ -5780,6 +6207,83 @@ mod snapshot_hook_tests {
     }
 
     #[test]
+    fn keep_reset_moves_head_and_preserves_unrelated_local_edit() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.write("b.txt", "b1\n");
+        repo.commit_all("c1");
+        repo.write("a.txt", "v2\n");
+        repo.commit_all("c2");
+        // Local edit on a file the reset does not touch.
+        repo.write("b.txt", "local edit\n");
+
+        tauri::async_runtime::block_on(git_reset_to_commit(
+            repo.cwd(),
+            "HEAD~1".to_string(),
+            "keep".to_string(),
+            Some(false),
+        ))
+        .expect("keep reset should succeed");
+
+        assert_eq!(repo.read("a.txt"), "v1\n");
+        assert_eq!(repo.read("b.txt"), "local edit\n");
+    }
+
+    #[test]
+    fn keep_reset_refuses_and_discards_nothing_when_an_edit_would_be_overwritten() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("c1");
+        repo.write("a.txt", "v2\n");
+        repo.commit_all("c2");
+        repo.write("a.txt", "local edit\n");
+        let head_before = repo.git(&["rev-parse", "HEAD"]).stdout;
+
+        let err = tauri::async_runtime::block_on(git_reset_to_commit(
+            repo.cwd(),
+            "HEAD~1".to_string(),
+            "keep".to_string(),
+            Some(false),
+        ))
+        .expect_err("keep reset must refuse");
+
+        assert!(
+            err.starts_with(RESET_KEEP_BLOCKED_PREFIX),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("a.txt"), "must name the file: {err}");
+        assert_eq!(repo.read("a.txt"), "local edit\n");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).stdout, head_before);
+    }
+
+    #[test]
+    fn reset_rejects_an_unknown_mode() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        repo.commit_all("c1");
+        let err = tauri::async_runtime::block_on(git_reset_to_commit(
+            repo.cwd(),
+            "HEAD".to_string(),
+            "bogus".to_string(),
+            Some(false),
+        ))
+        .expect_err("unknown mode must be refused");
+        assert!(err.contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn reset_keep_blocked_files_parses_git_stderr() {
+        let a = "error: Entry 'a.txt' not uptodate. Cannot merge.\nfatal: Could not reset index file to revision 'HEAD~1'.\n";
+        assert_eq!(reset_keep_blocked_files(a), Some(vec!["a.txt".to_string()]));
+        let b = "error: Your local changes to the following files would be overwritten by reset:\n\tx/y.txt\n\tz.txt\nPlease commit your changes or stash them before you reset.\nAborting\n";
+        assert_eq!(
+            reset_keep_blocked_files(b),
+            Some(vec!["x/y.txt".to_string(), "z.txt".to_string()])
+        );
+        assert_eq!(reset_keep_blocked_files("fatal: bad revision 'zz'\n"), None);
+    }
+
+    #[test]
     fn switch_branch_takes_a_snapshot_first() {
         let repo = TempRepo::new();
         repo.write("a.txt", "v1\n");
@@ -6003,5 +6507,118 @@ mod operation_action_tests {
         assert!(operation_action_args("merge", "quit").is_err());
         // An argument that would be read as an option must never reach git.
         assert!(operation_action_args("--upload-pack=evil", "abort").is_err());
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::{reveal_target, strip_forge_tokens, FORGE_TOKEN_VARS};
+
+    #[test]
+    fn strip_forge_tokens_removes_every_forge_token_from_the_child_env() {
+        let mut cmd = std::process::Command::new("true");
+        for var in FORGE_TOKEN_VARS {
+            cmd.env(var, "secret");
+        }
+        strip_forge_tokens(&mut cmd);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for var in FORGE_TOKEN_VARS {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(var), None)),
+                "{} still reaches the child",
+                var
+            );
+        }
+        assert_eq!(
+            FORGE_TOKEN_VARS,
+            [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GITLAB_TOKEN",
+                "GITLAB_ACCESS_TOKEN"
+            ]
+        );
+    }
+
+    fn temp_repo(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gitwand-reveal-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("a.rs"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn reveal_target_resolves_an_existing_path_inside_the_repo() {
+        let repo = temp_repo("ok");
+        let cwd = repo.to_string_lossy().to_string();
+        let target = reveal_target(&cwd, "src/a.rs").unwrap();
+        assert!(target.ends_with("src/a.rs"));
+        assert!(target.is_absolute());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn reveal_target_refuses_paths_outside_the_repo() {
+        let repo = temp_repo("escape");
+        let cwd = repo.to_string_lossy().to_string();
+        let err = reveal_target(&cwd, "../").unwrap_err();
+        assert!(err.contains("path escapes cwd"), "{err}");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(std::env::temp_dir(), repo.join("link-out")).unwrap();
+            let err = reveal_target(&cwd, "link-out").unwrap_err();
+            assert!(err.contains("path escapes cwd"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn reveal_target_reports_a_missing_path() {
+        let repo = temp_repo("missing");
+        let cwd = repo.to_string_lossy().to_string();
+        assert_eq!(
+            reveal_target(&cwd, "src/gone.rs").unwrap_err(),
+            "Path not found: src/gone.rs"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
+#[cfg(test)]
+mod force_with_lease_tests {
+    use super::force_with_lease_arg;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn builds_an_explicit_lease() {
+        assert_eq!(
+            force_with_lease_arg("feat/x", SHA).unwrap(),
+            format!("--force-with-lease=refs/heads/feat/x:{SHA}")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_sha() {
+        assert!(force_with_lease_arg("feat", "HEAD").is_err());
+        assert!(force_with_lease_arg("feat", &SHA[..39]).is_err());
+        assert!(force_with_lease_arg("feat", &SHA.replace('0', "g")).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_branch() {
+        for b in [
+            "", "-f", "a b", "a:b", "a..b", "a~1", "a\\b", "a\nb", "x/", "a@{1}",
+        ] {
+            assert!(force_with_lease_arg(b, SHA).is_err(), "{b:?}");
+        }
     }
 }

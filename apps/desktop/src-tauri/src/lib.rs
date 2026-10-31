@@ -106,11 +106,12 @@ compile_error!(
 
 // `strip_claude_auth_env` + `resolve_claude_binary` + `resolve_codex_binary`
 // + `resolve_opencode_binary` + `resolve_copilot_binary`
-// + `resolve_antigravity_binary` + 12 AI CLI commands
+// + `resolve_antigravity_binary` + 15 AI CLI commands
 // (detect_claude_cli, claude_cli_prompt, detect_codex_cli, codex_cli_prompt,
+// codex_list_models,
 // claude_cli_login, detect_opencode_cli, opencode_cli_prompt,
-// opencode_list_models, detect_copilot_cli, copilot_cli_prompt,
-// detect_antigravity_cli, antigravity_cli_prompt)
+// opencode_list_models, detect_copilot_cli, copilot_cli_prompt, copilot_list_models,
+// detect_antigravity_cli, antigravity_cli_prompt, antigravity_list_models)
 // migrated to `src/commands/ai.rs` (§3.4f).
 // Handler entries below route to `commands::ai::*`.
 
@@ -234,6 +235,12 @@ pub fn git_diff_parity(cwd: String, path: String, staged: bool) -> Result<types:
     tauri::async_runtime::block_on(commands::read::git_diff(cwd, path, staged))
 }
 
+/// Parity entry point for `git_show` (multi-file commit diff). Same
+/// reasoning as `git_diff_parity`.
+pub fn git_show_parity(cwd: String, hash: String) -> Result<Vec<types::GitDiff>, String> {
+    tauri::async_runtime::block_on(commands::read::git_show(cwd, hash))
+}
+
 pub fn git_branches_parity(cwd: String) -> Result<Vec<types::GitBranch>, String> {
     tauri::async_runtime::block_on(commands::ops::git_branches(cwd, None))
 }
@@ -255,6 +262,18 @@ pub fn git_blame_parity(
 /// loaded it fine, so QA could not reproduce it (issue #188).
 pub fn read_file_parity(cwd: String, path: String) -> Result<String, String> {
     tauri::async_runtime::block_on(commands::files::read_file(cwd, path))
+}
+
+/// Parity entry point for `list_repo_dir` (v3.11.2). Rust classifies ignored
+/// entries in process with libgit2; the dev-server shells out to
+/// `git check-ignore`. Two mechanisms answering one question is exactly what
+/// parity coverage exists for.
+pub fn list_repo_dir_parity(
+    cwd: String,
+    dir: String,
+    include_ignored: bool,
+) -> Result<types::RepoDirListing, String> {
+    tauri::async_runtime::block_on(commands::files::list_repo_dir(cwd, dir, include_ignored))
 }
 
 /// Parity entry points for the three Conflict Predictor commands. Until
@@ -325,6 +344,7 @@ pub fn command_parity(
         "git_cherry_pick" => tauri::async_runtime::block_on(commands::ops::git_cherry_pick(
             s("cwd")?,
             vec![s("hash")?],
+            None,
         ))
         .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
         "git_revert_commit" => tauri::async_runtime::block_on(commands::ops::git_revert_commit(
@@ -378,6 +398,7 @@ pub fn command_parity(
             s("message")?,
             None,
             None,
+            None,
         ))
         .map(parity_ok_marker),
         "git_create_branch" => tauri::async_runtime::block_on(commands::ops::git_create_branch(
@@ -403,6 +424,10 @@ pub fn command_parity(
             Some(false),
         ))
         .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
+        "git_fast_forward_to_upstream" => {
+            tauri::async_runtime::block_on(commands::ops::git_fast_forward_to_upstream(s("cwd")?))
+                .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
+        }
         "git_stage" => {
             tauri::async_runtime::block_on(commands::ops::git_stage(s("cwd")?, vec![s("path")?]))
                 .map(parity_ok_marker)
@@ -410,6 +435,41 @@ pub fn command_parity(
         "git_unstage" => {
             tauri::async_runtime::block_on(commands::ops::git_unstage(s("cwd")?, vec![s("path")?]))
                 .map(parity_ok_marker)
+        }
+        "git_file_log" => tauri::async_runtime::block_on(commands::read::git_file_log(
+            s("cwd")?,
+            s("path")?,
+            args.get("count").and_then(|v| v.as_u64()).map(|n| n as u32),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_file_diff" => tauri::async_runtime::block_on(commands::read::git_file_diff(
+            s("cwd")?,
+            s("path")?,
+            s("fromHash")?,
+            s("toHash")?,
+            s("fromPath").ok(),
+            s("toPath").ok(),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_tracked_ignored" => tauri::async_runtime::block_on(
+            commands::tracked_ignored::git_tracked_ignored(s("cwd")?),
+        )
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_untrack_paths" => {
+            let paths: Vec<String> = args
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or_else(|| "missing required arg 'paths' for git_untrack_paths".to_string())?;
+            tauri::async_runtime::block_on(commands::tracked_ignored::git_untrack_paths(
+                s("cwd")?,
+                paths,
+            ))
+            .map(parity_ok_marker)
         }
         "git_stage_patch" => {
             tauri::async_runtime::block_on(commands::ops::git_stage_patch(s("cwd")?, s("patch")?))
@@ -613,41 +673,24 @@ fn get_or_create_install_id() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // On some Linux setups (VMs, older Mesa drivers, missing GPU passthrough)
-    // WebKitGTK fails to create a hardware-accelerated EGL context and
-    // aborts the whole process with `Could not create default EGL display:
-    // EGL_BAD_PARAMETER. Aborting...` before any window is ever shown —
-    // reported as a terminal-visible abort on Ubuntu 26.04 (#135) and as a
-    // silent "app won't open" when launched from a .deb-installed GUI
-    // launcher on Linux Mint 22 (#139). These env vars must be set before
-    // the webview is created (WebKitGTK reads them at that point), so this
-    // has to run before `tauri::Builder::default()...run(...)` below.
-    // Forcing software rendering here lets the app degrade gracefully
-    // instead of aborting. No-op on macOS/Windows.
+    // Linux renders with the GPU. Setups where WebKitGTK can't get an EGL
+    // display abort at startup (#135, #139); a launch sentinel detects that and
+    // switches the next launch to software rendering. Deprecation note and
+    // details in commands/render_fallback.rs.
     #[cfg(target_os = "linux")]
-    {
-        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    commands::render_fallback::prepare_launch();
+
+    // WebKitGTK's DMA-BUF renderer is always turned off, GPU or not: on NVIDIA
+    // under Wayland it kills the process at startup with `Error 71 (Protocol
+    // error) dispatching to Wayland display`. Rendering stays on the GPU; only
+    // the hand-off of finished frames goes through shared memory. Tried and
+    // rejected on an RTX 3090 / Wayland: `__NV_DISABLE_EXPLICIT_SYNC=1` (no
+    // crash, but the window flickers non-stop) and `GDK_BACKEND=x11` (window
+    // does not come up properly). Never override a value the user set
+    // deliberately.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        // #135 follow-up: the two vars above only steer WebKitGTK's compositing
-        // path, not EGL *display acquisition* itself — force Mesa's software
-        // rasterizer as a broader fallback for systems where EGL_BAD_PARAMETER
-        // originates earlier (e.g. native Wayland/Gnome). Never override a value
-        // the user or environment already set deliberately.
-        if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
-            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-        }
-        // #135 follow-up 2: LIBGL_ALWAYS_SOFTWARE forces the GL renderer once an
-        // EGL context exists, but doesn't help when the failure happens earlier,
-        // at EGL *platform display* acquisition under native Wayland. Confirmed
-        // via `ldd` from an affected user that this isn't an AppImage-bundled-library
-        // issue (EGL/GL/Mesa all resolved to the host system, not the bundle) but a
-        // genuine native-Wayland EGL negotiation failure. Forcing GTK onto XWayland
-        // sidesteps that negotiation entirely, at the cost of native Wayland's
-        // fractional scaling and lower input latency. Never override a value the
-        // user or environment already set deliberately.
-        if std::env::var("GDK_BACKEND").is_err() {
-            std::env::set_var("GDK_BACKEND", "x11");
-        }
     }
 
     // macOS GUI apps launched from Finder/Dock get a minimal launchd env
@@ -677,11 +720,22 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // Tag the window title in dev builds so a `tauri dev` window can be
+            // told apart from an installed GitWand. Compiled out of release builds.
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(title) = window.title() {
+                    let _ = window.set_title(&format!("{} (DEV)", title));
+                }
+            }
+
             // Register Cmd+Shift+G (macOS) / Ctrl+Shift+G (Linux/Windows)
             // to bring GitWand to the foreground from anywhere.
+            // Non-fatal: another process may already own the hotkey (e.g. a
+            // prod GitWand running next to `tauri dev`, or an unrelated app).
             use tauri_plugin_global_shortcut::ShortcutState;
             let handle = app.handle().clone();
-            app.global_shortcut().on_shortcut(
+            if let Err(e) = app.global_shortcut().on_shortcut(
                 "CmdOrCtrl+Shift+G",
                 move |_app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {
@@ -695,7 +749,12 @@ pub fn run() {
                         let _ = handle.emit("global-shortcut-activate", ());
                     }
                 },
-            )?;
+            ) {
+                eprintln!(
+                    "[gitwand] global shortcut CmdOrCtrl+Shift+G not registered: {}",
+                    e
+                );
+            }
 
             // Anonymous launch telemetry via Aptabase — fire-and-forget.
             // Replaced Umami: Umami Cloud filters non-browser User-Agents and
@@ -707,8 +766,9 @@ pub fn run() {
             // auto-captures OS, app version and locale, so only install_id is
             // sent as a custom property. track_event runs in the background.
             // Skipped unless built with --features telemetry.
+            // Honours the user's opt-out and DO_NOT_TRACK (commands/telemetry.rs).
             #[cfg(feature = "telemetry")]
-            {
+            if commands::telemetry::telemetry_allowed() {
                 let install_id = get_or_create_install_id();
                 let _ = app.track_event(
                     "launch",
@@ -730,12 +790,15 @@ pub fn run() {
             commands::files::folder_diff,
             commands::files::list_dir,
             commands::files::list_repo_tree,
+            commands::files::list_repo_dir,
             commands::secrets::scan_secrets,
             commands::read::git_status,
             commands::read::git_diff,
             commands::read::git_log,
             commands::ops::git_stage,
             commands::ops::git_unstage,
+            commands::tracked_ignored::git_tracked_ignored,
+            commands::tracked_ignored::git_untrack_paths,
             commands::ops::git_stage_patch,
             commands::ops::git_unstage_patch,
             commands::ops::git_commit,
@@ -743,6 +806,7 @@ pub fn run() {
             commands::ops::git_split_commit,
             commands::ops::git_push,
             commands::ops::git_pull,
+            commands::ops::git_fast_forward_to_upstream,
             commands::ops::git_fetch,
             commands::ops::git_merge,
             commands::ops::git_operation_action,
@@ -762,6 +826,7 @@ pub fn run() {
             commands::ops::git_stash_pop,
             commands::ops::open_in_editor,
             commands::ops::open_url,
+            commands::ops::reveal_in_file_manager,
             commands::ops::set_git_config,
             commands::ops::read_gitwandrc,
             commands::read::preview_merge,
@@ -805,7 +870,13 @@ pub fn run() {
             commands::gh::gh_add_reaction,
             commands::gh::gh_delete_reaction,
             commands::gh::gh_pr_ready,
+            commands::gh::gh_pr_edit,
             commands::gh::gh_dismiss_review,
+            commands::gh::gh_pr_review_threads,
+            commands::gh::gh_pr_create_comment,
+            commands::gh::gh_pr_update_comment,
+            commands::gh::gh_pr_delete_comment,
+            commands::gh::gh_set_review_thread_resolved,
             commands::gh::gh_request_reviewers,
             commands::gh::gh_fork_info,
             commands::github_api::github_device_start,
@@ -828,6 +899,7 @@ pub fn run() {
             commands::azure::az_enable_auto_merge,
             commands::azure::az_disable_auto_merge,
             commands::azure::az_pr_ready,
+            commands::azure::az_pr_edit,
             commands::azure::az_checkout_pr,
             commands::azure::az_pr_comments,
             commands::azure::az_pr_create_comment,
@@ -876,6 +948,7 @@ pub fn run() {
             commands::read::git_file_log,
             commands::read::git_file_log_pickaxe,
             commands::read::git_file_log_range,
+            commands::read::git_file_diff,
             commands::read::git_blame,
             commands::ops::git_checkout_commit,
             commands::ops::git_reset_to_commit,
@@ -900,13 +973,16 @@ pub fn run() {
             commands::ops::pr_files,
             commands::ai::detect_codex_cli,
             commands::ai::codex_cli_prompt,
+            commands::ai::codex_list_models,
             commands::ai::detect_opencode_cli,
             commands::ai::opencode_cli_prompt,
             commands::ai::opencode_list_models,
             commands::ai::detect_copilot_cli,
             commands::ai::copilot_cli_prompt,
+            commands::ai::copilot_list_models,
             commands::ai::detect_antigravity_cli,
             commands::ai::antigravity_cli_prompt,
+            commands::ai::antigravity_list_models,
             commands::network::check_remote_reachable,
             commands::gitlab::detect_glab,
             commands::gitlab::gl_list_mrs,
@@ -923,6 +999,7 @@ pub fn run() {
             commands::gitlab::gl_disable_auto_merge,
             commands::gitlab::gl_checkout_mr,
             commands::gitlab::gl_convert_draft_to_ready,
+            commands::gitlab::gl_mr_edit,
             commands::gitlab::gl_mr_notes,
             commands::gitlab::gl_mr_create_note,
             commands::gitlab::gl_mr_update_note,
@@ -942,6 +1019,13 @@ pub fn run() {
             commands::credentials::set_credential,
             commands::credentials::get_credential,
             commands::credentials::delete_credential,
+            commands::ai_http::ai_api_key_set,
+            commands::ai_http::ai_api_key_hint,
+            commands::ai_http::ai_http_request,
+            commands::telemetry::telemetry_get_state,
+            commands::telemetry::telemetry_set_enabled,
+            commands::render_fallback::software_rendering_get_state,
+            commands::render_fallback::software_rendering_set_enabled,
             // ── Bitbucket Cloud REST v2 ──
             commands::bitbucket::bb_list_prs,
             commands::bitbucket::bb_list_issues,
@@ -964,6 +1048,7 @@ pub fn run() {
             commands::bitbucket::bb_pr_ci_checks,
             commands::bitbucket::bb_pr_annotations,
             commands::bitbucket::bb_convert_draft_to_ready,
+            commands::bitbucket::bb_pr_edit,
             commands::gitea::gitea_current_user,
             commands::gitea::gitea_validate_token,
             commands::gitea::gitea_list_prs,
@@ -984,6 +1069,7 @@ pub fn run() {
             commands::gitea::gitea_merge_pr,
             commands::gitea::gitea_checkout_pr,
             commands::gitea::gitea_convert_draft_to_ready,
+            commands::gitea::gitea_pr_edit,
             // ── MCP catalog ──
             commands::mcp_catalog::mcp_detect_configs,
             commands::mcp_catalog::mcp_read_config,
@@ -995,6 +1081,7 @@ pub fn run() {
             commands::read::git_branch_merged,
             commands::read::git_config_identity,
             commands::read::git_commit_template_path,
+            commands::read::read_commit_template,
             // ── v2.21.0 Monorepo Scope ──
             commands::read::git_rev_count,
             commands::terminal::terminal_open,
@@ -1014,6 +1101,10 @@ pub fn run() {
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 commands::watcher::stop_all_for_webview(webview.label());
+            }
+            // The webview came up: this launch got past the EGL abort.
+            if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                commands::render_fallback::launch_succeeded();
             }
         })
         .on_window_event(|window, event| {
