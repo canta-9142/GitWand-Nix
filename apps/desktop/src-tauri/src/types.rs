@@ -194,6 +194,31 @@ pub struct RepoTreeResult {
     pub truncated: bool,
 }
 
+// ─── One working-tree directory (Files view, v3.11.2) ─────────────
+
+/// One entry of `list_repo_dir`. `path` is repo-relative with `/` separators.
+/// `ignored` means "matched by an ignore rule and not tracked". `size` is the
+/// byte length for files, and 0 for directories and symlinks, which are never
+/// followed. The preview reads it to refuse a huge file without reading it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoDirEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: String, // "file" | "dir" | "symlink"
+    pub ignored: bool,
+    pub size: u64,
+}
+
+/// Result of `list_repo_dir`. `truncated` is set when the directory had more
+/// than `MAX_REPO_DIR_ENTRIES` listable entries.
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoDirListing {
+    pub entries: Vec<RepoDirEntry>,
+    pub truncated: bool,
+}
+
 // ─── Directory listing types ──────────────────────────────────────
 
 #[derive(Serialize)]
@@ -274,6 +299,12 @@ pub struct BlameLine {
 
 #[derive(Serialize)]
 pub struct FileLogEntry {
+    /// The file's path at this commit, repo-root-relative, as `git log
+    /// --follow --name-only` reports it: the old name before a rename.
+    /// Only the `--follow` logs (`git_file_log`, `git_file_log_pickaxe`) set
+    /// it; omitted elsewhere, so existing payloads are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub hash_full: String,
     pub hash: String,
     pub author: String,
@@ -727,6 +758,15 @@ pub struct ScratchWorktree {
     pub created_at: u64,
 }
 
+/// Outcome of a successful merge-back: the task's changes are in the main
+/// checkout. Removing the scratch afterwards is best-effort; when it fails
+/// (locked worktree, Windows file lock) the merge still stands and the
+/// failure is reported here instead of as an error.
+#[derive(Serialize, Clone, Debug)]
+pub struct ScratchMergeBackOutcome {
+    pub cleanup_warning: Option<String>,
+}
+
 // ─── Claude CLI ────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -785,6 +825,23 @@ pub struct AntigravityCliInfo {
     pub logged_in: bool,
     pub status: String,
     pub detail: String,
+}
+
+/// One entry of `agy models`: the `--model` id and its human-readable name
+/// (e.g. `gemini-3.8-flash-high` / `Gemini 3.8 Flash (High)`).
+#[derive(Serialize)]
+pub struct AntigravityModel {
+    pub id: String,
+    pub name: String,
+}
+
+/// One entry of Codex's model catalog (`codex debug models`): the `--model`
+/// slug, its display name, and the reasoning efforts it accepts.
+#[derive(Serialize)]
+pub struct CodexModel {
+    pub id: String,
+    pub name: String,
+    pub efforts: Vec<String>,
 }
 
 // ─── Git hooks ─────────────────────────────────────────────────────

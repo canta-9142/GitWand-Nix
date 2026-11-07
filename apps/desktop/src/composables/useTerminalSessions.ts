@@ -5,6 +5,7 @@ import {
   terminalResize,
   terminalClose,
 } from "../utils/backend";
+import { isUnderPath } from "../utils/paths";
 
 export type TerminalShortcut = "new" | "close" | { switch: number } | null;
 
@@ -19,7 +20,28 @@ export function resolveTerminalShortcut(e: KeyboardEvent, focused: boolean): Ter
   return null;
 }
 
-export type TerminalTabType = "shell" | "claude" | "codex" | "opencode" | "antigravity";
+export type TerminalTabType = "shell" | "claude" | "codex" | "opencode" | "antigravity" | "setup";
+
+/**
+ * Opens a backend session for a tab in place of `terminalOpen` (a worktree
+ * hook's `worktreeRunHook`, for instance). Returns the session id.
+ */
+export type TabSpawner = (
+  onChunk: (chunk: string) => void,
+  onExit: (code: number | null) => void,
+) => Promise<number>;
+
+export interface OpenTabOptions {
+  shell?: string;
+  type?: TerminalTabType;
+  /** Tab title; defaults from the type. */
+  title?: string;
+  /** Input is never sent to the session (setup / teardown tabs). */
+  readOnly?: boolean;
+  spawn?: TabSpawner;
+  /** Called once, when the session ends; the tab is then marked dead. */
+  onExit?: (code: number | null) => void;
+}
 
 export interface TerminalTab {
   id: number; // id local (mémoire)
@@ -29,12 +51,19 @@ export interface TerminalTab {
   alive: boolean;
   type: TerminalTabType;
   hasUnread: boolean;
+  /** The directory the session was opened in: what `disposeCwd` matches. */
+  cwd: string;
+  /** Typing is not forwarded to the session. */
+  readOnly: boolean;
 }
 
 // État module (pattern store-composable, pas de Pinia).
 const tabsByRepo = reactive(new Map<string, TerminalTab[]>());
 const activeByRepo = reactive(new Map<string, number | null>());
 let nextLocalId = 1;
+// openTab calls still awaiting their PTY, by tab id: disposeRepo waits for
+// them, so no session spawned meanwhile outlives the repo's disposal.
+const opening = new Map<number, Promise<unknown>>();
 
 // Debounce refresh par repo.
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -63,6 +92,7 @@ export function __resetForTests(): void {
   tabsByRepo.clear();
   activeByRepo.clear();
   nextLocalId = 1;
+  opening.clear();
   for (const timer of debounceTimers.values()) clearTimeout(timer);
   debounceTimers.clear();
   firstPendingAt.clear();
@@ -83,17 +113,19 @@ export function useTerminalSessions() {
     repoPath: string,
     cwd: string,
     onChunk: (tabId: number, chunk: string) => void,
-    opts?: { shell?: string; type?: TerminalTabType },
+    opts?: OpenTabOptions,
   ): Promise<TerminalTab> {
     const tabType = opts?.type ?? "shell";
     const tab: TerminalTab = {
       id: nextLocalId++,
       sessionId: -1,
-      title: tabType === "claude" ? "Claude Code" : tabType === "codex" ? "Codex" : tabType === "opencode" ? "OpenCode" : tabType === "antigravity" ? "Antigravity" : "shell",
+      title: opts?.title ?? (tabType === "claude" ? "Claude Code" : tabType === "codex" ? "Codex" : tabType === "opencode" ? "OpenCode" : tabType === "antigravity" ? "Antigravity" : tabType === "setup" ? "setup" : "shell"),
       titleManual: false,
       alive: true,
       type: tabType,
       hasUnread: false,
+      cwd,
+      readOnly: opts?.readOnly ?? false,
     };
     const list = listFor(repoPath);
     list.push(tab);
@@ -101,24 +133,51 @@ export function useTerminalSessions() {
     // Taille initiale standard ; le panel re-fit au mount.
     // Route output by stable tab.id so chunks arriving before terminalOpen
     // resolves (and before sessionId is assigned) are never dropped.
+    const done = spawnInto(tab, list, repoPath, cwd, onChunk, opts);
+    opening.set(tab.id, done);
     try {
-      const sessionId = await terminalOpen(
-        cwd,
-        {
-          cols: 80,
-          rows: 24,
-          shell: opts?.shell || undefined,
-          // Agent tabs ("claude"/"codex") launch as a first-class agent CLI,
-          // never smuggled through the `shell` parameter.
-          agent: tabType !== "shell" ? tabType : undefined,
-        },
-        (chunk) => {
-          if (activeByRepo.get(repoPath) !== tab.id) {
-            tab.hasUnread = true;
-          }
-          onChunk(tab.id, chunk);
-        },
-      );
+      await done;
+    } finally {
+      opening.delete(tab.id);
+    }
+    return tab;
+  }
+
+  async function spawnInto(
+    tab: TerminalTab,
+    list: TerminalTab[],
+    repoPath: string,
+    cwd: string,
+    onChunk: (tabId: number, chunk: string) => void,
+    opts?: OpenTabOptions,
+  ): Promise<void> {
+    const tabType = tab.type;
+    const onOutput = (chunk: string) => {
+      if (activeByRepo.get(repoPath) !== tab.id) {
+        tab.hasUnread = true;
+      }
+      onChunk(tab.id, chunk);
+    };
+    const onExit = (code: number | null) => {
+      tab.alive = false;
+      opts?.onExit?.(code);
+    };
+    try {
+      const sessionId = opts?.spawn
+        ? await opts.spawn(onOutput, onExit)
+        : await terminalOpen(
+            cwd,
+            {
+              cols: 80,
+              rows: 24,
+              shell: opts?.shell || undefined,
+              // Agent tabs ("claude"/"codex") launch as a first-class agent CLI,
+              // never smuggled through the `shell` parameter.
+              agent: tabType !== "shell" ? tabType : undefined,
+              onExit,
+            },
+            onOutput,
+          );
 
       // Fix 3 — Check if the tab was closed while we were awaiting the PTY spawn.
       // If closeTab() fired during the await window, it skipped terminalClose()
@@ -127,7 +186,7 @@ export function useTerminalSessions() {
       const stillExists = list.includes(tab);
       if (!stillExists) {
         await terminalClose(sessionId);
-        return tab; // caller has the ref; the tab is already gone from the list
+        return; // caller has the ref; the tab is already gone from the list
       }
 
       tab.sessionId = sessionId;
@@ -144,7 +203,6 @@ export function useTerminalSessions() {
       }
       throw err; // re-throw so the caller (App.vue) can surface the error
     }
-    return tab;
   }
 
   async function closeTab(repoPath: string, tabId: number): Promise<void> {
@@ -187,12 +245,41 @@ export function useTerminalSessions() {
     if (t) { clearTimeout(t); debounceTimers.delete(repoPath); }
     firstPendingAt.delete(repoPath);
     const list = listFor(repoPath);
-    // Independent IPC calls — close all sessions concurrently.
-    await Promise.all(
-      list.filter((tab) => tab.sessionId >= 0).map((tab) => terminalClose(tab.sessionId)),
-    );
-    tabsByRepo.set(repoPath, []);
+    // Emptied in place: a tab still spawning checks this very array once its
+    // PTY is up, and closes it when gone (openTab's Fix 3) — we wait for that.
+    const tabs = list.splice(0);
     activeByRepo.set(repoPath, null);
+    // Independent IPC calls — close all sessions concurrently.
+    await Promise.all([
+      ...tabs.filter((tab) => tab.sessionId >= 0).map((tab) => terminalClose(tab.sessionId)),
+      ...tabs.map((tab) => opening.get(tab.id)?.catch(() => {})),
+    ]);
+  }
+
+  /**
+   * Close every tab opened in `root` or under it (a worktree's path), in any
+   * repo, waiting for tabs still opening — like `disposeRepo`, but by the
+   * tabs' own directory rather than the repo they are listed under.
+   */
+  async function disposeCwd(root: string): Promise<void> {
+    const closing: Promise<unknown>[] = [];
+    for (const [repoPath, list] of tabsByRepo) {
+      // Removed in place: a tab still spawning checks this very array once
+      // its PTY is up, and closes it when gone (openTab's Fix 3).
+      const gone = list.filter((tab) => isUnderPath(tab.cwd, root));
+      if (gone.length === 0) continue;
+      for (const tab of gone) list.splice(list.indexOf(tab), 1);
+      const active = activeByRepo.get(repoPath);
+      if (gone.some((tab) => tab.id === active)) {
+        activeByRepo.set(repoPath, list.length ? list[list.length - 1].id : null);
+      }
+      for (const tab of gone) {
+        if (tab.sessionId >= 0) closing.push(terminalClose(tab.sessionId));
+        const pending = opening.get(tab.id);
+        if (pending) closing.push(pending.catch(() => {}));
+      }
+    }
+    await Promise.all(closing);
   }
 
   function notifyOutput(repoPath: string): void {
@@ -248,6 +335,7 @@ export function useTerminalSessions() {
     renameTab,
     setTitleFromShell,
     disposeRepo,
+    disposeCwd,
     notifyOutput,
     setMutationHandler,
     write,

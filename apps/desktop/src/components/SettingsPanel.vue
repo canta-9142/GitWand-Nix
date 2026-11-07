@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
 import { clampHistoryBudget } from "@gitwand/core";
 import { mergeLlmFallbackForSave } from "../utils/llmFallbackRc";
 import { useI18n } from "../composables/useI18n";
@@ -87,17 +87,40 @@ export type NotificationLevel = "all" | "reviews" | "ci" | "none";
 // lives in `useAIProvider`.
 import {
   type AIProvider,
+  type AIModelOption,
   CLI_AGENT_PROVIDERS,
+  DEFAULT_CLAUDE_API_MODEL,
+  fallbackModelsForProvider,
+  isFetchableEndpoint,
+  isStaleEffort,
   listModelsForProvider,
+  providerEfforts,
 } from "../composables/useAIProvider";
 import { useLogs, type LogEntry } from "../composables/useLogs";
 import { useIdentity } from "../composables/useIdentity";
+import type { SettingsSectionTarget } from "../composables/branchPickerBridge";
 import { useCommitTemplates } from "../composables/useCommitTemplates";
-import { useAiPromptPresets, BUILTIN_PRESETS } from "../composables/useAiPromptPresets";
-import { useReleaseNoteTemplates } from "../composables/useReleaseNoteTemplates";
+import {
+  AI_TEMPLATE_KINDS,
+  builtinTemplates,
+  userTemplates,
+  addTemplate as addAiTemplate,
+  updateTemplate as updateAiTemplate,
+  removeTemplate as removeAiTemplate,
+  requestedAiTemplateKind,
+  type AiTemplate,
+  type AiTemplateKind,
+} from "../composables/useAiTemplates";
+import { DEFAULT_TEMPLATE_ID } from "../composables/aiTemplateDefaults";
 import type { IdentityProfile, CommitTemplate, AiPromptPreset, DockEntryId, ReleaseNoteTemplate } from "../composables/useSettings";
-import { DEFAULT_DOCK_ORDER, normalizeDockOrder, refreshSettings as refreshSharedSettings } from "../composables/useSettings";
-import { gitCommitTemplatePath, openExternalUrl } from "../utils/backend";
+import {
+  DEFAULT_DOCK_ORDER,
+  normalizeDockOrder,
+  refreshSettings as refreshSharedSettings,
+  settingsRevision,
+} from "../composables/useSettings";
+import { gitCommitTemplatePath, openExternalUrl, aiHttpRequest, telemetryGetState, telemetrySetEnabled, softwareRenderingGetState, softwareRenderingSetEnabled } from "../utils/backend";
+import { useAiApiKey, useAiApiKeyDraft, stripAiApiKey, toPersistedSettings, normalizeEndpointSetting } from "../composables/useAiApiKey";
 export type { AIProvider };
 
 // Re-export for back-compat — earlier callers imported this shape from
@@ -108,7 +131,9 @@ const props = defineProps<{
   /** Accumulated error log passed down from App.vue */
   errorLog?: LogEntry[];
   /** Open directly on this tab (e.g. "logs" when clicking the error badge) */
-  initialTab?: "general" | "dock" | "dashboard" | "git" | "editor" | "terminal" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "releaseNotes";
+  initialTab?: "general" | "dock" | "dashboard" | "git" | "editor" | "terminal" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "aiTemplates";
+  /** Scroll to this section of the initial tab once open (e.g. "identities") */
+  initialSection?: SettingsSectionTarget;
   /** Current repo path (for Hooks tab) */
   cwd?: string;
 }>();
@@ -135,8 +160,9 @@ interface Settings {
   gitPath: string;
   defaultBranch: string;
   commitSignature: boolean;
-  commitMessageLang: string; // "" = follow UI locale
-  prAiLanguage: "english" | "ui";
+  commitMessageLang: string; // locale code; "" (older saves) = English
+  releaseNotesLang: string; // locale code; "" (older saves) = English
+  prDescriptionLang: string; // locale code; "" (older saves) = English
   diffMode: DiffMode;
   pullMode: PullMode;
   switchBehavior: SwitchBehavior;
@@ -152,11 +178,12 @@ interface Settings {
   // AI settings
   aiEnabled: boolean;
   aiProvider: AIProvider;
-  aiApiKey: string;
   aiApiEndpoint: string;
   aiModel: string;
   // Per-provider model selection for CLI agents (v2.17)
   aiModelByProvider: Partial<Record<AIProvider, string>>;
+  // Per-provider reasoning effort (low … max)
+  aiEffortByProvider: Partial<Record<AIProvider, string>>;
   aiOllamaUrl: string;
   aiOllamaModel: string;
   // v3.11.1 — send commit history for the conflicting lines with AI prompts.
@@ -184,7 +211,6 @@ interface Settings {
   dockHidePrs: boolean;
   dockHideTerminal: boolean;
   dockHideFiles: boolean;
-  dockHideChangesWhenEmpty: boolean;
   dockIconsOnly: boolean;
   dockVertical: boolean;
   dockIdleOpacity: number;
@@ -215,6 +241,9 @@ interface Settings {
   aiPromptPresets: AiPromptPreset[];
   activePresetIdByRepo: Record<string, string | null>;
   // v3 Release Note Templates
+  prTemplates: AiPromptPreset[];
+  aiTemplateLangByRepo: Record<string, Record<string, string>>;
+  activePrTemplateIdByRepo: Record<string, string | null>;
   releaseNoteTemplates: ReleaseNoteTemplate[];
   activeReleaseNoteTemplateIdByRepo: Record<string, string | null>;
   // v3.x terminal
@@ -249,6 +278,14 @@ interface Settings {
   snapshotAiLabels: boolean;
   /** Live Repo (v3.10.0): subscribe to filesystem events instead of polling. */
   liveRepoWatcher: boolean;
+  /** Opt-in: fast-forward a purely-behind current branch after the background fetch. */
+  autoFastForward: boolean;
+  /** Load remote images in rendered markdown (off: tracking pixels). */
+  allowRemoteImages: boolean;
+  /** README remote-image consent per project (normaliseCwd keys). */
+  remoteImagesByRepo: Record<string, boolean>;
+  /** Look up commit authors on Gravatar (off: leaks author emails). */
+  gravatarEnabled: boolean;
 }
 
 const defaultSettings: Settings = {
@@ -256,8 +293,9 @@ const defaultSettings: Settings = {
   gitPath: "",
   defaultBranch: "main",
   commitSignature: true,
-  commitMessageLang: "",
-  prAiLanguage: "english",
+  commitMessageLang: "en",
+  releaseNotesLang: "en",
+  prDescriptionLang: "en",
   diffMode: "inline",
   pullMode: "rebase",
   switchBehavior: "ask",
@@ -271,10 +309,10 @@ const defaultSettings: Settings = {
   // AI defaults
   aiEnabled: false,
   aiProvider: "none",
-  aiApiKey: "",
   aiApiEndpoint: "https://api.anthropic.com",
-  aiModel: "claude-sonnet-4-20250514",
+  aiModel: DEFAULT_CLAUDE_API_MODEL,
   aiModelByProvider: {},
+  aiEffortByProvider: {},
   aiOllamaUrl: "http://localhost:11434",
   aiOllamaModel: "codellama",
   aiHistoryEnabled: true,
@@ -296,7 +334,6 @@ const defaultSettings: Settings = {
   dockHidePrs: false,
   dockHideTerminal: false,
   dockHideFiles: false,
-  dockHideChangesWhenEmpty: true,
   dockIconsOnly: false,
   dockVertical: false,
   dockIdleOpacity: 0.45,
@@ -323,6 +360,9 @@ const defaultSettings: Settings = {
   aiPromptPresets: [],
   activePresetIdByRepo: {},
   // v3 Release Note Templates
+  prTemplates: [],
+  aiTemplateLangByRepo: {},
+  activePrTemplateIdByRepo: {},
   releaseNoteTemplates: [],
   activeReleaseNoteTemplateIdByRepo: {},
   // v3.x terminal
@@ -346,19 +386,30 @@ const defaultSettings: Settings = {
   snapshotMaxCount: 200,
   snapshotAiLabels: false,
   liveRepoWatcher: true,
+  autoFastForward: false,
+  allowRemoteImages: false,
+  remoteImagesByRepo: {},
+  gravatarEnabled: false,
 };
 
 function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...defaultSettings, ...JSON.parse(raw) };
+    // `aiApiKey` lives in the keychain now (useAiApiKey); never round-trip it.
+    if (raw) {
+      const s: Settings = stripAiApiKey({ ...defaultSettings, ...JSON.parse(raw) });
+      // Same repair as useSettings.loadSettings for a scheme-less endpoint.
+      s.aiApiEndpoint = normalizeEndpointSetting(s.aiApiEndpoint);
+      return s;
+    }
   } catch { /* ignore */ }
   return { ...defaultSettings };
 }
 
 function saveSettings(s: Settings) {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    // See useSettings.saveSettings: a legacy key awaiting migration is kept.
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(toPersistedSettings(s)));
   } catch { /* ignore */ }
 }
 
@@ -389,6 +440,12 @@ function updateClampedSetting<K extends keyof Settings>(
 
 function updateSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
   settings.value[key] = value;
+  // Identities are written by useIdentity, possibly elsewhere (the commit
+  // menu) while this panel is open: never write back a stale copy. Same for
+  // the per-repo AI template / language picked from the AI button menus.
+  const fresh = loadSettings();
+  syncIdentityFields(fresh);
+  syncAiTemplateSettings(fresh);
   saveSettings(settings.value);
   // Keep the shared reactive settings (read by AppDock and friends) in sync so
   // changes like dock order / position apply live, not only on panel close.
@@ -417,11 +474,10 @@ function dockEntryLabel(id: DockEntryId): string {
     case "dashboard": return t("settings.dock.itemDashboard");
     case "prs": return t("settings.dock.itemPrs");
     case "graph": return t("settings.dock.itemGitTree");
-    case "changes": return t("settings.dock.itemChanges");
   }
 }
 
-/** Persisted order, normalised so all five entries are always present. */
+/** Persisted order, normalised so all four entries are always present. */
 const dockOrder = computed<DockEntryId[]>(() => normalizeDockOrder(settings.value.dockOrder));
 
 function moveDockEntry(id: DockEntryId, dir: -1 | 1) {
@@ -438,7 +494,7 @@ function resetDockPosition() {
 }
 
 // ─── Tab navigation ──────────────────────────────────────
-type SettingsTab = "general" | "dock" | "dashboard" | "git" | "editor" | "terminal" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "releaseNotes";
+type SettingsTab = "general" | "dock" | "dashboard" | "git" | "editor" | "terminal" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "aiTemplates";
 const activeSettingsTab = ref<SettingsTab>(props.initialTab ?? "general");
 
 // ─── Logs tab — formatting + clipboard ──────────────────
@@ -481,7 +537,7 @@ function ensureAiDetect() {
   runOpencodeCliDetect();
   runCopilotCliDetect();
   runAntigravityCliDetect();
-  loadCliModels();
+  loadModels();
 }
 
 // Not `immediate` — the initial tab is handled in `onMounted`, which runs
@@ -518,7 +574,7 @@ const settingsTabs: { id: SettingsTab; icon: string }[] = [
   { id: "editor", icon: "editor" },
   { id: "terminal", icon: "terminal" },
   { id: "ai", icon: "ai" },
-  { id: "releaseNotes", icon: "releaseNotes" },
+  { id: "aiTemplates", icon: "aiTemplates" },
   { id: "accounts", icon: "accounts" },
   { id: "mcp", icon: "mcp" },
   { id: "automations", icon: "automations" },
@@ -531,10 +587,13 @@ const settingsTabs: { id: SettingsTab; icon: string }[] = [
 // be hardcoded strings (three of them French), rendered raw with no t()
 // call, shown untranslated in every locale. Every sibling tab label already
 // goes through t() via tabLabel() below.
-const settingsNavGroups: Array<{ labelKey: LocaleKey | null; tabs: SettingsTab[] }> = [
+// `templateKinds`: the group lists one entry per AI template kind instead of
+// tabs; each opens the aiTemplates tab on that kind.
+const settingsNavGroups: Array<{ labelKey: LocaleKey | null; tabs: SettingsTab[]; templateKinds?: boolean }> = [
   { labelKey: "settings.navGroupApplication", tabs: ["general", "dock", "dashboard", "editor", "terminal"] },
   { labelKey: "settings.navGroupRepo", tabs: ["git", "hooks", "accounts"] },
-  { labelKey: "settings.navGroupAi", tabs: ["ai", "releaseNotes", "mcp", "automations"] },
+  { labelKey: "settings.navGroupAi", tabs: ["ai", "mcp", "automations"] },
+  { labelKey: "settings.tabAiTemplates", tabs: [], templateKinds: true },
   { labelKey: "settings.navGroupSystem", tabs: ["logs"] },
 ];
 
@@ -547,13 +606,25 @@ function tabLabel(id: SettingsTab): string {
     case "editor": return t("settings.tabEditor");
     case "terminal": return t("settings.tabTerminal");
     case "ai": return t("settings.tabAi");
-    case "releaseNotes": return t("settings.tabReleaseNotes");
+    case "aiTemplates": return t("settings.tabAiTemplates");
     case "accounts": return t("settings.tabAccounts");
     case "mcp": return t("settings.tabMcp");
     case "automations": return t("settings.tabAutomations");
     case "hooks": return t("settings.tabHooks");
     case "logs": return t("settings.tabLogs");
   }
+}
+
+// AI Templates is entered per template kind from the nav, so its page title
+// names the kind rather than the tab.
+const pageTitle = computed(() =>
+  activeSettingsTab.value === "aiTemplates"
+    ? t(aiTemplateKindLabel[aiTemplateKind.value])
+    : tabLabel(activeSettingsTab.value),
+);
+
+function tabDescription(id: SettingsTab): string {
+  return t(`settings.pageDesc.${id}` as LocaleKey);
 }
 
 // ─── Language ──────────────────────────────────────────
@@ -661,24 +732,20 @@ function onAIProviderChange(val: AIProvider) {
   if (val === "claude-code-cli") {
     // Refresh detection when the user picks this provider.
     runClaudeCliDetect();
-    loadCliModels(val);
   } else if (val === "codex-cli") {
     runCodexCliDetect();
-    loadCliModels(val);
   } else if (val === "opencode-cli") {
     runOpencodeCliDetect();
-    loadCliModels(val);
   } else if (val === "copilot-cli") {
     runCopilotCliDetect();
   } else if (val === "antigravity-cli") {
     runAntigravityCliDetect();
-    loadCliModels(val);
   } else if (val === "claude") {
     if (!settings.value.aiApiEndpoint || settings.value.aiApiEndpoint === "https://api.openai.com/v1") {
       updateSetting("aiApiEndpoint", "https://api.anthropic.com");
     }
     if (!settings.value.aiModel || settings.value.aiModel.startsWith("gpt-")) {
-      updateSetting("aiModel", "claude-sonnet-4-20250514");
+      updateSetting("aiModel", DEFAULT_CLAUDE_API_MODEL);
     }
   } else if (val === "openai-compat") {
     if (!settings.value.aiApiEndpoint || settings.value.aiApiEndpoint === "https://api.anthropic.com") {
@@ -697,9 +764,10 @@ const ollamaModels = ref<string[]>([]);
 async function detectOllama() {
   try {
     const url = settings.value.aiOllamaUrl || "http://localhost:11434";
-    const res = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(2000) });
-    if (res.ok) {
-      const data = await res.json();
+    // Through the backend: the webview's CSP no longer reaches arbitrary hosts.
+    const res = await aiHttpRequest("GET", `${url.replace(/\/+$/, "")}/api/tags`, "none", undefined, 2);
+    if (res.status >= 200 && res.status < 300) {
+      const data = JSON.parse(res.body);
       ollamaAvailable.value = true;
       if (data.models && Array.isArray(data.models)) {
         ollamaModels.value = data.models.map((m: any) => m.name || m.model).filter(Boolean);
@@ -711,19 +779,95 @@ async function detectOllama() {
   }
 }
 
-// API key visibility toggle
+// API key — stored in the OS keychain, never read back: the panel only sees
+// a masked hint. The input holds a draft that is saved on change.
+const aiKey = useAiApiKey();
+const aiKeyConfigured = aiKey.configured;
+const maskedApiKey = computed(() => aiKey.hint.value ?? "");
 const showApiKey = ref(false);
 
-const maskedApiKey = computed(() => {
-  const key = settings.value.aiApiKey;
-  if (!key) return "";
-  if (key.length <= 8) return "••••••••";
-  return key.slice(0, 4) + "••••" + key.slice(-4);
+/**
+ * Endpoint the key is bound to when saved: the backend only ever sends it to
+ * this origin (see useAiApiKey).
+ */
+function apiKeyEndpoint(): string {
+  return settings.value.aiApiEndpoint?.trim() || "https://api.anthropic.com";
+}
+/**
+ * Warning shown under the key, or null: a stored key bound to another
+ * endpoint (or to none), or a key from an earlier version still unencrypted
+ * in the settings because its move to the keychain failed.
+ */
+const aiKeyWarning = computed<string | null>(() => {
+  if (aiKey.legacyKeyStuck.value) return t("settings.aiLegacyKeyStuck");
+  if (!aiKey.boundElsewhere(apiKeyEndpoint())) return null;
+  return aiKey.origin.value
+    ? t("settings.aiApiKeyBoundElsewhere", aiKey.origin.value)
+    : t("settings.aiApiKeyUnbound");
 });
+
+// Draft of the key input, saved on `change` and when the panel closes.
+const {
+  draft: apiKeyDraft,
+  error: apiKeyError,
+  save: saveApiKeyDraft,
+} = useAiApiKeyDraft(apiKeyEndpoint);
+
+async function clearApiKey() {
+  try {
+    await aiKey.clear();
+    apiKeyError.value = null;
+  } catch (e) {
+    apiKeyError.value = (e as Error).message;
+  }
+}
+
+// Launch telemetry — the setting lives in the backend (it must be readable
+// before the webview loads), not in localStorage.
+const telemetryEnabled = ref(true);
+const telemetryForcedOff = ref(false);
+telemetryGetState()
+  .then((st) => {
+    telemetryEnabled.value = st.enabled;
+    telemetryForcedOff.value = st.forced_off_by_env;
+  })
+  .catch(() => { /* backend unavailable — keep defaults */ });
+
+async function onTelemetryChange(enabled: boolean) {
+  telemetryEnabled.value = enabled;
+  try {
+    await telemetrySetEnabled(enabled);
+  } catch {
+    telemetryEnabled.value = !enabled;
+  }
+}
+
+// Linux software rendering — read before the webview exists, so it lives in
+// the backend like telemetry. Applies at the next launch.
+const softwareRenderingSupported = ref(false);
+const softwareRendering = ref(false);
+const softwareRenderingAuto = ref(false);
+softwareRenderingGetState()
+  .then((st) => {
+    softwareRenderingSupported.value = st.supported;
+    softwareRendering.value = st.enabled;
+    softwareRenderingAuto.value = st.auto_enabled;
+  })
+  .catch(() => { /* backend unavailable — keep the row hidden */ });
+
+async function onSoftwareRenderingChange(enabled: boolean) {
+  softwareRendering.value = enabled;
+  softwareRenderingAuto.value = false;
+  try {
+    await softwareRenderingSetEnabled(enabled);
+  } catch {
+    softwareRendering.value = !enabled;
+  }
+}
 
 // ─── Claude OAuth-like Connect flow ─────────────────────
 const claudeAuthMode = ref<"apikey" | "connect">(
-  settings.value.aiApiKey ? "apikey" : "connect",
+  aiKeyConfigured.value ? "apikey" : "connect",
 );
 const claudeConnectStep = ref<"idle" | "waiting" | "success" | "error">("idle");
 const claudeConnectError = ref<string | null>(null);
@@ -735,7 +879,7 @@ function startClaudeConnect() {
   claudeConnectError.value = null;
 }
 
-function validateAndSaveClaudeKey(key: string) {
+async function validateAndSaveClaudeKey(key: string) {
   const trimmed = key.trim();
   if (!trimmed) {
     claudeConnectError.value = t("settings.aiConnectErrorEmpty");
@@ -747,7 +891,14 @@ function validateAndSaveClaudeKey(key: string) {
     claudeConnectStep.value = "error";
     return;
   }
-  updateSetting("aiApiKey", trimmed);
+  try {
+    await aiKey.save(trimmed, apiKeyEndpoint());
+  } catch (e) {
+    claudeConnectError.value = (e as Error).message;
+    claudeConnectStep.value = "error";
+    return;
+  }
+  claudeConnectKeyInput.value = "";
   claudeConnectStep.value = "success";
   claudeConnectError.value = null;
   // Auto-dismiss after 2s
@@ -759,8 +910,8 @@ function validateAndSaveClaudeKey(key: string) {
   }, 2000);
 }
 
-function disconnectClaude() {
-  updateSetting("aiApiKey", "");
+async function disconnectClaude() {
+  await clearApiKey();
   claudeAuthMode.value = "connect";
   claudeConnectStep.value = "idle";
 }
@@ -883,36 +1034,132 @@ async function runAntigravityCliDetect() {
   }
 }
 
-// ─── Per-provider model picker for CLI agents (v2.17) ───
-const cliModelOptions = ref<string[]>([]);
-const cliModelsLoading = ref(false);
+// ─── Per-provider model + effort picker ───
+// The list comes from whatever the provider can enumerate (see
+// `listModelsForProvider`); an empty list means free-text entry.
+const modelOptions = ref<AIModelOption[]>([]);
+const modelsLoading = ref(false);
+const modelsError = ref("");
 const isCliAgentProvider = computed(() =>
   (CLI_AGENT_PROVIDERS as readonly string[]).includes(settings.value.aiProvider),
 );
+/** Providers whose model is picked in the shared model row. */
+const hasModelPicker = computed(() =>
+  isCliAgentProvider.value
+  || settings.value.aiProvider === "claude"
+  || settings.value.aiProvider === "openai-compat",
+);
+/** The API providers store their model in `aiModel`, CLIs per provider. */
+const usesApiModelField = computed(() =>
+  settings.value.aiProvider === "claude" || settings.value.aiProvider === "openai-compat",
+);
 
-async function loadCliModels(provider: AIProvider = settings.value.aiProvider) {
-  if (!(CLI_AGENT_PROVIDERS as readonly string[]).includes(provider)) {
-    cliModelOptions.value = [];
-    return;
-  }
-  cliModelsLoading.value = true;
+// A slow fetch for a previous provider/key must not overwrite a newer one.
+let modelsRequest = 0;
+async function loadModels(provider: AIProvider = settings.value.aiProvider) {
+  const request = ++modelsRequest;
+  modelsError.value = "";
+  modelsLoading.value = true;
   try {
-    cliModelOptions.value = await listModelsForProvider(provider);
-  } catch {
-    cliModelOptions.value = [];
+    const list = await listModelsForProvider(provider, settings.value);
+    if (request === modelsRequest) modelOptions.value = list;
+  } catch (e) {
+    if (request === modelsRequest) {
+      modelOptions.value = fallbackModelsForProvider(provider);
+      modelsError.value = (e as Error).message;
+    }
   } finally {
-    cliModelsLoading.value = false;
+    if (request === modelsRequest) modelsLoading.value = false;
   }
 }
 
-function currentCliModel(): string {
-  return settings.value.aiModelByProvider?.[settings.value.aiProvider] ?? "";
+// Refetch when the provider or key changes — debounced so typing a key does
+// not fire one request per keystroke. The endpoint is deliberately NOT
+// watched: the fetch sends the API key to it, so every keystroke would leak
+// the key to each half-typed host. It refetches on blur instead (see
+// `onEndpointBlur`). Only once the AI tab has been opened: before that,
+// nobody is looking at the list.
+let modelsReloadTimer: ReturnType<typeof setTimeout> | undefined;
+watch(
+  () => [settings.value.aiProvider, aiKey.revision.value],
+  () => {
+    if (!aiDetectDone) return;
+    modelOptions.value = [];
+    clearTimeout(modelsReloadTimer);
+    modelsReloadTimer = setTimeout(() => loadModels(), 500);
+  },
+);
+onUnmounted(() => clearTimeout(modelsReloadTimer));
+
+/** Endpoint field committed: refetch, but only for a complete URL. */
+function onEndpointBlur() {
+  if (!aiDetectDone || !isFetchableEndpoint(settings.value.aiApiEndpoint)) return;
+  clearTimeout(modelsReloadTimer);
+  modelOptions.value = [];
+  loadModels();
 }
 
-function onCliModelChange(val: string) {
-  const next = { ...(settings.value.aiModelByProvider ?? {}) };
+const currentModel = computed(() =>
+  usesApiModelField.value
+    ? settings.value.aiModel
+    : settings.value.aiModelByProvider?.[settings.value.aiProvider] ?? "",
+);
+const currentModelOption = computed(() =>
+  modelOptions.value.find((m) => m.id === currentModel.value),
+);
+const currentEffort = computed(
+  () => settings.value.aiEffortByProvider?.[settings.value.aiProvider] ?? "",
+);
+/**
+ * Effort levels for the selected model. A listed model says what it supports;
+ * otherwise fall back to what the provider accepts in general (empty for the
+ * API providers, where an unlisted model may support no effort at all).
+ */
+const effortOptions = computed(() =>
+  currentModelOption.value
+    ? currentModelOption.value.efforts
+    : providerEfforts(settings.value.aiProvider),
+);
+
+/** "Claude Opus 5.5 · claude-opus-5-5 · effort: low/medium/high". */
+function modelOptionLabel(m: AIModelOption): string {
+  const parts = [m.name];
+  if (m.id !== m.name) parts.push(m.id);
+  if (m.efforts.length) parts.push(`${t("settings.aiEffortShort")}: ${m.efforts.join("/")}`);
+  return parts.join(" · ");
+}
+
+// A saved effort can outlive the model that accepted it (model changed
+// elsewhere, list refreshed, provider renamed it). Only judged when the
+// current model is in the list: an unlisted model (fallback list after a
+// failed fetch, no key yet, free text) says nothing about what it accepts,
+// so its saved effort is kept.
+watch([modelOptions, currentModel], () => {
+  if (isStaleEffort(currentEffort.value, effortOptions.value, currentModelOption.value != null)) {
+    onEffortChange("");
+  }
+});
+
+function onModelChange(val: string) {
+  if (usesApiModelField.value) {
+    updateSetting("aiModel", val);
+  } else {
+    const next = { ...(settings.value.aiModelByProvider ?? {}) };
+    next[settings.value.aiProvider] = val;
+    updateSetting("aiModelByProvider", next);
+  }
+  // An effort the new model does not take would fail the next request. (The
+  // watch above covers it once the list is known; this also covers a
+  // free-text model, where the list is empty.)
+  if (currentEffort.value && !effortOptions.value.includes(currentEffort.value)) {
+    onEffortChange("");
+  }
+}
+
+function onEffortChange(val: string) {
+  const next = { ...(settings.value.aiEffortByProvider ?? {}) };
   next[settings.value.aiProvider] = val;
-  updateSetting("aiModelByProvider", next);
+  updateSetting("aiEffortByProvider", next);
 }
 
 async function runClaudeCliLogin() {
@@ -1118,7 +1365,13 @@ function onLlmFallbackMinModeChange(val: MinMode) {
   llmFallback.value.minMode = val;
 }
 
+/** Target of `initialSection: "identities"`. */
+const identitiesSection = ref<HTMLElement | null>(null);
+
 onMounted(() => {
+  if (props.initialSection === "identities") {
+    nextTick(() => identitiesSection.value?.scrollIntoView({ block: "start" }));
+  }
   // The non-immediate `activeSettingsTab` watcher above does not fire for the
   // tab we open on, so replay its side effects for the initial tab here. The
   // AI CLI detection only runs when the AI tab is actually shown — probing the
@@ -1141,7 +1394,38 @@ watch(
 
 // ─── v2.12 Identities ────────────────────────────────────
 
-const { identities, add: addIdentity, update: updateIdentity, remove: removeIdentity, setActive: setActiveIdentity } = useIdentity();
+const {
+  identities,
+  repoOverrideId: projectIdentityId,
+  add: addIdentity,
+  update: updateIdentity,
+  remove: removeIdentity,
+  setActive: setActiveIdentity,
+  setRepoOverride: setProjectIdentity,
+} = useIdentity(() => props.cwd ?? "");
+
+/**
+ * useIdentity() writes straight to localStorage; mirror its fields into the
+ * panel's local copy so the next updateSetting() does not write them back stale.
+ */
+function syncIdentityFields(fresh = loadSettings()) {
+  settings.value.identities = fresh.identities;
+  settings.value.activeIdentityId = fresh.activeIdentityId;
+  settings.value.identityOverrideByRepo = fresh.identityOverrideByRepo;
+}
+
+const projectName = computed(() => (props.cwd ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "");
+
+function onDefaultIdentityChange(e: Event) {
+  setActiveIdentity((e.target as HTMLSelectElement).value || null);
+  syncIdentityFields();
+}
+
+function onProjectIdentityChange(e: Event) {
+  if (!props.cwd) return;
+  setProjectIdentity(props.cwd, (e.target as HTMLSelectElement).value || null);
+  syncIdentityFields();
+}
 
 const identityForm = ref<{ label: string; gitName: string; gitEmail: string; gpgKey: string }>({
   label: "", gitName: "", gitEmail: "", gpgKey: "",
@@ -1169,11 +1453,13 @@ function saveIdentityForm() {
   } else {
     addIdentity({ label, gitName, gitEmail, gpgKey: gpgKey || undefined });
   }
+  syncIdentityFields();
   showIdentityForm.value = false;
 }
 
 function deleteIdentity(id: string) {
   removeIdentity(id);
+  syncIdentityFields();
 }
 
 // ─── v2.12 Commit Templates ──────────────────────────────
@@ -1222,99 +1508,136 @@ async function doImportFromGitMessage() {
   }
 }
 
-// ─── v2.13 AI Prompt Presets ─────────────────────────────
+// ─── AI Templates (commit / PR / release notes) ─────────────
+// Built-ins (Default included) are read-only: view + duplicate. User
+// templates: edit + duplicate + delete. Duplicating opens a prefilled "add"
+// form, so cancelling leaves nothing behind.
 
-const { userPresets, add: addPreset, update: updatePreset, remove: removePreset } = useAiPromptPresets();
+const aiTemplateKind = ref<AiTemplateKind>(requestedAiTemplateKind.value ?? "commit");
+requestedAiTemplateKind.value = null;
 
-const presetForm = ref<{ name: string; description: string; systemPrompt: string }>({
+const aiTemplateKindLabel: Record<AiTemplateKind, LocaleKey> = {
+  commit: "settings.aiTemplates.kindCommit",
+  pr: "settings.aiTemplates.kindPr",
+  releaseNotes: "settings.aiTemplates.kindReleaseNotes",
+};
+// Nav icon per template kind. Keyed by kind so a new kind is a type error
+// here instead of silently borrowing another kind's icon.
+type SvgShape = { tag: "circle" | "path"; attrs: Record<string, string> };
+const aiTemplateKindIcon: Record<AiTemplateKind, SvgShape[]> = {
+  commit: [
+    { tag: "circle", attrs: { cx: "8", cy: "8", r: "2.5" } },
+    { tag: "path", attrs: { d: "M1 8h4.5M10.5 8H15" } },
+  ],
+  pr: [
+    { tag: "circle", attrs: { cx: "4", cy: "3.5", r: "1.5" } },
+    { tag: "circle", attrs: { cx: "4", cy: "12.5", r: "1.5" } },
+    { tag: "circle", attrs: { cx: "12", cy: "12.5", r: "1.5" } },
+    { tag: "path", attrs: { d: "M4 5v6M12 11V6.5A2 2 0 0 0 10 4.5H7.5M9 3l-1.5 1.5L9 6" } },
+  ],
+  releaseNotes: [
+    { tag: "path", attrs: { d: "M2 2.5h6.5L14 8l-5.5 5.5L2 8z" } },
+    { tag: "circle", attrs: { cx: "5.5", cy: "5.5", r: "1", fill: "currentColor", stroke: "none" } },
+  ],
+};
+const aiTemplateKindHint: Record<AiTemplateKind, LocaleKey> = {
+  commit: "settings.aiTemplates.hintCommit",
+  pr: "settings.aiTemplates.hintPr",
+  releaseNotes: "settings.aiTemplates.hintReleaseNotes",
+};
+
+const aiBuiltinTemplates = computed(() => builtinTemplates(aiTemplateKind.value));
+const aiUserTemplates = computed(() => {
+  void settingsRevision.value;
+  return userTemplates(aiTemplateKind.value);
+});
+
+const aiTemplateForm = ref<{ name: string; description: string; systemPrompt: string }>({
   name: "", description: "", systemPrompt: "",
 });
-const editingPresetId = ref<string | null>(null);
-const showPresetForm = ref(false);
+/** null = form closed; "view" = read-only built-in. */
+const aiTemplateFormMode = ref<"add" | "edit" | "view" | null>(null);
+const aiTemplateFormId = ref<string | null>(null);
 
-function openAddPreset() {
-  presetForm.value = { name: "", description: "", systemPrompt: "" };
-  editingPresetId.value = null;
-  showPresetForm.value = true;
+function aiTemplateName(tpl: AiTemplate): string {
+  return tpl.id === DEFAULT_TEMPLATE_ID ? t("settings.aiTemplates.default") : tpl.name;
 }
 
-function openEditPreset(preset: AiPromptPreset) {
-  presetForm.value = {
-    name: preset.name,
-    description: preset.description ?? "",
-    systemPrompt: preset.systemPrompt,
+function aiTemplateMeta(tpl: AiTemplate): string {
+  if (tpl.id === DEFAULT_TEMPLATE_ID) return t("settings.aiTemplates.defaultDescription");
+  return tpl.description || tpl.systemPrompt.split("\n", 1)[0];
+}
+
+function openAiTemplateForm(mode: "add" | "edit" | "view", tpl?: AiTemplate, name?: string) {
+  aiTemplateForm.value = {
+    name: name ?? (tpl ? aiTemplateName(tpl) : ""),
+    description: tpl?.description ?? "",
+    systemPrompt: tpl?.systemPrompt ?? "",
   };
-  editingPresetId.value = preset.id;
-  showPresetForm.value = true;
+  aiTemplateFormMode.value = mode;
+  aiTemplateFormId.value = mode === "add" ? null : tpl?.id ?? null;
 }
 
-function savePresetForm() {
-  const { name, description, systemPrompt } = presetForm.value;
-  if (!name.trim() || !systemPrompt.trim()) return;
-  if (editingPresetId.value) {
-    updatePreset(editingPresetId.value, { name, description: description || undefined, systemPrompt });
-  } else {
-    addPreset({ name, description: description || undefined, systemPrompt });
+function closeAiTemplateForm() {
+  aiTemplateFormMode.value = null;
+  aiTemplateFormId.value = null;
+}
+
+function duplicateAiTemplate(tpl: AiTemplate) {
+  openAiTemplateForm("add", tpl, t("settings.aiTemplates.copyName", aiTemplateName(tpl)));
+}
+
+function duplicateViewedAiTemplate() {
+  const tpl = aiBuiltinTemplates.value.find((b) => b.id === aiTemplateFormId.value);
+  if (tpl) duplicateAiTemplate(tpl);
+}
+
+/**
+ * The composable writes straight to localStorage; mirror the template fields
+ * into this panel's own copy so a later updateSetting() doesn't persist a
+ * stale list over them.
+ */
+function syncAiTemplateSettings(fresh = loadSettings()) {
+  settings.value.aiPromptPresets = fresh.aiPromptPresets;
+  settings.value.activePresetIdByRepo = fresh.activePresetIdByRepo;
+  settings.value.prTemplates = fresh.prTemplates;
+  settings.value.aiTemplateLangByRepo = fresh.aiTemplateLangByRepo;
+  settings.value.activePrTemplateIdByRepo = fresh.activePrTemplateIdByRepo;
+  settings.value.releaseNoteTemplates = fresh.releaseNoteTemplates;
+  settings.value.activeReleaseNoteTemplateIdByRepo = fresh.activeReleaseNoteTemplateIdByRepo;
+}
+
+function saveAiTemplateForm() {
+  const name = aiTemplateForm.value.name.trim();
+  const systemPrompt = aiTemplateForm.value.systemPrompt;
+  if (!name || !systemPrompt.trim()) return;
+  const description = aiTemplateForm.value.description.trim() || undefined;
+  if (aiTemplateFormMode.value === "edit" && aiTemplateFormId.value) {
+    updateAiTemplate(aiTemplateKind.value, aiTemplateFormId.value, { name, description, systemPrompt });
+  } else if (aiTemplateFormMode.value === "add") {
+    addAiTemplate(aiTemplateKind.value, { name, description, systemPrompt });
   }
-  showPresetForm.value = false;
+  syncAiTemplateSettings();
+  closeAiTemplateForm();
 }
 
-// ─── v3 Release Note Templates ─────────────────────────────
-
-const {
-  templates: releaseNoteTemplates,
-  add: addReleaseNoteTemplate,
-  update: updateReleaseNoteTemplate,
-  remove: removeReleaseNoteTemplate,
-} = useReleaseNoteTemplates();
-
-const releaseNoteTemplateForm = ref<{ name: string; customRules: string }>({
-  name: "",
-  customRules: "",
-});
-const editingReleaseNoteTemplateId = ref<string | null>(null);
-const showReleaseNoteTemplateForm = ref(false);
-
-function openAddReleaseNoteTemplate() {
-  releaseNoteTemplateForm.value = { name: "", customRules: "" };
-  editingReleaseNoteTemplateId.value = null;
-  showReleaseNoteTemplateForm.value = true;
+function deleteAiTemplate(id: string) {
+  removeAiTemplate(aiTemplateKind.value, id);
+  syncAiTemplateSettings();
+  if (aiTemplateFormId.value === id) closeAiTemplateForm();
 }
 
-function openEditReleaseNoteTemplate(tpl: ReleaseNoteTemplate) {
-  releaseNoteTemplateForm.value = {
-    name: tpl.name,
-    customRules: tpl.customRules,
-  };
-  editingReleaseNoteTemplateId.value = tpl.id;
-  showReleaseNoteTemplateForm.value = true;
-}
+watch(aiTemplateKind, closeAiTemplateForm);
 
-function saveReleaseNoteTemplateForm() {
-  const { name, customRules } = releaseNoteTemplateForm.value;
-  if (!name.trim() || !customRules.trim()) return;
-  if (editingReleaseNoteTemplateId.value) {
-    updateReleaseNoteTemplate(editingReleaseNoteTemplateId.value, { name, customRules });
-  } else {
-    addReleaseNoteTemplate({ name, customRules });
-  }
-  showReleaseNoteTemplateForm.value = false;
-  // Sync the local settings state
-  const updated = loadSettings();
-  settings.value.releaseNoteTemplates = updated.releaseNoteTemplates;
-}
-
-function deleteReleaseNoteTemplate(id: string) {
-  removeReleaseNoteTemplate(id);
-  const updated = loadSettings();
-  settings.value.releaseNoteTemplates = updated.releaseNoteTemplates;
-  settings.value.activeReleaseNoteTemplateIdByRepo = updated.activeReleaseNoteTemplateIdByRepo;
+function openAiTemplateKind(kind: AiTemplateKind) {
+  activeSettingsTab.value = "aiTemplates";
+  aiTemplateKind.value = kind;
 }
 
 </script>
 
 <template>
-  <BaseModal size="xl" :title="t('settings.title')" :bodyFlush="true" :scrollOwn="true" @close="emit('close')">
+  <BaseModal size="screen" :title="t('settings.title')" :bodyFlush="true" :scrollOwn="true" @close="emit('close')">
     <template #title-icon>
       <span class="bm-title-icon" aria-hidden="true">
         <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
@@ -1379,7 +1702,7 @@ function deleteReleaseNoteTemplate(id: string) {
                 <circle cx="8" cy="8" r="4" />
                 <circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none" />
               </svg>
-              <svg v-else-if="tab.icon === 'releaseNotes'" width="15" height="15" viewBox="0 0 16 16" fill="none"
+              <svg v-else-if="tab.icon === 'aiTemplates'" width="15" height="15" viewBox="0 0 16 16" fill="none"
                 stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M3 2h7l3 3v9H3z" />
                 <path d="M9 2v4h4" />
@@ -1418,6 +1741,18 @@ function deleteReleaseNoteTemplate(id: string) {
                 {{ props.errorLog!.length > 99 ? '99+' : props.errorLog!.length }}
               </span>
             </button>
+            <template v-if="group.templateKinds">
+              <button v-for="kind in AI_TEMPLATE_KINDS" :key="kind" class="sp-nav-item"
+                :class="{ 'sp-nav-item--active': activeSettingsTab === 'aiTemplates' && aiTemplateKind === kind }"
+                @click="openAiTemplateKind(kind)">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                  stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <component :is="shape.tag" v-for="(shape, i) in aiTemplateKindIcon[kind]" :key="i"
+                    v-bind="shape.attrs" />
+                </svg>
+                <span>{{ t(aiTemplateKindLabel[kind]) }}</span>
+              </button>
+            </template>
           </div>
         </template>
 
@@ -1450,21 +1785,17 @@ function deleteReleaseNoteTemplate(id: string) {
         </div>
 
         <div class="sp-nav-spacer" />
-        <div class="sp-nav-footer">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"
-            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="8" cy="3" r="1.5" />
-            <circle cx="3" cy="11" r="1.5" />
-            <circle cx="13" cy="11" r="1.5" />
-            <path d="M8 4.5v3L3 9.6M8 7.5l5 2.1" />
-          </svg>
-          <span class="sp-nav-footer-name">GitWand</span>
-          <span class="sp-nav-footer-version">v{{ appVersion }}</span>
-        </div>
+        <div class="sp-nav-footer">{{ t('settings.versionLabel', appVersion) }}</div>
       </nav>
 
       <!-- ── Right content area ── -->
       <div class="sp-content">
+
+        <!-- Page title + intro, same look as HelpView's section header -->
+        <header class="sp-page-header">
+          <h2 class="sp-page-title">{{ pageTitle }}</h2>
+          <p class="sp-page-intro">{{ tabDescription(activeSettingsTab) }}</p>
+        </header>
 
         <!-- ═══ GÉNÉRAL ═══ -->
         <template v-if="activeSettingsTab === 'general'">
@@ -1475,28 +1806,6 @@ function deleteReleaseNoteTemplate(id: string) {
               <option value="auto">{{ t('settings.languageAuto') }}</option>
               <option v-for="loc in supportedLocales" :key="loc" :value="loc">{{ localeLabels[loc] }}</option>
             </select>
-          </div>
-
-          <!-- Commit message language -->
-          <div class="sp-row">
-            <label class="sp-label" for="setting-commit-lang">{{ t('settings.commitMessageLang') }}</label>
-            <select id="setting-commit-lang" class="sp-select" :value="settings.commitMessageLang"
-              @change="updateSetting('commitMessageLang', ($event.target as HTMLSelectElement).value)">
-              <option value="">{{ t('settings.commitMessageLangAuto') }}</option>
-              <option v-for="loc in supportedLocales" :key="loc" :value="loc">{{ localeLabels[loc] }}</option>
-            </select>
-            <span class="sp-hint">{{ t('settings.commitMessageLangHint') }}</span>
-          </div>
-
-          <!-- PR AI language -->
-          <div class="sp-row">
-            <label class="sp-label" for="setting-pr-ai-lang">{{ t('settings.prAiLanguage') }}</label>
-            <select id="setting-pr-ai-lang" class="sp-select" :value="settings.prAiLanguage"
-              @change="updateSetting('prAiLanguage', ($event.target as HTMLSelectElement).value as 'english' | 'ui')">
-              <option value="english">{{ t('settings.prAiLanguageEnglish') }}</option>
-              <option value="ui">{{ t('settings.prAiLanguageUi') }}</option>
-            </select>
-            <span class="sp-hint">{{ t('settings.prAiLanguageHint') }}</span>
           </div>
 
           <!-- Theme -->
@@ -1554,6 +1863,47 @@ function deleteReleaseNoteTemplate(id: string) {
               {{ settings.updateChannel === 'beta' ? t('settings.updateChannelBetaHint') :
                 t('settings.updateChannelStableHint') }}
             </span>
+          </div>
+
+          <!-- Privacy: third-party requests the app makes on its own -->
+          <div class="sp-row sp-row--checkbox">
+            <label class="sp-checkbox-label" for="setting-remote-images">
+              <input id="setting-remote-images" type="checkbox" class="sp-checkbox"
+                :checked="settings.allowRemoteImages"
+                @change="updateSetting('allowRemoteImages', ($event.target as HTMLInputElement).checked)" />
+              <span>{{ t('settings.allowRemoteImages') }}</span>
+            </label>
+            <span class="sp-hint">{{ t('settings.allowRemoteImagesHint') }}</span>
+          </div>
+
+          <div class="sp-row sp-row--checkbox">
+            <label class="sp-checkbox-label" for="setting-gravatar">
+              <input id="setting-gravatar" type="checkbox" class="sp-checkbox"
+                :checked="settings.gravatarEnabled"
+                @change="updateSetting('gravatarEnabled', ($event.target as HTMLInputElement).checked)" />
+              <span>{{ t('settings.gravatarEnabled') }}</span>
+            </label>
+            <span class="sp-hint">{{ t('settings.gravatarEnabledHint') }}</span>
+          </div>
+
+          <div class="sp-row sp-row--checkbox">
+            <label class="sp-checkbox-label" for="setting-telemetry">
+              <input id="setting-telemetry" type="checkbox" class="sp-checkbox"
+                :checked="telemetryEnabled && !telemetryForcedOff" :disabled="telemetryForcedOff"
+                @change="onTelemetryChange(($event.target as HTMLInputElement).checked)" />
+              <span>{{ t('settings.telemetryEnabled') }}</span>
+            </label>
+            <span class="sp-hint">{{ telemetryForcedOff ? t('settings.telemetryForcedOff') : t('settings.telemetryEnabledHint') }}</span>
+          </div>
+
+          <div v-if="softwareRenderingSupported" class="sp-row sp-row--checkbox">
+            <label class="sp-checkbox-label" for="setting-software-rendering">
+              <input id="setting-software-rendering" type="checkbox" class="sp-checkbox"
+                :checked="softwareRendering"
+                @change="onSoftwareRenderingChange(($event.target as HTMLInputElement).checked)" />
+              <span>{{ t('settings.softwareRendering') }}</span>
+            </label>
+            <span class="sp-hint">{{ softwareRenderingAuto ? t('settings.softwareRenderingAuto') : t('settings.softwareRenderingHint') }}</span>
           </div>
         </template>
 
@@ -1653,17 +2003,6 @@ function deleteReleaseNoteTemplate(id: string) {
             <span class="sp-hint">{{ t('settings.dock.lockedHint') }}</span>
           </div>
 
-          <!-- Hide Changes when the working tree is clean -->
-          <div class="sp-row sp-row--checkbox">
-            <label class="sp-checkbox-label" for="setting-dock-hide-changes-empty">
-              <input id="setting-dock-hide-changes-empty" type="checkbox" class="sp-checkbox"
-                :checked="settings.dockHideChangesWhenEmpty"
-                @change="updateSetting('dockHideChangesWhenEmpty', ($event.target as HTMLInputElement).checked)" />
-              <span>{{ t('settings.dock.hideChangesWhenEmpty.label') }}</span>
-            </label>
-            <span class="sp-hint">{{ t('settings.dock.hideChangesWhenEmpty.help') }}</span>
-          </div>
-
           <!-- ── Appearance ── -->
           <div class="sp-row">
             <span class="sp-label">{{ t('settings.dock.appearance.label') }}</span>
@@ -1752,6 +2091,9 @@ function deleteReleaseNoteTemplate(id: string) {
         </template>
 
         <template v-if="activeSettingsTab === 'dashboard'">
+          <!-- ── Layout ── -->
+          <h3 class="sp-section-label">{{ t('settings.dashboard.layout.label') }}</h3>
+
           <!-- README first row -->
           <div class="sp-row sp-row--checkbox">
             <label class="sp-checkbox-label" for="setting-dashboard-readme-first">
@@ -1877,6 +2219,17 @@ function deleteReleaseNoteTemplate(id: string) {
             <span class="sp-hint">{{ t('settings.liveRepoWatcherHint') }}</span>
           </div>
 
+          <!-- Auto fast-forward after fetch -->
+          <div class="sp-row sp-row--checkbox">
+            <label class="sp-checkbox-label" for="setting-auto-fast-forward">
+              <input id="setting-auto-fast-forward" type="checkbox" class="sp-checkbox"
+                :checked="settings.autoFastForward"
+                @change="updateSetting('autoFastForward', ($event.target as HTMLInputElement).checked)" />
+              <span>{{ t('settings.autoFastForward') }}</span>
+            </label>
+            <span class="sp-hint">{{ t('settings.autoFastForwardHint') }}</span>
+          </div>
+
           <!-- Blame diff algorithm -->
           <div class="sp-row">
             <label class="sp-label" for="setting-blame-algo">{{ t('settings.blameAlgorithm') }}</label>
@@ -1909,8 +2262,7 @@ function deleteReleaseNoteTemplate(id: string) {
           </div>
 
           <!-- Statistiques tier locales (recoverable-before-model) -->
-          <div class="sp-section-divider"></div>
-          <h3 class="sp-section-title">{{ t('settings.tierStats.title') }}</h3>
+          <h3 class="sp-section-label">{{ t('settings.tierStats.title') }}</h3>
           <span class="sp-hint">{{ t('settings.tierStats.hint') }}</span>
           <div v-if="tierStats.totalHunks === 0" class="sp-row">
             <span class="sp-hint">{{ t('settings.tierStats.empty') }}</span>
@@ -1968,7 +2320,7 @@ function deleteReleaseNoteTemplate(id: string) {
           </div>
 
           <!-- ── Identités ── -->
-          <div class="sp-group">
+          <div ref="identitiesSection" class="sp-group">
             <div class="sp-group__head">
               <span class="sp-group__label">{{ t('settings.git.identities') }}</span>
               <button v-if="!showIdentityForm" class="sp-group__action" @click="openAddIdentity">
@@ -1987,8 +2339,8 @@ function deleteReleaseNoteTemplate(id: string) {
 
               <div v-for="p in identities" :key="p.id" class="sp-group__row">
                 <div class="sp-group__row-info">
-                  <span class="sp-group__row-name">{{ p.label }}</span>
-                  <span class="sp-group__row-meta mono">{{ p.gitName }} &lt;{{ p.gitEmail }}&gt;</span>
+                  <span class="sp-group__row-name sp-profile-name">{{ p.label }}</span>
+                  <span class="sp-group__row-meta sp-profile-meta mono">{{ p.gitName }} &lt;{{ p.gitEmail }}&gt;</span>
                 </div>
                 <div class="sp-group__row-aside">
                   <span v-if="p.gpgKey" class="sp-tag">GPG</span>
@@ -2037,6 +2389,30 @@ function deleteReleaseNoteTemplate(id: string) {
               </div>
             </div>
           </div>
+
+          <!-- Which identity commits: global default + this project's own choice -->
+          <template v-if="identities.length > 0">
+            <div class="sp-field">
+              <label class="sp-field__label" for="setting-identity-default">{{ t('settings.git.identityDefault') }}</label>
+              <select id="setting-identity-default" class="sp-select" :value="settings.activeIdentityId ?? ''"
+                @change="onDefaultIdentityChange">
+                <option value="">{{ t('commit.identityDefault') }}</option>
+                <option v-for="p in identities" :key="p.id" :value="p.id">{{ p.label }} — {{ p.gitEmail }}</option>
+              </select>
+              <span class="sp-hint">{{ t('settings.git.identityDefaultHint') }}</span>
+            </div>
+            <div v-if="props.cwd" class="sp-field">
+              <label class="sp-field__label" for="setting-identity-project">
+                {{ t('settings.git.identityProject', projectName) }}
+              </label>
+              <select id="setting-identity-project" class="sp-select" :value="projectIdentityId ?? ''"
+                @change="onProjectIdentityChange">
+                <option value="">{{ t('commit.identityFollowDefault') }}</option>
+                <option v-for="p in identities" :key="p.id" :value="p.id">{{ p.label }} — {{ p.gitEmail }}</option>
+              </select>
+              <span class="sp-hint">{{ t('settings.git.identityProjectHint') }}</span>
+            </div>
+          </template>
 
           <!-- ── Templates de commit ── -->
           <div class="sp-group">
@@ -2240,6 +2616,8 @@ function deleteReleaseNoteTemplate(id: string) {
 
         <!-- ═══ INTELLIGENCE ARTIFICIELLE ═══ -->
         <template v-if="activeSettingsTab === 'ai'">
+          <h3 class="sp-section-label">{{ t('settings.sectionLabel.ai') }}</h3>
+
           <!-- Enable AI -->
           <div class="sp-row sp-row--checkbox">
             <label class="sp-checkbox-label" for="setting-ai-enabled">
@@ -2291,34 +2669,11 @@ function deleteReleaseNoteTemplate(id: string) {
                  bug: no behavior change here, just an indicator so this isn't invisible
                  in the provider UI). -->
             <div
-              v-if="claudeCliInfo?.found && ((settings.aiProvider === 'claude' && !settings.aiApiKey)
-                || (settings.aiProvider === 'openai-compat' && (!settings.aiApiKey || !settings.aiApiEndpoint)))"
+              v-if="claudeCliInfo?.found && ((settings.aiProvider === 'claude' && !aiKeyConfigured)
+                || (settings.aiProvider === 'openai-compat' && (!aiKeyConfigured || !settings.aiApiEndpoint)))"
               class="sp-row"
             >
               <span class="sp-hint">{{ t('settings.aiProviderCliFallbackHint') }}</span>
-            </div>
-
-            <!-- Per-provider model picker for CLI agents (v2.17). Dynamic
-                 enumeration for opencode (`opencode models`); curated aliases
-                 for Claude Code; free-text fallback for Codex. -->
-            <div v-if="isCliAgentProvider" class="sp-row">
-              <label class="sp-label" for="setting-ai-cli-model">{{ t('settings.aiModelLabel') }}</label>
-              <select v-if="cliModelOptions.length > 0" id="setting-ai-cli-model" class="sp-select"
-                :value="currentCliModel()"
-                @change="onCliModelChange(($event.target as HTMLSelectElement).value)">
-                <option value="">{{ t('settings.aiModelCliDefault') }}</option>
-                <option v-for="m in cliModelOptions" :key="m" :value="m">{{ m }}</option>
-              </select>
-              <input v-else id="setting-ai-cli-model" class="sp-input mono" type="text"
-                :value="currentCliModel()"
-                @input="onCliModelChange(($event.target as HTMLInputElement).value)"
-                :placeholder="t('settings.aiModelCliPlaceholder')" />
-              <span class="sp-hint">
-                {{ cliModelsLoading ? t('settings.aiModelCliLoading') : t('settings.aiModelCliHint') }}
-                <button v-if="settings.aiProvider === 'opencode-cli'" class="sp-text-btn" @click="loadCliModels()">
-                  {{ t('settings.aiModelCliRefresh') }}
-                </button>
-              </span>
             </div>
 
             <!-- Claude provider -->
@@ -2340,7 +2695,11 @@ function deleteReleaseNoteTemplate(id: string) {
 
               <!-- Connect flow -->
               <template v-if="claudeAuthMode === 'connect'">
-                <div v-if="settings.aiApiKey" class="sp-row">
+                <div v-if="aiKeyWarning" class="sp-row sp-connect-error">
+                  {{ aiKeyWarning }}
+                  <button v-if="aiKey.legacyKeyStuck.value" class="sp-text-btn" @click="aiKey.discardLegacyKey()">{{ t('settings.aiLegacyKeyRemove') }}</button>
+                </div>
+                <div v-if="aiKeyConfigured" class="sp-row">
                   <div class="sp-connected-badge">
                     <span class="sp-connected-dot"></span>
                     <span>{{ t('settings.aiAuthConnected', maskedApiKey) }}</span>
@@ -2404,9 +2763,9 @@ function deleteReleaseNoteTemplate(id: string) {
                   <label class="sp-label" for="setting-ai-key">{{ t('settings.aiApiKeyLabel') }}</label>
                   <div class="sp-key-row">
                     <input id="setting-ai-key" class="sp-input mono sp-input--key"
-                      :type="showApiKey ? 'text' : 'password'" :value="settings.aiApiKey"
-                      @input="updateSetting('aiApiKey', ($event.target as HTMLInputElement).value)"
-                      placeholder="sk-ant-api03-..." />
+                      :type="showApiKey ? 'text' : 'password'" v-model="apiKeyDraft"
+                      autocomplete="off" @change="saveApiKeyDraft"
+                      :placeholder="maskedApiKey || 'sk-ant-api03-...'" />
                     <button class="sp-key-toggle" @click="showApiKey = !showApiKey"
                       :title="showApiKey ? t('settings.aiHideKey') : t('settings.aiShowKey')">
                       <svg v-if="showApiKey" width="16" height="16" viewBox="0 0 16 16" fill="none"
@@ -2422,21 +2781,21 @@ function deleteReleaseNoteTemplate(id: string) {
                       </svg>
                     </button>
                   </div>
+                  <div v-if="aiKeyConfigured" class="sp-key-stored">
+                    <span class="sp-hint">{{ t('settings.aiApiKeyStored', maskedApiKey) }}</span>
+                    <button class="sp-text-btn" @click="clearApiKey">{{ t('settings.aiAuthDisconnect') }}</button>
+                  </div>
+                  <div v-if="aiKeyWarning" class="sp-connect-error">
+                    {{ aiKeyWarning }}
+                    <button v-if="aiKey.legacyKeyStuck.value" class="sp-text-btn" @click="aiKey.discardLegacyKey()">{{ t('settings.aiLegacyKeyRemove') }}</button>
+                  </div>
+                  <div v-if="apiKeyError" class="sp-connect-error">{{ apiKeyError }}</div>
                   <span class="sp-hint">{{ t('settings.aiApiKeyAvailable') }} <a
                       href="https://console.anthropic.com/settings/keys" target="_blank"
                       class="sp-link">console.anthropic.com</a></span>
                 </div>
               </template>
 
-              <div class="sp-row">
-                <label class="sp-label" for="setting-ai-model-claude">{{ t('settings.aiModelLabel') }}</label>
-                <select id="setting-ai-model-claude" class="sp-select" :value="settings.aiModel"
-                  @change="updateSetting('aiModel', ($event.target as HTMLSelectElement).value)">
-                  <option value="claude-sonnet-4-20250514">{{ t('settings.aiModelSonnet') }}</option>
-                  <option value="claude-haiku-4-5-20251001">{{ t('settings.aiModelHaiku') }}</option>
-                  <option value="claude-opus-4-20250514">{{ t('settings.aiModelOpus') }}</option>
-                </select>
-              </div>
             </template>
 
             <!-- Claude Code CLI provider (piggyback on user's subscription) -->
@@ -2710,6 +3069,7 @@ function deleteReleaseNoteTemplate(id: string) {
                 <label class="sp-label" for="setting-ai-endpoint">{{ t('settings.aiCompatEndpoint') }}</label>
                 <input id="setting-ai-endpoint" class="sp-input mono" type="text" :value="settings.aiApiEndpoint"
                   @input="updateSetting('aiApiEndpoint', ($event.target as HTMLInputElement).value)"
+                  @blur="onEndpointBlur"
                   placeholder="https://api.openai.com/v1" />
                 <span class="sp-hint">{{ t('settings.aiCompatEndpointHint') }}</span>
               </div>
@@ -2718,9 +3078,9 @@ function deleteReleaseNoteTemplate(id: string) {
                 <label class="sp-label" for="setting-ai-key-compat">{{ t('settings.aiCompatApiKey') }}</label>
                 <div class="sp-key-row">
                   <input id="setting-ai-key-compat" class="sp-input mono sp-input--key"
-                    :type="showApiKey ? 'text' : 'password'" :value="settings.aiApiKey"
-                    @input="updateSetting('aiApiKey', ($event.target as HTMLInputElement).value)"
-                    placeholder="sk-..." />
+                    :type="showApiKey ? 'text' : 'password'" v-model="apiKeyDraft"
+                    autocomplete="off" @change="saveApiKeyDraft"
+                    :placeholder="maskedApiKey || 'sk-...'" />
                   <button class="sp-key-toggle" @click="showApiKey = !showApiKey"
                     :title="showApiKey ? t('settings.aiHideKey') : t('settings.aiShowKey')">
                     <svg v-if="showApiKey" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
@@ -2736,12 +3096,59 @@ function deleteReleaseNoteTemplate(id: string) {
                     </svg>
                   </button>
                 </div>
+                <div v-if="aiKeyConfigured" class="sp-key-stored">
+                  <span class="sp-hint">{{ t('settings.aiApiKeyStored', maskedApiKey) }}</span>
+                  <button class="sp-text-btn" @click="clearApiKey">{{ t('settings.aiAuthDisconnect') }}</button>
+                </div>
+                <div v-if="aiKeyWarning" class="sp-connect-error">
+                  {{ aiKeyWarning }}
+                  <button v-if="aiKey.legacyKeyStuck.value" class="sp-text-btn" @click="aiKey.discardLegacyKey()">{{ t('settings.aiLegacyKeyRemove') }}</button>
+                </div>
+                <div v-if="apiKeyError" class="sp-connect-error">{{ apiKeyError }}</div>
               </div>
 
+            </template>
+
+            <!-- Model + effort picker. The list is fetched from the provider
+                 (Anthropic / OpenAI-compatible `models` endpoint, `opencode
+                 models`, `agy models`, `copilot help config`, `codex debug
+                 models`) or curated
+                 (Claude Code aliases); an
+                 empty list falls back to free-text entry. -->
+            <template v-if="hasModelPicker">
               <div class="sp-row">
-                <label class="sp-label" for="setting-ai-model-compat">{{ t('settings.aiModelLabel') }}</label>
-                <input id="setting-ai-model-compat" class="sp-input mono" type="text" :value="settings.aiModel"
-                  @input="updateSetting('aiModel', ($event.target as HTMLInputElement).value)" placeholder="gpt-4o" />
+                <div class="sp-label-row">
+                  <label class="sp-label" for="setting-ai-model">{{ t('settings.aiModelLabel') }}</label>
+                  <span class="sp-label-aside">(<button class="sp-text-btn sp-label-aside__btn"
+                      :disabled="modelsLoading" @click="loadModels()">{{ t('settings.aiModelCliRefresh') }}</button>)</span>
+                </div>
+                <select v-if="modelOptions.length > 0" id="setting-ai-model" class="sp-select"
+                  :value="currentModel"
+                  @change="onModelChange(($event.target as HTMLSelectElement).value)">
+                  <option v-if="isCliAgentProvider" value="">{{ t('settings.aiModelCliDefault') }}</option>
+                  <option v-else-if="!currentModelOption && currentModel" :value="currentModel">{{ currentModel }}</option>
+                  <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ modelOptionLabel(m) }}</option>
+                </select>
+                <input v-else id="setting-ai-model" class="sp-input mono" type="text"
+                  :value="currentModel"
+                  @input="onModelChange(($event.target as HTMLInputElement).value)"
+                  :placeholder="settings.aiProvider === 'openai-compat' ? 'gpt-4o' : t('settings.aiModelCliPlaceholder')" />
+                <span class="sp-hint">
+                  <template v-if="modelsLoading">{{ t('settings.aiModelCliLoading') }}</template>
+                  <template v-else-if="modelsError">{{ t('settings.aiModelsFetchError', modelsError) }}</template>
+                  <template v-else-if="isCliAgentProvider">{{ t('settings.aiModelCliHint') }}</template>
+                  <template v-else>{{ t('settings.aiModelsFetchedHint') }}</template>
+                </span>
+              </div>
+
+              <div v-if="effortOptions.length > 0" class="sp-row">
+                <label class="sp-label" for="setting-ai-effort">{{ t('settings.aiEffortLabel') }}</label>
+                <select id="setting-ai-effort" class="sp-select" :value="currentEffort"
+                  @change="onEffortChange(($event.target as HTMLSelectElement).value)">
+                  <option value="">{{ t('settings.aiEffortDefault') }}</option>
+                  <option v-for="e in effortOptions" :key="e" :value="e">{{ e }}</option>
+                </select>
+                <span class="sp-hint">{{ t('settings.aiEffortHint') }}</span>
               </div>
             </template>
 
@@ -2974,99 +3381,6 @@ function deleteReleaseNoteTemplate(id: string) {
               </div>
             </div>
 
-            <!-- ─── Prompt Presets (v2.13) ─────────────────── -->
-            <div class="sp-section-divider sp-section-divider--inner"></div>
-            <div class="sp-group">
-              <div class="sp-group__head">
-                <div class="sp-group__head-text">
-                  <span class="sp-group__label">{{ t('settings.ai.presets.title') }}</span>
-                  <span class="sp-group__sublabel">{{ t('settings.ai.presets.hint') }}</span>
-                </div>
-                <button v-if="!showPresetForm" class="sp-group__action" @click="openAddPreset">
-                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5"
-                    aria-hidden="true">
-                    <path d="M8 3v10M3 8h10" />
-                  </svg>
-                  {{ t('settings.ai.presets.add') }}
-                </button>
-              </div>
-
-              <div class="sp-group__body">
-                <!-- Built-in presets -->
-                <div v-for="preset in BUILTIN_PRESETS" :key="preset.id" class="sp-group__row sp-group__row--muted">
-                  <div class="sp-group__row-info">
-                    <span class="sp-group__row-name">{{ preset.name }}</span>
-                    <span class="sp-group__row-meta">{{ preset.description }}</span>
-                  </div>
-                  <div class="sp-group__row-aside" style="opacity:1">
-                    <span class="sp-tag">{{ t('settings.ai.presets.builtinBadge') }}</span>
-                  </div>
-                </div>
-
-                <!-- Divider built-in → custom -->
-                <div class="sp-group__sep">{{ t('settings.ai.presets.customLabel') }}</div>
-
-                <!-- Custom presets empty -->
-                <div v-if="userPresets.length === 0 && !showPresetForm" class="sp-group__empty">
-                  {{ t('settings.ai.presets.empty') }}
-                </div>
-
-                <!-- Custom preset rows -->
-                <div v-for="preset in userPresets" :key="preset.id" class="sp-group__row">
-                  <div class="sp-group__row-info">
-                    <span class="sp-group__row-name">{{ preset.name }}</span>
-                    <span class="sp-group__row-meta">{{ preset.description || '—' }}</span>
-                  </div>
-                  <div class="sp-group__row-aside">
-                    <button class="sp-ghost-btn" @click="openEditPreset(preset)"
-                      :title="t('settings.git.identityEdit')">
-                      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
-                        stroke-width="1.5">
-                        <path d="M11.5 2.5l2 2L5 13H3v-2L11.5 2.5z" />
-                      </svg>
-                    </button>
-                    <button class="sp-ghost-btn sp-ghost-btn--danger" @click="removePreset(preset.id)"
-                      :title="t('settings.git.identityDelete')">
-                      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
-                        stroke-width="1.5">
-                        <path d="M4 4l8 8M12 4l-8 8" />
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-
-                <!-- Preset add/edit form -->
-                <div v-if="showPresetForm" class="sp-group__form">
-                  <div class="sp-group__form-grid sp-group__form-grid--1col">
-                    <div class="sp-field">
-                      <label class="sp-field__label">{{ t('settings.ai.presets.formName') }}</label>
-                      <input class="sp-input sp-input--sm" v-model="presetForm.name"
-                        :placeholder="t('settings.ai.presets.formName')" />
-                    </div>
-                    <div class="sp-field">
-                      <label class="sp-field__label">{{ t('settings.ai.presets.formDescription') }} <span
-                          class="sp-field__optional">— optionnel</span></label>
-                      <input class="sp-input sp-input--sm" v-model="presetForm.description"
-                        :placeholder="t('settings.ai.presets.formDescription')" />
-                    </div>
-                    <div class="sp-field">
-                      <label class="sp-field__label">Prompt système</label>
-                      <textarea class="sp-textarea sp-input--sm mono" v-model="presetForm.systemPrompt"
-                        :placeholder="t('settings.ai.presets.formPromptPlaceholder')" rows="6" />
-                      <span class="sp-field__hint">{{ t('settings.ai.presets.formLangHint') }}</span>
-                    </div>
-                  </div>
-                  <div class="sp-group__form-footer">
-                    <button class="btn btn--ghost sp-btn--sm" @click="showPresetForm = false">{{ t('common.cancel')
-                    }}</button>
-                    <button class="btn btn--primary sp-btn--sm" @click="savePresetForm"
-                      :disabled="!presetForm.name.trim() || !presetForm.systemPrompt.trim()">{{ t('common.save')
-                      }}</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
             <!-- AI info box -->
             <div class="sp-info-box">
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
@@ -3079,9 +3393,7 @@ function deleteReleaseNoteTemplate(id: string) {
           </template>
 
           <!-- ─── AI fallback (v2.5 — .gitwandrc per-repo) ─────── -->
-          <div class="sp-section-divider"></div>
-
-          <h3 class="sp-section-title">{{ t('settings.ai.fallback.title') }}</h3>
+          <h3 class="sp-section-label">{{ t('settings.ai.fallback.title') }}</h3>
 
           <!-- No repo open → disable the entire block with an info message -->
           <div v-if="!llmFallbackHasRepo" class="sp-info-box">
@@ -3190,45 +3502,117 @@ function deleteReleaseNoteTemplate(id: string) {
           </template>
         </template>
 
-        <!-- ═══ RELEASE NOTES ═══ -->
-        <template v-if="activeSettingsTab === 'releaseNotes'">
-          <div class="sp-group">
+        <!-- ═══ AI TEMPLATES ═══ -->
+        <template v-if="activeSettingsTab === 'aiTemplates'">
+          <!-- Commit message language -->
+          <div v-if="aiTemplateKind === 'commit'" class="sp-row">
+            <label class="sp-label" for="setting-commit-lang">{{ t('settings.commitMessageLang') }}</label>
+            <select id="setting-commit-lang" class="sp-select" :value="settings.commitMessageLang || 'en'"
+              @change="updateSetting('commitMessageLang', ($event.target as HTMLSelectElement).value)">
+              <option v-for="loc in supportedLocales" :key="loc" :value="loc">{{ localeLabels[loc] }}</option>
+            </select>
+            <span class="sp-hint">{{ t('settings.commitMessageLangHint') }}</span>
+            <span class="sp-hint">{{ t('settings.aiTemplates.langDefaultNote') }}</span>
+            <span class="sp-hint">{{ t('settings.aiTemplates.langOverrideNote') }}</span>
+          </div>
+
+          <!-- PR AI language -->
+          <div v-if="aiTemplateKind === 'pr'" class="sp-row">
+            <label class="sp-label" for="setting-pr-ai-lang">{{ t('settings.prAiLanguage') }}</label>
+            <select id="setting-pr-ai-lang" class="sp-select" :value="settings.prDescriptionLang || 'en'"
+              @change="updateSetting('prDescriptionLang', ($event.target as HTMLSelectElement).value)">
+              <option v-for="loc in supportedLocales" :key="loc" :value="loc">{{ localeLabels[loc] }}</option>
+            </select>
+            <span class="sp-hint">{{ t('settings.prAiLanguageHint') }}</span>
+            <span class="sp-hint">{{ t('settings.aiTemplates.langDefaultNote') }}</span>
+            <span class="sp-hint">{{ t('settings.aiTemplates.langOverrideNote') }}</span>
+          </div>
+
+          <!-- Release notes language -->
+          <div v-if="aiTemplateKind === 'releaseNotes'" class="sp-row">
+            <label class="sp-label" for="setting-release-notes-lang">{{ t('settings.releaseNotesLang') }}</label>
+            <select id="setting-release-notes-lang" class="sp-select" :value="settings.releaseNotesLang || 'en'"
+              @change="updateSetting('releaseNotesLang', ($event.target as HTMLSelectElement).value)">
+              <option v-for="loc in supportedLocales" :key="loc" :value="loc">{{ localeLabels[loc] }}</option>
+            </select>
+            <span class="sp-hint">{{ t('settings.releaseNotesLangHint') }}</span>
+            <span class="sp-hint">{{ t('settings.aiTemplates.langDefaultNote') }}</span>
+            <span class="sp-hint">{{ t('settings.aiTemplates.langOverrideNote') }}</span>
+          </div>
+
+          <!-- ── Prompt templates ── -->
+          <h3 class="sp-section-label">{{ t('settings.aiTemplates.promptTemplatesLabel') }}</h3>
+
+          <div class="sp-group sp-group--ait">
             <div class="sp-group__head">
               <div class="sp-group__head-text">
-                <span class="sp-group__label">{{ t('settings.ai.releaseNotes.title') }}</span>
                 <span class="sp-group__sublabel">
-                  {{ t('settings.ai.releaseNotes.hint') }}
-                  <span style="display: block; margin-top: 4px; font-style: italic; opacity: 0.85;">
-                    {{ t('settings.ai.releaseNotes.sharedNote') }}
-                  </span>
+                  {{ t(aiTemplateKindHint[aiTemplateKind]) }}
+                  <span class="sp-ait-shared">{{ t('settings.aiTemplates.sharedNote') }}</span>
                 </span>
               </div>
             </div>
 
             <div class="sp-group__body">
-              <!-- Custom templates empty -->
-              <div v-if="settings.releaseNoteTemplates.length === 0 && !showReleaseNoteTemplateForm" class="sp-group__empty">
-                {{ t('settings.ai.releaseNotes.empty') }}
+              <div class="sp-group__sep">{{ t('settings.aiTemplates.default') }}</div>
+
+              <!-- Built-in templates (Default first): read-only, view + duplicate -->
+              <div v-for="tpl in aiBuiltinTemplates" :key="tpl.id" class="sp-group__row sp-group__row--muted">
+                <div class="sp-group__row-info">
+                  <span class="sp-group__row-name sp-profile-name">{{ aiTemplateName(tpl) }}</span>
+                  <span class="sp-group__row-meta sp-profile-meta">{{ aiTemplateMeta(tpl) }}</span>
+                </div>
+                <div class="sp-group__row-aside" style="opacity:1">
+                  <span class="sp-tag">{{ t('settings.aiTemplates.builtinBadge') }}</span>
+                  <button class="sp-ghost-btn" @click="openAiTemplateForm('view', tpl)"
+                    :title="t('settings.aiTemplates.view')" :aria-label="t('settings.aiTemplates.view')">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                      stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z" />
+                      <circle cx="8" cy="8" r="2" />
+                    </svg>
+                  </button>
+                  <button class="sp-ghost-btn" @click="duplicateAiTemplate(tpl)"
+                    :title="t('settings.aiTemplates.duplicate')" :aria-label="t('settings.aiTemplates.duplicate')">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                      stroke-width="1.5" stroke-linejoin="round">
+                      <rect x="5" y="5" width="9" height="9" rx="1.5" />
+                      <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
+                    </svg>
+                  </button>
+                </div>
               </div>
 
-              <!-- Custom template rows -->
-              <div v-for="tpl in settings.releaseNoteTemplates" :key="tpl.id" class="sp-group__row">
+              <div class="sp-group__sep">{{ t('settings.aiTemplates.customLabel') }}</div>
+
+              <div v-if="aiUserTemplates.length === 0 && aiTemplateFormMode !== 'add'" class="sp-group__empty">
+                {{ t('settings.aiTemplates.empty') }}
+              </div>
+
+              <!-- User templates: edit + duplicate + delete -->
+              <div v-for="tpl in aiUserTemplates" :key="tpl.id" class="sp-group__row">
                 <div class="sp-group__row-info">
-                  <span class="sp-group__row-name">{{ tpl.name }}</span>
-                  <span class="sp-group__row-meta mono" style="font-size: var(--font-size-xs); max-height: 48px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 500px;">
-                    {{ tpl.customRules }}
-                  </span>
+                  <span class="sp-group__row-name sp-profile-name">{{ tpl.name }}</span>
+                  <span class="sp-group__row-meta sp-profile-meta">{{ aiTemplateMeta(tpl) }}</span>
                 </div>
                 <div class="sp-group__row-aside">
-                  <button class="sp-ghost-btn" @click="openEditReleaseNoteTemplate(tpl)"
-                    :title="t('settings.git.identityEdit')">
+                  <button class="sp-ghost-btn" @click="openAiTemplateForm('edit', tpl)"
+                    :title="t('settings.aiTemplates.edit')" :aria-label="t('settings.aiTemplates.edit')">
                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
                       stroke-width="1.5">
                       <path d="M11.5 2.5l2 2L5 13H3v-2L11.5 2.5z" />
                     </svg>
                   </button>
-                  <button class="sp-ghost-btn sp-ghost-btn--danger" @click="deleteReleaseNoteTemplate(tpl.id)"
-                    :title="t('settings.git.identityDelete')">
+                  <button class="sp-ghost-btn" @click="duplicateAiTemplate(tpl)"
+                    :title="t('settings.aiTemplates.duplicate')" :aria-label="t('settings.aiTemplates.duplicate')">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                      stroke-width="1.5" stroke-linejoin="round">
+                      <rect x="5" y="5" width="9" height="9" rx="1.5" />
+                      <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
+                    </svg>
+                  </button>
+                  <button class="sp-ghost-btn sp-ghost-btn--danger" @click="deleteAiTemplate(tpl.id)"
+                    :title="t('settings.aiTemplates.delete')" :aria-label="t('settings.aiTemplates.delete')">
                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"
                       stroke-width="1.5">
                       <path d="M4 4l8 8M12 4l-8 8" />
@@ -3237,48 +3621,77 @@ function deleteReleaseNoteTemplate(id: string) {
                 </div>
               </div>
 
-              <!-- Template add/edit form -->
-              <div v-if="showReleaseNoteTemplateForm" class="sp-group__form">
+              <button v-if="!aiTemplateFormMode" class="sp-group__row sp-ait-add" @click="openAiTemplateForm('add')">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5"
+                  aria-hidden="true">
+                  <path d="M8 3v10M3 8h10" />
+                </svg>
+                {{ t('settings.aiTemplates.add') }}
+              </button>
+
+              <!-- Add / edit / view form -->
+              <div v-if="aiTemplateFormMode" class="sp-group__form">
                 <div class="sp-group__form-grid sp-group__form-grid--1col">
                   <div class="sp-field">
-                    <label class="sp-field__label">{{ t('settings.ai.releaseNotes.formName') }}</label>
-                    <input class="sp-input sp-input--sm" v-model="releaseNoteTemplateForm.name"
-                      :placeholder="t('settings.ai.releaseNotes.formName')" />
+                    <label class="sp-field__label">{{ t('settings.aiTemplates.formName') }}</label>
+                    <input class="sp-input sp-input--sm" v-model="aiTemplateForm.name"
+                      :readonly="aiTemplateFormMode === 'view'"
+                      :placeholder="t('settings.aiTemplates.formName')" />
                   </div>
                   <div class="sp-field">
-                    <label class="sp-field__label">{{ t('settings.ai.releaseNotes.formRules') }}</label>
-                    <textarea class="sp-textarea sp-input--sm mono" style="min-height: 260px;" v-model="releaseNoteTemplateForm.customRules"
-                      :placeholder="t('settings.ai.releaseNotes.formRulesPlaceholder')" rows="12" />
+                    <label class="sp-field__label">{{ t('settings.aiTemplates.formDescription') }}</label>
+                    <input class="sp-input sp-input--sm" v-model="aiTemplateForm.description"
+                      :readonly="aiTemplateFormMode === 'view'"
+                      :placeholder="t('settings.aiTemplates.formDescription')" />
+                  </div>
+                  <div class="sp-field">
+                    <label class="sp-field__label">{{ t('settings.aiTemplates.formPrompt') }}</label>
+                    <textarea class="sp-textarea sp-input--sm mono sp-ait-prompt" v-model="aiTemplateForm.systemPrompt"
+                      :readonly="aiTemplateFormMode === 'view'"
+                      :placeholder="t('settings.aiTemplates.formPromptPlaceholder')" rows="14" />
+                    <span class="sp-field__hint">
+                      {{ aiTemplateFormMode === 'view' ? t('settings.aiTemplates.readOnlyHint') : t('settings.aiTemplates.formLangHint') }}
+                    </span>
+                    <span v-if="aiTemplateKind === 'pr' && aiTemplateFormMode !== 'view'" class="sp-field__hint">
+                      {{ t('settings.aiTemplates.prFormatHint') }}
+                    </span>
                   </div>
                 </div>
                 <div class="sp-group__form-footer">
-                  <button class="btn btn--ghost sp-btn--sm" @click="showReleaseNoteTemplateForm = false">{{ t('common.cancel')
-                  }}</button>
-                  <button class="btn btn--primary sp-btn--sm" @click="saveReleaseNoteTemplateForm"
-                    :disabled="!releaseNoteTemplateForm.name.trim() || !releaseNoteTemplateForm.customRules.trim()">{{ t('common.save')
-                    }}</button>
+                  <template v-if="aiTemplateFormMode === 'view'">
+                    <button class="btn btn--ghost sp-btn--sm" @click="closeAiTemplateForm">{{ t('common.close') }}</button>
+                    <button class="btn btn--primary sp-btn--sm" @click="duplicateViewedAiTemplate">
+                      {{ t('settings.aiTemplates.duplicate') }}
+                    </button>
+                  </template>
+                  <template v-else>
+                    <button class="btn btn--ghost sp-btn--sm" @click="closeAiTemplateForm">{{ t('common.cancel') }}</button>
+                    <button class="btn btn--primary sp-btn--sm" @click="saveAiTemplateForm"
+                      :disabled="!aiTemplateForm.name.trim() || !aiTemplateForm.systemPrompt.trim()">
+                      {{ t('common.save') }}
+                    </button>
+                  </template>
                 </div>
               </div>
             </div>
-
-            <button v-if="!showReleaseNoteTemplateForm" class="btn btn--primary add-btn" @click="openAddReleaseNoteTemplate">
-                {{ t('settings.ai.releaseNotes.add') }}
-            </button>
           </div>
         </template>
 
         <!-- ═══ AUTOMATIONS ═══ -->
         <!-- ═══ ACCOUNTS ═══ -->
         <template v-if="activeSettingsTab === 'accounts'">
+          <h3 class="sp-section-label">{{ t('settings.sectionLabel.accounts') }}</h3>
           <SettingsAccountsTab />
         </template>
 
         <!-- ═══ MCP ═══ -->
         <template v-if="activeSettingsTab === 'mcp'">
+          <h3 class="sp-section-label">{{ t('settings.sectionLabel.mcp') }}</h3>
           <SettingsMcpTab :cwd="props.cwd" />
         </template>
 
         <template v-if="activeSettingsTab === 'automations'">
+          <h3 class="sp-section-label">{{ t('settings.sectionLabel.automations') }}</h3>
           <AutomationsPanel />
         </template>
 
@@ -3290,13 +3703,12 @@ function deleteReleaseNoteTemplate(id: string) {
 
         <!-- ═══ LOGS ═══ -->
         <template v-if="activeSettingsTab === 'logs'">
-          <div class="sp-logs-header">
-            <h3 class="sp-section-title">{{ t('settings.logsTitle') }}</h3>
+          <div v-if="(props.errorLog?.length ?? 0) > 0" class="sp-logs-header">
             <div class="sp-logs-actions">
-              <button v-if="(props.errorLog?.length ?? 0) > 0" class="bm-btn bm-btn--ghost" @click="copyAllLogs">
+              <button class="bm-btn bm-btn--ghost" @click="copyAllLogs">
                 {{ t('settings.logsCopyAll') }}
               </button>
-              <button v-if="(props.errorLog?.length ?? 0) > 0" class="bm-btn bm-btn--ghost" @click="emit('clearLogs')">
+              <button class="bm-btn bm-btn--ghost" @click="emit('clearLogs')">
                 {{ t('settings.logsClear') }}
               </button>
             </div>
@@ -3330,32 +3742,36 @@ function deleteReleaseNoteTemplate(id: string) {
 .sp-layout {
   display: flex;
   flex-direction: row;
-  height: 72vh;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
 /* ─── Left nav sidebar ─────────────────────────────────── */
+/* Mirrors HelpView's .help-nav / .help-nav__item look. */
 .sp-nav {
-  width: 196px;
+  width: 220px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--color-border);
-  padding: var(--space-4) 0 var(--space-3);
+  padding: var(--space-5, 16px) 0 var(--space-3);
   overflow-y: auto;
-  background: var(--color-bg-subtle, var(--color-bg));
 }
 
 .sp-nav-group {
-  padding: 0 var(--space-3) var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1, 2px);
+  padding: 0 var(--space-4, 12px) var(--space-5);
 }
 
 .sp-nav-group-label {
   display: block;
-  padding: var(--space-2) var(--space-3);
-  font-size: 11px;
-  font-weight: var(--font-weight-semibold);
-  color: var(--color-text-subtle, var(--color-text-muted));
+  padding: var(--space-2) var(--space-4, 12px);
+  font-size: 12px;
+  font-weight: var(--font-weight-bold, 700);
+  color: var(--color-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.07em;
   user-select: none;
@@ -3366,26 +3782,27 @@ function deleteReleaseNoteTemplate(id: string) {
   align-items: center;
   gap: var(--space-3);
   width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-muted);
-  background: none;
+  padding: var(--space-3, 6px) var(--space-4, 12px);
+  border-radius: var(--radius-md, 6px);
+  font-size: var(--font-size-base, 13px);
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--color-text);
+  background: transparent;
   border: none;
   cursor: pointer;
   text-align: left;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition: background var(--transition-base), color var(--transition-base);
 }
 
 .sp-nav-item:hover {
-  background: var(--color-bg-elevated, var(--color-surface));
+  background: var(--color-bg-tertiary);
   color: var(--color-text);
 }
 
-.sp-nav-item--active {
-  background: var(--color-bg-elevated, var(--color-surface));
-  color: var(--color-text);
+.sp-nav-item--active,
+.sp-nav-item--active:hover {
+  background: var(--color-accent-soft, rgba(99, 102, 241, 0.1));
+  color: var(--color-accent);
 }
 
 .sp-nav-item svg {
@@ -3454,35 +3871,62 @@ function deleteReleaseNoteTemplate(id: string) {
   flex: 1;
 }
 
+/* Version centred both ways in the strip below the line. The negative
+   bottom margin cancels .sp-nav's bottom padding so the strip is symmetric. */
 .sp-nav-footer {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  justify-content: center;
+  min-height: 40px;
+  margin-bottom: calc(-1 * var(--space-3));
   padding: var(--space-3) var(--space-5);
   font-size: 11px;
-  color: var(--color-text-subtle, var(--color-text-muted));
-  opacity: 0.7;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-muted);
   border-top: 1px solid var(--color-border);
   margin-top: var(--space-2);
 }
 
-.sp-nav-footer-name {
-  font-weight: var(--font-weight-semibold);
-}
-
-.sp-nav-footer-version {
-  opacity: 0.6;
-}
-
 /* ─── Right content area ───────────────────────────────── */
+/* Content is capped at 1200px wide, but the scroll container itself spans
+   to the window edge so the scrollbar sits at the far right. The cap comes
+   from a growing right padding: % padding resolves against .sp-layout's
+   width, so (100% - 220px nav) is this element's width, and subtracting
+   the 1200px cap and the left padding leaves exactly 1200px of content —
+   the same as HelpView's .help-content__inner. Base padding matches
+   HelpView's .help-content. */
 .sp-content {
   flex: 1;
   min-width: 0;
-  padding: var(--space-7) var(--space-8);
+  padding: var(--space-8, 32px) var(--space-10, 48px);
+  padding-right: max(var(--space-10, 48px), calc(100% - 220px - 1200px - var(--space-10, 48px)));
   display: flex;
   flex-direction: column;
   gap: var(--space-6);
   overflow-y: auto;
+}
+
+/* Mirrors HelpView's .help-section__title / .help-section__intro. The
+   header's margin stacks on .sp-content's gap for extra air before the
+   first setting. */
+.sp-page-header {
+  padding-bottom: var(--space-7);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.sp-page-title {
+  font-size: var(--font-size-2xl, 20px);
+  font-weight: var(--font-weight-bold, 700);
+  color: var(--color-text);
+  line-height: 1.2;
+  margin: 0 0 var(--space-1, 2px);
+}
+
+.sp-page-intro {
+  font-size: var(--font-size-lg, 14px);
+  color: var(--color-text-muted);
+  line-height: 1.6;
+  margin: 0;
 }
 
 .sp-row {
@@ -3530,6 +3974,47 @@ function deleteReleaseNoteTemplate(id: string) {
   color: var(--color-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* Section title inside a tab (accent bar on the left). Distinct from
+   .sp-label, which every form-field label uses. AutomationsPanel's
+   .aup-section-title mirrors it. */
+.sp-section-label {
+  margin: var(--space-6) 0 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding-left: var(--space-4);
+  border-left: 2px solid var(--color-accent);
+  line-height: 1.2;
+}
+
+/* First section right under the header line: tighter top spacing. */
+.sp-page-header + .sp-section-label {
+  margin-top: var(--space-4);
+}
+
+/* Label with a small inline action after it — "MODEL (Refresh)". */
+.sp-label-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.sp-label-aside {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.sp-label-aside__btn {
+  font-size: inherit;
+}
+
+.sp-label-aside__btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* Dock — position row: checkbox on the left, reset button pushed to the right. */
@@ -3656,11 +4141,40 @@ function deleteReleaseNoteTemplate(id: string) {
   padding-left: var(--space-6);
 }
 
+/* Drawn by hand: the native WebKitGTK checkbox misplaces its check mark
+   (pushed to the top-right corner) once resized to 16px. */
 .sp-checkbox {
+  appearance: none;
+  -webkit-appearance: none;
+  flex-shrink: 0;
   width: 16px;
   height: 16px;
-  accent-color: var(--color-accent);
+  margin: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  background: var(--color-bg) center / 12px 12px no-repeat;
   cursor: pointer;
+  transition: background-color var(--transition-hover), border-color var(--transition-hover);
+}
+
+.sp-checkbox:hover:not(:disabled) {
+  border-color: var(--color-accent);
+}
+
+.sp-checkbox:checked {
+  border-color: var(--color-accent);
+  background-color: var(--color-accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 6.2 5 8.6 9.5 3.6'/%3E%3C/svg%3E");
+}
+
+.sp-checkbox:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.sp-checkbox:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .sp-hint {
@@ -3708,6 +4222,12 @@ function deleteReleaseNoteTemplate(id: string) {
 /* ─── API key row ──────────────────────────────────────── */
 .sp-key-row {
   display: flex;
+  gap: var(--space-3);
+}
+
+.sp-key-stored {
+  display: flex;
+  align-items: center;
   gap: var(--space-3);
 }
 
@@ -3785,6 +4305,17 @@ function deleteReleaseNoteTemplate(id: string) {
   background: var(--color-accent);
   color: var(--color-accent-text);
   font-weight: var(--font-weight-semibold);
+}
+
+.sp-ait-shared {
+  display: block;
+  margin-top: 4px;
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.sp-ait-prompt {
+  min-height: 260px;
 }
 
 .sp-connect-flow {
@@ -3960,7 +4491,7 @@ function deleteReleaseNoteTemplate(id: string) {
 .sp-logs-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: var(--space-4);
 }
 
@@ -4072,13 +4603,6 @@ function deleteReleaseNoteTemplate(id: string) {
   height: 1px;
   background: var(--color-border);
   margin: var(--space-3) 0;
-}
-
-.sp-section-title {
-  margin: 0;
-  font-size: var(--font-size-md);
-  font-weight: var(--font-weight-semibold);
-  color: var(--color-text);
 }
 
 .sp-warning-box {
@@ -4200,7 +4724,7 @@ function deleteReleaseNoteTemplate(id: string) {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-4) var(--space-5);
   background: var(--color-bg);
   border-bottom: 1px solid var(--color-border);
   transition: background var(--transition-base);
@@ -4240,6 +4764,18 @@ function deleteReleaseNoteTemplate(id: string) {
   text-overflow: ellipsis;
 }
 
+/* Identity and AI template rows: same look as the commit panel's profile
+   menu (RepoSidebar) and the AI template menu (AiTemplateMenu). */
+.sp-profile-name {
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+}
+
+.sp-profile-meta {
+  font-size: 11px;
+  color: var(--color-text-meta);
+}
+
 .sp-group__row-aside {
   display: flex;
   align-items: center;
@@ -4251,6 +4787,10 @@ function deleteReleaseNoteTemplate(id: string) {
 
 /* ── Empty state ── */
 .sp-group__empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 41px;
   padding: var(--space-4) var(--space-3);
   font-size: var(--font-size-sm);
   color: var(--color-text-subtle);
@@ -4390,12 +4930,54 @@ function deleteReleaseNoteTemplate(id: string) {
   font-size: var(--font-size-sm);
 }
 
-.add-btn {
+/* "New template": a full-width row of the list, not a header action. */
+/* Filled accent strip so "Add template" reads as a real button. */
+.sp-ait-add {
   width: 100%;
-  margin-top: 10px;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-3);
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+}
+
+/* Same hover as AutomationsPanel's .aup-add-btn. Darken on hover rather than using --color-accent-hover: in the dark theme
+   that token is a light violet (#a78bfa) and white text on it drops to
+   ~2.7:1. Mixing in black keeps the label above 4.5:1 in both themes. */
+.sp-ait-add:hover {
+  background: color-mix(in srgb, var(--color-accent) 82%, #000);
 }
 
 /* ── v2.13 / sp-group extensions ─────────────────────── */
+
+/* AI Templates tab: list text is brighter than the default muted group look. */
+/* Sits right under its "Prompt templates" section label: pull it up to eat
+   part of .sp-content's gap so the hint reads as the label's subtext. */
+.sp-group--ait {
+  margin-top: calc(-1 * var(--space-5));
+}
+
+.sp-group--ait .sp-group__sublabel {
+  font-size: var(--font-size-base);
+  padding: var(--space-3) 0;
+  color: var(--color-text);
+  opacity: 0.85;
+}
+
+.sp-group--ait .sp-group__row--muted {
+  opacity: 1;
+}
+
+.sp-group--ait .sp-group__empty {
+  color: var(--color-text-muted);
+}
+
 .sp-section-divider--inner {
   margin: var(--space-4) 0 var(--space-2);
 }
@@ -4426,17 +5008,23 @@ function deleteReleaseNoteTemplate(id: string) {
 }
 
 /* Separator between built-ins and custom */
+/* First divider: the body's own border already draws the top edge. */
+.sp-group__sep:first-child {
+  border-top: none;
+}
+
 .sp-group__sep {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   padding: 0 var(--space-3);
-  height: 28px;
-  font-size: var(--font-size-xs);
-  font-weight: var(--font-weight-semibold);
+  height: 31px;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-bold);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--color-text-subtle);
+  /* Text only (opacity would also fade the strip's background/borders). */
+  color: color-mix(in srgb, var(--color-text) 80%, transparent);
   background: var(--color-bg-secondary);
   border-top: 1px solid var(--color-border);
   border-bottom: 1px solid var(--color-border);

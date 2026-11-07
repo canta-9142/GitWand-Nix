@@ -554,14 +554,20 @@ fn gl_diff_stats_from_files(files: &[serde_json::Value]) -> (i64, i64) {
     let mut deletions = 0i64;
     for f in files {
         let diff = f.get("diff").and_then(|d| d.as_str()).unwrap_or("");
+        // Count only inside hunk bodies, bounded by their `@@` counts: a
+        // removed `-- x` line is `--- x` there, and must not be mistaken for
+        // a file header (nor a header outside a hunk for a change).
+        let mut body = crate::git::HunkBody::default();
         for line in diff.lines() {
-            if line.starts_with("+++") || line.starts_with("---") {
-                continue;
-            }
-            if line.starts_with('+') {
-                additions += 1;
-            } else if line.starts_with('-') {
-                deletions += 1;
+            match body.classify(line) {
+                Some(crate::git::HunkLineKind::Add) => additions += 1,
+                Some(crate::git::HunkLineKind::Delete) => deletions += 1,
+                Some(crate::git::HunkLineKind::Context) => {}
+                None => {
+                    if line.starts_with("@@") {
+                        body = crate::git::HunkBody::from_header(line);
+                    }
+                }
             }
         }
     }
@@ -1326,6 +1332,46 @@ fn gl_convert_draft_to_ready_inner(cwd: String, iid: i64) -> Result<(), String> 
 #[tauri::command]
 pub(crate) async fn gl_convert_draft_to_ready(cwd: String, iid: i64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || gl_convert_draft_to_ready_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Edit a MR's title and/or description via `glab api` (`-f` sends each
+/// value as a raw string).
+fn gl_mr_edit_inner(
+    cwd: String,
+    iid: i64,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), String> {
+    let fields = super::pr_edit::edit_fields(&title, &body, "description")?;
+    let endpoint = format!("projects/:fullpath/merge_requests/{}", iid);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "-X", "PUT", &endpoint]);
+    for (k, v) in &fields {
+        cmd.args(["-f", &format!("{}={}", k, v)]);
+    }
+    cmd.current_dir(&cwd);
+    let output =
+        output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api edit MR: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gl edit MR failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn gl_mr_edit(
+    cwd: String,
+    iid: i64,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_edit_inner(cwd, iid, title, body))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -2173,6 +2219,17 @@ mod gl_diff_stats_from_files_tests {
             "diff": "--- a/a.rs\n+++ b/a.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
         })];
         assert_eq!(gl_diff_stats_from_files(&files), (1, 1));
+    }
+
+    #[test]
+    fn counts_hunk_lines_whose_content_starts_with_dash_dash_or_plus_plus() {
+        // A removed SQL comment `-- note` is the diff line `--- note`, an added
+        // `++x` is `+++x`: inside a hunk they are changes, not file headers.
+        let files = vec![json!({
+            "new_path": "q.sql",
+            "diff": "--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,3 @@\n--- note\n+++x\n ctx\n---- y\n++++ z\n"
+        })];
+        assert_eq!(gl_diff_stats_from_files(&files), (2, 2));
     }
 
     #[test]

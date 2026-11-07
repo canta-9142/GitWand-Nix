@@ -1,21 +1,23 @@
 <script setup lang="ts">
 import { computed, ref, nextTick, onMounted, onUnmounted, watch, inject } from "vue";
-import { TOGGLE_GIT_TREE_KEY } from "../composables/branchPickerBridge";
+import { TOGGLE_GIT_TREE_KEY, COMMIT_MESSAGE_SINK_KEY, OPEN_SETTINGS_KEY } from "../composables/branchPickerBridge";
 import { type RepoFileEntry, type ViewMode } from "../composables/useGitRepo";
 import { gitRemoteInfo, getGitUser, type GitLogEntry, type GitBranch, type RemoteInfo, type GitUser, type GitDiff } from "../utils/backend";
 import PrListSidebar from "./PrListSidebar.vue";
 import ScopePicker from "./ScopePicker.vue";
+import TrackedIgnoredNotice from "./TrackedIgnoredNotice.vue";
 import { useI18n } from "../composables/useI18n";
 import Avatar from "./Avatar.vue";
 import { useCommitMessage } from "../composables/useCommitMessage";
 import { useAIProvider } from "../composables/useAIProvider";
-import { supportedLocales, localeLabels } from "../locales";
 import { useAbsorb, type AbsorbCandidate } from "../composables/useAbsorb";
 import { useIdentity } from "../composables/useIdentity";
 import { useCommitTemplates } from "../composables/useCommitTemplates";
 import { useArchivedBranches } from "../composables/useArchivedBranches";
 import { usePinnedBranches } from "../composables/usePinnedBranches";
 import { useAiPromptPresets } from "../composables/useAiPromptPresets";
+import AiTemplateMenu from "./AiTemplateMenu.vue";
+import { getTemplateLang } from "../composables/useAiTemplates";
 import {
   buildFileTree,
   flattenTree,
@@ -119,7 +121,7 @@ const emit = defineEmits<{
   openCommitReview: [];
 }>();
 
-const { t, locale } = useI18n();
+const { t } = useI18n();
 
 /** v3.7.0 (Task 4) — the findings badge's tooltip gains an iter/coverage
  *  suffix once at least one review pass has completed this cycle. */
@@ -487,28 +489,67 @@ const openRepoLabel = computed<string>(() => {
 
 // ─── AI commit message generation ─────────────────────────
 const ai = useAIProvider();
-const { isGenerating, lastError: aiError, generate: generateCommitMsg, transform: transformCommitMsg } = useCommitMessage();
-const aiMenuOpen = ref(false);
-const aiLangMenuOpen = ref(false);
-
-// ─── v2.13 AI Prompt Presets ──────────────────────────────
-const {
-  allWithBuiltins: allPresets,
-  activePreset,
-  activePresetId,
-  activate: activatePreset,
-} = useAiPromptPresets(() => props.cwd);
-const aiPresetMenuOpen = ref(false);
+const { isGenerating, lastError: aiError, generate: generateCommitMsg, translate: translateCommitMsg } = useCommitMessage();
+// ─── AI template (commit kind) ────────────────────────────
+// Picked from the AI chevron menu (AiTemplateMenu); applied at generation.
+const { activePreset } = useAiPromptPresets(() => props.cwd);
 
 // ─── v2.12 Identity selector ─────────────────────────────
 
-const { identities, activeIdentity, setActive: setActiveIdentity } = useIdentity(() => props.cwd);
+const { identities, activeIdentity, repoOverrideId, globalDefault, setRepoOverride } = useIdentity(() => props.cwd);
 const identityMenuOpen = ref(false);
+const identityBtn = ref<HTMLButtonElement | null>(null);
+/** Fixed position of the teleported menu, under the button's right edge. */
+const identityMenuPos = ref({ top: 0, right: 0 });
 
 function closeIdentityMenu() { identityMenuOpen.value = false; }
 
+/**
+ * The menu is teleported to <body> with fixed positioning: inside the sidebar
+ * it was clipped by the scrolling commit rail and drawn under the file list.
+ */
+function toggleIdentityMenu() {
+  if (identityMenuOpen.value) return closeIdentityMenu();
+  const rect = identityBtn.value?.getBoundingClientRect();
+  if (!rect) return;
+  identityMenuPos.value = { top: rect.bottom + 4, right: window.innerWidth - rect.right };
+  identityMenuOpen.value = true;
+}
+
+/** Fixed-positioned: any outside scroll or resize would detach it from the button. */
+function onIdentityMenuScroll(e: Event) {
+  if ((e.target as Element | null)?.closest?.(".commit-identity-menu")) return;
+  closeIdentityMenu();
+}
+function onIdentityMenuKey(e: KeyboardEvent) {
+  if (e.key === "Escape") closeIdentityMenu();
+}
+/** Dismiss listeners live only while the menu is open, whatever closes it. */
+function listenIdentityMenu(on: boolean) {
+  if (on) {
+    window.addEventListener("scroll", onIdentityMenuScroll, true);
+    window.addEventListener("resize", closeIdentityMenu);
+    window.addEventListener("keydown", onIdentityMenuKey);
+  } else {
+    window.removeEventListener("scroll", onIdentityMenuScroll, true);
+    window.removeEventListener("resize", closeIdentityMenu);
+    window.removeEventListener("keydown", onIdentityMenuKey);
+  }
+}
+watch(identityMenuOpen, listenIdentityMenu);
+onUnmounted(() => listenIdentityMenu(false));
+
+const openSettings = inject(OPEN_SETTINGS_KEY, undefined);
+
+/** Open Settings → Git, scrolled to the identities section. */
+function manageIdentities() {
+  closeIdentityMenu();
+  openSettings?.("git", "identities");
+}
+
+/** The choice is remembered for this repo only; null = follow the global default. */
 function setIdentityFromMenu(id: string | null) {
-  setActiveIdentity(id);
+  if (props.cwd) setRepoOverride(props.cwd, id);
   identityMenuOpen.value = false;
 }
 
@@ -593,45 +634,10 @@ function buildTrailers(): string {
   return lines.join("\n");
 }
 
-/** Read the commit-message language from settings (empty string = follow UI locale). */
-function getCommitMessageLang(): string {
-  try {
-    const raw = localStorage.getItem("gitwand-settings");
-    if (raw) {
-      const s = JSON.parse(raw);
-      if (s.commitMessageLang) return s.commitMessageLang;
-    }
-  } catch { /* ignore */ }
-  return "";
-}
-
-/** Resolve the effective language code for AI generation. */
-function resolveCommitLang(): string {
-  const explicit = getCommitMessageLang();
-  if (explicit) return explicit;
-  // Fallback: derive from UI locale
-  return locale.value.startsWith("en") ? "en" : locale.value.split("-")[0] || "fr";
-}
-
-/** Persist the commit-message language setting. */
-function setCommitMessageLang(lang: string) {
-  try {
-    const raw = localStorage.getItem("gitwand-settings");
-    const s = raw ? JSON.parse(raw) : {};
-    s.commitMessageLang = lang;
-    localStorage.setItem("gitwand-settings", JSON.stringify(s));
-  } catch { /* ignore */ }
-}
-
-/** Close AI menu and identity/template menus when clicking outside */
+/** Close the identity / template / branch menus when clicking outside */
 function onDocClick(e: MouseEvent) {
   const target = e.target as HTMLElement;
-  if (!target.closest(".commit-ai-wrapper")) {
-    aiMenuOpen.value = false;
-    aiLangMenuOpen.value = false;
-    aiPresetMenuOpen.value = false;
-  }
-  if (!target.closest(".commit-identity")) {
+  if (!target.closest(".commit-identity") && !target.closest(".commit-identity-menu")) {
     identityMenuOpen.value = false;
   }
   if (!target.closest(".commit-template-wrapper")) {
@@ -644,9 +650,12 @@ function onDocClick(e: MouseEvent) {
 onMounted(() => document.addEventListener("click", onDocClick));
 onUnmounted(() => document.removeEventListener("click", onDocClick));
 
-function applyMessage(msg: string) {
+// Captured at setup: the AI call may resolve after this pane unmounted (view
+// switch), when emit() is a no-op. The App-level sink still reaches the draft.
+const commitMessageSink = inject(COMMIT_MESSAGE_SINK_KEY, null);
+
+function applyMessage(cwd: string, msg: string) {
   const [summary, ...rest] = msg.split("\n");
-  emit("update:commitSummary", summary.trim());
   let body = rest.join("\n").trim();
 
   // Append signature if setting is enabled
@@ -659,43 +668,39 @@ function applyMessage(msg: string) {
     }
   } catch { /* ignore */ }
 
-  emit("update:commitDescription", body);
+  if (commitMessageSink) {
+    commitMessageSink(cwd, summary.trim(), body);
+  } else {
+    emit("update:commitSummary", summary.trim());
+    emit("update:commitDescription", body);
+  }
 }
 
 async function onGenerateCommitMessage() {
   if (!props.cwd || isGenerating.value) return;
-  aiMenuOpen.value = false;
-  aiPresetMenuOpen.value = false;
-  const lang = resolveCommitLang();
+  const cwd = props.cwd;
+  const lang = getTemplateLang("commit", cwd);
   const preset = activePreset.value;
   try {
-    const msg = await generateCommitMsg(props.cwd, {
+    const msg = await generateCommitMsg(cwd, {
       locale: lang as string,
       systemPromptOverride: preset?.systemPrompt,
     });
-    applyMessage(msg);
+    applyMessage(cwd, msg);
   } catch {
     // lastError is already set by the composable — the UI shows it.
   }
 }
 
-async function onAiAction(action: "regenerate" | "shorten" | "detail" | "changeLang", targetLocale?: string) {
-  aiMenuOpen.value = false;
-  aiLangMenuOpen.value = false;
+/** Language picked in the AI menu while a message exists: translate it. */
+async function onAiTranslate(targetLocale: string) {
   if (isGenerating.value) return;
-  if (action === "regenerate") {
-    await onGenerateCommitMessage();
-    return;
-  }
-  // When changing language, also persist as new default
-  if (action === "changeLang" && targetLocale) {
-    setCommitMessageLang(targetLocale);
-  }
   const currentMsg = [props.commitSummary, props.commitDescription].filter(Boolean).join("\n");
   if (!currentMsg.trim()) return;
+  const cwd = props.cwd;
   try {
-    const msg = await transformCommitMsg(action, currentMsg, targetLocale);
-    applyMessage(msg);
+    const msg = await translateCommitMsg(currentMsg, targetLocale, cwd);
+    applyMessage(cwd, msg);
   } catch {
     // aiError is set by the composable.
   }
@@ -753,6 +758,12 @@ function fileDir(path: string): string {
 
 const totalChanges = computed(() => props.files.length);
 
+/** A file list the list/tree toggle applies to is on screen (WIP or commit). */
+const hasLayoutFiles = computed(() =>
+  (showPane("files", "changes") && totalChanges.value > 0) ||
+  (showPane("history") && (props.commitDiffs?.length ?? 0) > 0),
+);
+
 const unstagedCount = computed(() => props.repoStats.unstaged + props.repoStats.untracked);
 
 function onStageClick(e: Event, path: string) {
@@ -781,7 +792,7 @@ const ccCanScrollRight = ref(false);
 function updateCcScroll() {
   const el = ccTypesEl.value;
   if (!el) return;
-  ccCanScrollLeft.value = el.scrollLeft > 0;
+  ccCanScrollLeft.value = el.scrollLeft > 1;
   ccCanScrollRight.value = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
 }
 
@@ -789,13 +800,22 @@ function scrollCcTypes(dir: -1 | 1) {
   const el = ccTypesEl.value;
   if (!el) return;
   el.scrollLeft = dir === 1 ? el.scrollWidth : 0;
-  ccCanScrollLeft.value = dir === 1;
-  ccCanScrollRight.value = dir === -1;
 }
 
+// Keep arrows in sync with trackpad/wheel scrolling and sidebar resizes,
+// not just arrow clicks.
+let ccResizeObserver: ResizeObserver | null = null;
 watch(ccTypesEl, (el) => {
-  if (el) nextTick(updateCcScroll);
+  ccResizeObserver?.disconnect();
+  ccResizeObserver = null;
+  if (!el) return;
+  nextTick(updateCcScroll);
+  if (typeof ResizeObserver !== "undefined") {
+    ccResizeObserver = new ResizeObserver(updateCcScroll);
+    ccResizeObserver.observe(el);
+  }
 });
+onUnmounted(() => ccResizeObserver?.disconnect());
 
 /** The active type prefix extracted from the current summary, or "" if none. */
 const activePrefix = computed(() => {
@@ -901,13 +921,14 @@ interface BranchCtxMenu {
   x: number;
   y: number;
   branchName: string;
+  isRemote: boolean;
 }
-const branchCtx = ref<BranchCtxMenu>({ visible: false, x: 0, y: 0, branchName: "" });
+const branchCtx = ref<BranchCtxMenu>({ visible: false, x: 0, y: 0, branchName: "", isRemote: false });
 
-function openBranchCtx(e: MouseEvent, name: string) {
+function openBranchCtx(e: MouseEvent, b: GitBranch) {
   e.preventDefault();
   e.stopPropagation();
-  branchCtx.value = { visible: true, x: e.clientX, y: e.clientY, branchName: name };
+  branchCtx.value = { visible: true, x: e.clientX, y: e.clientY, branchName: b.name, isRemote: b.isRemote };
 }
 
 function closeBranchCtx() { branchCtx.value.visible = false; }
@@ -935,8 +956,7 @@ function onBranchCtxUnarchive() {
 const branchToDelete = computed(() => {
   if (!branchCtx.value.branchName || !props.branches) return null;
   const name = branchCtx.value.branchName;
-  // In sidebar, we don't have an explicit 'type', but we can check if it starts with origin/
-  const isRemote = name.startsWith("origin/") || name.startsWith("remotes/");
+  const isRemote = branchCtx.value.isRemote;
 
   if (!isRemote) {
     const local = props.branches.find((b) => b.name === name && !b.isRemote);
@@ -994,8 +1014,9 @@ function formatActivityDate(dateStr: string): string {
 <template>
   <nav class="repo-sidebar" :class="`repo-sidebar--${pane}`" :aria-label="t('sidebar.tabChanges')">
     <!-- Monorepo scope picker (v2.21.0) — self-hides unless the repo is a detected monorepo.
-         In the changes view it shares a row with the layout toggle (pushed to the right). -->
-    <div v-if="cwd && showPane('files', 'changes') && totalChanges > 0" class="changes-controls">
+         Shared by the WIP (changes) and commit (history) panes: it shares a row with
+         the list/tree layout toggle (pushed to the right) whenever there are files. -->
+    <div v-if="cwd && hasLayoutFiles" class="changes-controls">
       <ScopePicker :cwd="cwd" />
       <div
         class="layout-toggle"
@@ -1006,7 +1027,7 @@ function formatActivityDate(dateStr: string): string {
           class="layout-toggle-btn"
           :class="{ 'layout-toggle-btn--active': changesLayout === 'list' }"
           @click="setChangesLayout('list')"
-          :title="t('sidebar.viewAsList')"
+          v-tooltip="t('sidebar.viewAsList')"
           :aria-pressed="changesLayout === 'list'"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1019,7 +1040,7 @@ function formatActivityDate(dateStr: string): string {
           class="layout-toggle-btn"
           :class="{ 'layout-toggle-btn--active': changesLayout === 'tree' }"
           @click="setChangesLayout('tree')"
-          :title="t('sidebar.viewAsTree')"
+          v-tooltip="t('sidebar.viewAsTree')"
           :aria-pressed="changesLayout === 'tree'"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1029,7 +1050,7 @@ function formatActivityDate(dateStr: string): string {
         </button>
       </div>
     </div>
-    <ScopePicker v-else-if="cwd && showPane('files', 'changes')" :cwd="cwd" />
+    <ScopePicker v-else-if="cwd && showPane('files', 'changes', 'history')" :cwd="cwd" />
 
     <!-- History file list -->
     <div class="sections" v-if="showPane('history')">
@@ -1038,39 +1059,6 @@ function formatActivityDate(dateStr: string): string {
           <span class="section-icon section-icon--history" style="color: var(--color-accent)">H</span>
           <span class="section-label">{{ t('header.files') }}</span>
           <span class="section-count" v-if="commitDiffs">{{ commitDiffs.length }}</span>
-          <span class="section-spacer"></span>
-          <!-- List / tree layout toggle -->
-          <div
-            v-if="commitDiffs && commitDiffs.length > 0"
-            class="layout-toggle"
-            role="group"
-            :aria-label="t('sidebar.viewLayout')"
-            @click.stop
-          >
-            <button
-              class="layout-toggle-btn"
-              :class="{ 'layout-toggle-btn--active': changesLayout === 'list' }"
-              @click="setChangesLayout('list')"
-              :title="t('sidebar.viewAsList')"
-              :aria-pressed="changesLayout === 'list'"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
-                <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
-              </svg>
-            </button>
-            <button
-              class="layout-toggle-btn"
-              :class="{ 'layout-toggle-btn--active': changesLayout === 'tree' }"
-              @click="setChangesLayout('tree')"
-              :title="t('sidebar.viewAsTree')"
-              :aria-pressed="changesLayout === 'tree'"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 5h6l2 2h10v12H3z"/>
-              </svg>
-            </button>
-          </div>
         </div>
         <ul class="file-items" role="listbox" v-if="commitDiffs">
           <!-- Flat list layout -->
@@ -1168,6 +1156,9 @@ function formatActivityDate(dateStr: string): string {
       </div>
     </div>
 
+    <!-- Tracked files that now match .gitignore (self-hides when there are none) -->
+    <TrackedIgnoredNotice v-if="cwd && showPane('files', 'changes')" @refresh="emit('refresh')" />
+
     <!-- File sections -->
     <div class="sections" v-if="showPane('files', 'changes')">
       <template v-for="sectionKey in SECTION_KEYS" :key="sectionKey">
@@ -1196,18 +1187,18 @@ function formatActivityDate(dateStr: string): string {
                 v-if="sectionKey === 'changes'"
                 class="action-group-btn"
                 @click.stop="emit('stagePaths', sections[sectionKey].map(f => f.path))"
-                :title="t('sidebar.stageAll')"
+                v-tooltip="t('sidebar.stageAll')"
               >+</button>
               <button
                 v-if="sectionKey === 'staged'"
                 class="action-group-btn"
                 @click.stop="emit('unstageAll')"
-                :title="t('sidebar.unstageAll')"
+                v-tooltip="t('sidebar.unstageAll')"
               >-</button>
               <button
                 class="action-group-btn action-group-btn--danger"
                 @click.stop="emit('discardSection', sectionKey, sections[sectionKey].map(f => f.path))"
-                :title="t('sidebar.discardAll')"
+                v-tooltip="sectionKey === 'staged' ? t('sidebar.discardStagedOnly') : t('sidebar.discardChangesOnly')"
               >
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <polyline points="3 6 5 6 21 6"/>
@@ -1243,7 +1234,7 @@ function formatActivityDate(dateStr: string): string {
                 <span
                   class="file-status-badge mono"
                   :style="{ color: statusColor(file.status) }"
-                  :title="file.status"
+                  v-tooltip="file.status"
                 >
                   {{ statusBadge(file.status) }}
                 </span>
@@ -1258,7 +1249,7 @@ function formatActivityDate(dateStr: string): string {
                 <span
                   v-if="file.section === 'staged' && (reviewFindingsByFile?.[file.path] ?? 0) > 0"
                   class="file-review-count"
-                  :title="t('commitReview.fileCountTooltip', reviewFindingsByFile![file.path])"
+                  v-tooltip="t('commitReview.fileCountTooltip', reviewFindingsByFile![file.path])"
                 >{{ reviewFindingsByFile![file.path] }}</span>
                 <!-- Stage / Unstage + Discard per file -->
                 <div v-if="file.section !== 'conflicted'" class="action-group" @click.stop>
@@ -1266,18 +1257,18 @@ function formatActivityDate(dateStr: string): string {
                     v-if="file.section === 'unstaged' || file.section === 'untracked'"
                     class="action-group-btn"
                     @click="onStageClick($event, file.path)"
-                    :title="t('sidebar.stage')"
+                    v-tooltip="t('sidebar.stage')"
                   >+</button>
                   <button
                     v-if="file.section === 'staged'"
                     class="action-group-btn"
                     @click="onUnstageClick($event, file.path)"
-                    :title="t('sidebar.unstage')"
+                    v-tooltip="t('sidebar.unstage')"
                   >-</button>
                   <button
                     class="action-group-btn action-group-btn--danger"
                     @click.stop="emit('discard', file.path, file.section)"
-                    :title="file.section === 'untracked' ? t('sidebar.ctxDeleteFile') : t('sidebar.ctxDiscardChanges')"
+                    v-tooltip="file.section === 'untracked' ? t('sidebar.ctxDeleteFile') : t('sidebar.ctxDiscardChanges')"
                   >
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <polyline points="3 6 5 6 21 6"/>
@@ -1349,19 +1340,19 @@ function formatActivityDate(dateStr: string): string {
                       v-if="sectionKey === 'staged'"
                       class="action-group-btn"
                       @click.stop="unstagePaths(filesUnderFolder(sectionKey, row.path))"
-                      :title="t('sidebar.unstageAll')"
+                      v-tooltip="t('sidebar.unstageAll')"
                     >-</button>
                     <button
                       v-if="sectionKey === 'changes'"
                       class="action-group-btn"
                       @click.stop="emit('stagePaths', filesUnderFolder(sectionKey, row.path))"
-                      :title="t('sidebar.stageAll')"
+                      v-tooltip="t('sidebar.stageAll')"
                     >+</button>
                     <button
                       v-if="sectionKey !== 'conflicted'"
                       class="action-group-btn action-group-btn--danger"
                       @click.stop="emit('discardSection', sectionKey, filesUnderFolder(sectionKey, row.path))"
-                      :title="t('sidebar.discardAll')"
+                      v-tooltip="sectionKey === 'staged' ? t('sidebar.discardStagedOnlyInFolder') : t('sidebar.discardChangesOnlyInFolder')"
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <polyline points="3 6 5 6 21 6"/>
@@ -1392,7 +1383,7 @@ function formatActivityDate(dateStr: string): string {
                     <span
                       class="file-status-badge mono"
                       :style="{ color: statusColor(row.file!.status) }"
-                      :title="row.file!.status"
+                      v-tooltip="row.file!.status"
                     >
                       {{ statusBadge(row.file!.status) }}
                     </span>
@@ -1407,25 +1398,25 @@ function formatActivityDate(dateStr: string): string {
                     <span
                       v-if="row.file!.section === 'staged' && (reviewFindingsByFile?.[row.path] ?? 0) > 0"
                       class="file-review-count"
-                      :title="t('commitReview.fileCountTooltip', reviewFindingsByFile![row.path])"
+                      v-tooltip="t('commitReview.fileCountTooltip', reviewFindingsByFile![row.path])"
                     >{{ reviewFindingsByFile![row.path] }}</span>
                     <div v-if="row.file!.section !== 'conflicted'" class="action-group" @click.stop>
                       <button
                         v-if="row.file!.section === 'unstaged' || row.file!.section === 'untracked'"
                         class="action-group-btn"
                         @click="onStageClick($event, row.path)"
-                        :title="t('sidebar.stage')"
+                        v-tooltip="t('sidebar.stage')"
                       >+</button>
                       <button
                         v-if="row.file!.section === 'staged'"
                         class="action-group-btn"
                         @click="onUnstageClick($event, row.path)"
-                        :title="t('sidebar.unstage')"
+                        v-tooltip="t('sidebar.unstage')"
                       >-</button>
                       <button
                         class="action-group-btn action-group-btn--danger"
                         @click.stop="emit('discard', row.path, row.file!.section)"
-                        :title="row.file!.section === 'untracked' ? t('sidebar.ctxDeleteFile') : t('sidebar.ctxDiscardChanges')"
+                        v-tooltip="row.file!.section === 'untracked' ? t('sidebar.ctxDeleteFile') : t('sidebar.ctxDiscardChanges')"
                       >
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <polyline points="3 6 5 6 21 6"/>
@@ -1476,21 +1467,77 @@ function formatActivityDate(dateStr: string): string {
 
     <!-- Commit panel — fixed at bottom, always visible in changes view -->
     <div class="commit-panel" v-if="showPane('commit', 'changes')">
-      <!-- Conventional Commits type picker -->
-      <div class="cc-types-wrapper">
-        <button v-show="ccCanScrollLeft" class="cc-scroll-btn cc-scroll-btn--left" @click="scrollCcTypes(-1)" tabindex="-1">‹</button>
-        <div class="cc-types" ref="ccTypesEl" :title="t('sidebar.ccTypesTitle')"
-          :class="{ 'cc-types--fade-left': ccCanScrollLeft, 'cc-types--fade-right': ccCanScrollRight }">
-          <button
-            v-for="type in CC_TYPES"
-            :key="type"
-            class="cc-chip"
-            :class="{ 'cc-chip--active': activePrefix === type }"
-            @click="setCommitType(type)"
-            :title="t(`sidebar.ccType_${type}`)"
-          >{{ type }}</button>
+      <!-- Top row: Conventional Commits type picker + identity selector -->
+      <div class="commit-top-row">
+        <div class="cc-types-wrapper">
+          <button v-show="ccCanScrollLeft" class="cc-scroll-btn cc-scroll-btn--left" @click="scrollCcTypes(-1)" tabindex="-1">‹</button>
+          <div class="cc-types" ref="ccTypesEl" role="group" @scroll.passive="updateCcScroll" :aria-label="t('sidebar.ccTypesTitle')"
+            :class="{ 'cc-types--fade-left': ccCanScrollLeft, 'cc-types--fade-right': ccCanScrollRight }">
+            <button
+              v-for="type in CC_TYPES"
+              :key="type"
+              class="cc-chip"
+              :class="{ 'cc-chip--active': activePrefix === type }"
+              @click="setCommitType(type)"
+              v-tooltip="t(`sidebar.ccType_${type}`)"
+            >{{ type }}</button>
+          </div>
+          <button v-show="ccCanScrollRight" class="cc-scroll-btn cc-scroll-btn--right" @click="scrollCcTypes(1)" tabindex="-1">›</button>
         </div>
-        <button v-show="ccCanScrollRight" class="cc-scroll-btn cc-scroll-btn--right" @click="scrollCcTypes(1)" tabindex="-1">›</button>
+        <!-- Identity selector (v2.12) — shown only when profiles exist -->
+        <div v-if="identities.length > 0" class="commit-identity">
+          <button ref="identityBtn" class="commit-identity-btn" @click.stop="toggleIdentityMenu">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+              <circle cx="8" cy="6" r="3"/>
+              <path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6" stroke-linecap="round"/>
+            </svg>
+            <span class="commit-identity-name">{{ activeIdentity ? activeIdentity.label : t('commit.identityDefault') }}</span>
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
+              <path d="M1.5 3L4 5.5L6.5 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <Teleport to="body">
+            <div
+              v-if="identityMenuOpen"
+              class="commit-identity-menu"
+              :style="{ top: `${identityMenuPos.top}px`, right: `${identityMenuPos.right}px` }"
+            >
+              <div
+                class="commit-identity-item"
+                :class="{ 'commit-identity-item--active': !repoOverrideId }"
+                @click="setIdentityFromMenu(null)"
+              >
+                <div class="commit-identity-item-info">
+                  <span class="commit-identity-item-label">{{ t('commit.identityFollowDefault') }}</span>
+                  <span class="commit-identity-item-meta">{{ globalDefault ? globalDefault.label : t('commit.identityDefault') }}</span>
+                </div>
+                <span class="commit-identity-check"><svg v-if="!repoOverrideId" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              </div>
+              <div
+                v-for="p in identities"
+                :key="p.id"
+                class="commit-identity-item"
+                :class="{ 'commit-identity-item--active': repoOverrideId === p.id }"
+                @click="setIdentityFromMenu(p.id)"
+              >
+                <div class="commit-identity-item-info">
+                  <span class="commit-identity-item-label">{{ p.label }}</span>
+                  <span class="commit-identity-item-meta mono">{{ p.gitName }} &lt;{{ p.gitEmail }}&gt;</span>
+                </div>
+                <span class="commit-identity-check"><svg v-if="repoOverrideId === p.id" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              </div>
+              <template v-if="openSettings">
+                <div class="commit-identity-sep" role="separator"></div>
+                <div class="commit-identity-item commit-identity-manage" @click="manageIdentities">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+                    <path d="M2 4h12M2 8h8M2 12h10" stroke-linecap="round"/><circle cx="13" cy="12" r="2"/>
+                  </svg>
+                  <span class="commit-identity-item-label">{{ t('commit.identityManage') }}</span>
+                </div>
+              </template>
+            </div>
+          </Teleport>
+        </div>
       </div>
       <div class="commit-summary-row">
         <!-- Template slash autocomplete dropdown -->
@@ -1519,9 +1566,9 @@ function formatActivityDate(dateStr: string): string {
         <div v-if="ai.isAvailable.value" class="commit-ai-wrapper">
           <button
             class="commit-ai-btn"
-            :class="{ 'commit-ai-btn--loading': isGenerating }"
+            :class="{ 'commit-ai-btn--loading ai-loading': isGenerating }"
             :disabled="isGenerating || repoStats.staged === 0"
-            :title="isGenerating ? t('sidebar.aiGeneratingTooltip') : t('sidebar.aiGenerateTooltip')"
+            v-tooltip="isGenerating ? t('sidebar.aiGeneratingTooltip') : t('sidebar.aiGenerateTooltip')"
             @click="onGenerateCommitMessage"
           >
             <svg v-if="isGenerating" class="commit-spinner" width="12" height="12" viewBox="0 0 14 14" aria-hidden="true">
@@ -1530,74 +1577,22 @@ function formatActivityDate(dateStr: string): string {
             </svg>
             <span v-else class="commit-ai-label">{{ t('common.ai') }}</span>
           </button>
-          <button
-            class="commit-ai-chevron"
+          <!-- Chevron + shared AI menu: language, then the template list -->
+          <AiTemplateMenu
+            kind="commit"
+            :cwd="cwd"
             :disabled="isGenerating"
-            @click.stop="aiMenuOpen = !aiMenuOpen"
-            aria-label="AI actions"
-          >
-            <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
-              <path d="M1.5 3L4 5.5L6.5 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </button>
-          <ul v-if="aiMenuOpen" class="commit-ai-menu">
-            <li @click="onAiAction('regenerate')" :class="{ disabled: repoStats.staged === 0 }">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0110.47-4M14 8a6 6 0 01-10.47 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M12 1v3h-3M4 15v-3h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              {{ t('sidebar.aiRegenerate') }}
-            </li>
-            <li @click="onAiAction('shorten')" :class="{ disabled: !commitSummary }">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M3 8h6M3 12h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-              {{ t('sidebar.aiShorten') }}
-            </li>
-            <li @click="onAiAction('detail')" :class="{ disabled: !commitSummary }">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M3 8h10M3 12h10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-              {{ t('sidebar.aiDetail') }}
-            </li>
-            <li class="commit-ai-menu-parent" :class="{ disabled: !commitSummary }" @click.stop="commitSummary && (aiLangMenuOpen = !aiLangMenuOpen)">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.2"/><path d="M2.5 8h11M8 2.5c-1.5 2-1.5 9 0 11M8 2.5c1.5 2 1.5 9 0 11" stroke="currentColor" stroke-width="1.2"/></svg>
-              {{ t('sidebar.aiChangeLang') }}
-              <svg class="commit-ai-menu-arrow" width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M3 1.5L5.5 4L3 6.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              <ul v-if="aiLangMenuOpen" class="commit-ai-submenu">
-                <li v-for="loc in supportedLocales" :key="loc" @click.stop="onAiAction('changeLang', loc)" :class="{ 'is-active': loc === resolveCommitLang() }">
-                  <svg v-if="loc === resolveCommitLang()" class="commit-ai-check" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  {{ localeLabels[loc] }}
-                </li>
-              </ul>
-            </li>
-            <!-- Preset picker submenu (v2.13) -->
-            <li class="commit-ai-menu-sep"></li>
-            <li class="commit-ai-menu-parent" @click.stop="aiPresetMenuOpen = !aiPresetMenuOpen">
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2 4h12M2 8h8M2 12h10" stroke-linecap="round"/><circle cx="13" cy="12" r="2"/></svg>
-              <span class="commit-ai-preset-label">
-                {{ t('sidebar.aiPreset') }}
-                <span v-if="activePreset" class="commit-ai-preset-name">{{ activePreset.name }}</span>
-              </span>
-              <svg class="commit-ai-menu-arrow" width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M3 1.5L5.5 4L3 6.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              <ul v-if="aiPresetMenuOpen" class="commit-ai-submenu commit-ai-preset-submenu">
-                <li @click.stop="activatePreset(null); aiPresetMenuOpen = false" :class="{ 'is-active': !activePresetId }">
-                  <svg v-if="!activePresetId" class="commit-ai-check" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  {{ t('sidebar.aiPresetDefault') }}
-                </li>
-                <li class="commit-ai-submenu-sep"></li>
-                <li
-                  v-for="preset in allPresets"
-                  :key="preset.id"
-                  @click.stop="activatePreset(preset.id); aiPresetMenuOpen = false"
-                  :class="{ 'is-active': activePresetId === preset.id }"
-                  :title="preset.description"
-                >
-                  <svg v-if="activePresetId === preset.id" class="commit-ai-check" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  {{ preset.name }}
-                </li>
-              </ul>
-            </li>
-          </ul>
+            placement="above"
+            chevron-class="commit-ai-chevron"
+            :translatable="!!commitSummary"
+            @translate="onAiTranslate"
+          />
         </div>
         <!-- Template picker button -->
         <div v-if="templates.length > 0" class="commit-template-wrapper">
           <button
             class="commit-template-btn"
-            :title="t('commit.templatePicker')"
+            v-tooltip="t('commit.templatePicker')"
             @click.stop="templatePickerOpen = !templatePickerOpen"
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
@@ -1635,14 +1630,14 @@ function formatActivityDate(dateStr: string): string {
           class="trailer-toggle"
           :class="{ 'trailer-toggle--open': trailerSectionOpen }"
           @click="trailerSectionOpen = !trailerSectionOpen"
-          :title="t('sidebar.trailerToggleTitle')"
+          v-tooltip="t('sidebar.trailerToggleTitle')"
         >
           <svg class="trailer-toggle-caret" width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
             <path d="M2.5 3.5L5 6l2.5-2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
           <span>{{ t('sidebar.trailerToggleLabel') }}</span>
           <!-- Dot when any trailer is active -->
-          <span v-if="trailerSob || trailerRbEnabled" class="trailer-active-dot" :title="t('sidebar.trailerActiveTitle')"></span>
+          <span v-if="trailerSob || trailerRbEnabled" class="trailer-active-dot" role="img" :aria-label="t('sidebar.trailerActiveTitle')"></span>
         </button>
 
         <template v-if="trailerSectionOpen">
@@ -1651,7 +1646,7 @@ function formatActivityDate(dateStr: string): string {
             <input type="checkbox" v-model="trailerSob" class="trailer-check" />
             <span class="trailer-main-label">{{ t('sidebar.trailerSobLabel') }}</span>
             <span class="trailer-git-key">Signed-off-by</span>
-            <button type="button" class="trailer-help" :title="t('sidebar.trailerSobHelp')" tabindex="-1" @click.prevent>?</button>
+            <button type="button" class="trailer-help" v-tooltip="t('sidebar.trailerSobHelp')" tabindex="-1" @click.prevent>?</button>
           </label>
           <div v-if="trailerSob && sobValue" class="trailer-value-line">{{ sobValue }}</div>
 
@@ -1660,7 +1655,7 @@ function formatActivityDate(dateStr: string): string {
             <input type="checkbox" v-model="trailerRbEnabled" class="trailer-check" />
             <span class="trailer-main-label">{{ t('sidebar.trailerRbLabel') }}</span>
             <span class="trailer-git-key">Reviewed-by</span>
-            <button type="button" class="trailer-help" :title="t('sidebar.trailerRbHelp')" tabindex="-1" @click.prevent>?</button>
+            <button type="button" class="trailer-help" v-tooltip="t('sidebar.trailerRbHelp')" tabindex="-1" @click.prevent>?</button>
           </label>
           <input
             v-if="trailerRbEnabled"
@@ -1672,49 +1667,12 @@ function formatActivityDate(dateStr: string): string {
           />
         </template>
       </div>
-      <!-- Identity selector (v2.12) — shown only when profiles exist -->
-      <div v-if="identities.length > 0" class="commit-identity">
-        <button class="commit-identity-btn" @click.stop="identityMenuOpen = !identityMenuOpen">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
-            <circle cx="8" cy="6" r="3"/>
-            <path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6" stroke-linecap="round"/>
-          </svg>
-          <span class="commit-identity-name">{{ activeIdentity ? activeIdentity.label : t('commit.identityDefault') }}</span>
-          <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
-            <path d="M1.5 3L4 5.5L6.5 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </button>
-        <div v-if="identityMenuOpen" class="commit-identity-menu">
-          <div
-            class="commit-identity-item"
-            :class="{ 'commit-identity-item--active': !activeIdentity }"
-            @click="setIdentityFromMenu(null)"
-          >
-            <span>{{ t('commit.identityDefault') }}</span>
-            <svg v-if="!activeIdentity" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </div>
-          <div
-            v-for="p in identities"
-            :key="p.id"
-            class="commit-identity-item"
-            :class="{ 'commit-identity-item--active': activeIdentity?.id === p.id }"
-            @click="setIdentityFromMenu(p.id)"
-          >
-            <div class="commit-identity-item-info">
-              <span class="commit-identity-item-label">{{ p.label }}</span>
-              <span class="commit-identity-item-meta mono">{{ p.gitName }} &lt;{{ p.gitEmail }}&gt;</span>
-            </div>
-            <svg v-if="activeIdentity?.id === p.id" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L5 9l4.5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </div>
-        </div>
-      </div>
-
       <div class="commit-actions">
         <button
           v-if="(secretFindingsCount ?? 0) > 0"
           type="button"
           class="commit-secrets-badge"
-          :title="t('secrets.badgeTooltip', secretFindingsCount ?? 0)"
+          v-tooltip="t('secrets.badgeTooltip', secretFindingsCount ?? 0)"
           @click="emit('openSecrets')"
         >
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -1730,7 +1688,7 @@ function formatActivityDate(dateStr: string): string {
           class="commit-review-btn"
           :class="{ 'commit-review-btn--loading': commitReviewRunning }"
           :disabled="commitReviewRunning"
-          :title="commitReviewRunning ? t('commitReview.reviewButtonRunning', commitReviewProgress?.done ?? 0, commitReviewProgress?.total ?? 0) : t('commitReview.reviewButton')"
+          v-tooltip="commitReviewRunning ? t('commitReview.reviewButtonRunning', commitReviewProgress?.done ?? 0, commitReviewProgress?.total ?? 0) : t('commitReview.reviewButton')"
           @click="emit('reviewStaged')"
         >
           <svg v-if="commitReviewRunning" class="commit-spinner" width="12" height="12" viewBox="0 0 14 14" aria-hidden="true">
@@ -1748,7 +1706,7 @@ function formatActivityDate(dateStr: string): string {
           v-if="(commitReviewFindingsCount ?? 0) > 0"
           type="button"
           class="commit-review-badge"
-          :title="commitReviewBadgeTooltip"
+          v-tooltip="commitReviewBadgeTooltip"
           @click="emit('openCommitReview')"
         >
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -1770,7 +1728,7 @@ function formatActivityDate(dateStr: string): string {
         <button
           v-if="props.files.length > 0"
           class="commit-discard-all"
-          :title="t('sidebar.discardAll')"
+          v-tooltip="t('sidebar.discardAll')"
           @click="emit('discardSection', 'all', props.files.map(f => f.path))"
         >
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -1819,7 +1777,7 @@ function formatActivityDate(dateStr: string): string {
             class="branch-item"
             :class="{ 'branch-item--current': b.isCurrent }"
             @click="emit('changeView', 'graph')"
-            @contextmenu="openBranchCtx($event, b.name)"
+            @contextmenu="openBranchCtx($event, b)"
             :title="b.name"
           >
             <span class="branch-name mono">{{ b.name }}</span>
@@ -1833,7 +1791,7 @@ function formatActivityDate(dateStr: string): string {
             </span>
             <button
               class="branch-ctx-trigger"
-              @click.stop="openBranchCtx($event, b.name)"
+              @click.stop="openBranchCtx($event, b)"
               :aria-label="t('branch.moreActions')"
             >⋯</button>
           </div>
@@ -1861,7 +1819,7 @@ function formatActivityDate(dateStr: string): string {
             v-for="b in archivedBranches"
             :key="b.name"
             class="branch-item branch-item--archived"
-            @contextmenu="openBranchCtx($event, b.name)"
+            @contextmenu="openBranchCtx($event, b)"
             :title="b.name"
           >
             <span class="branch-name mono">{{ b.name }}</span>
@@ -1871,7 +1829,7 @@ function formatActivityDate(dateStr: string): string {
             </span>
             <button
               class="branch-ctx-trigger"
-              @click.stop="openBranchCtx($event, b.name)"
+              @click.stop="openBranchCtx($event, b)"
               :aria-label="t('branch.moreActions')"
             >⋯</button>
           </div>
@@ -1996,7 +1954,6 @@ function formatActivityDate(dateStr: string): string {
     >
       <!-- Discard : libellé selon la section -->
       <button
-        v-if="ctxMenu.file.section !== 'staged'"
         class="ctx-item ctx-item--danger"
         @click="onCtxDiscard"
       >
@@ -2007,7 +1964,7 @@ function formatActivityDate(dateStr: string): string {
       </button>
 
       <!-- Separator -->
-      <div class="ctx-separator" v-if="ctxMenu.file.section !== 'staged'"></div>
+      <div class="ctx-separator"></div>
 
       <!-- Absorb into original commit -->
       <button
@@ -2123,6 +2080,10 @@ function formatActivityDate(dateStr: string): string {
   align-items: center;
   gap: var(--space-4);
   padding: var(--space-4) var(--space-2);
+  /* Height of the WIP action group (20px buttons + 1px border each side) plus
+     padding (border-box), so headers without one (commit files, conflicted)
+     line up with those that do. */
+  min-height: calc(22px + 2 * var(--space-4));
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-semibold);
   line-height: 1;
@@ -2476,9 +2437,12 @@ function formatActivityDate(dateStr: string): string {
   align-items: center;
   justify-content: center;
   padding: 0 5px;
-  background: var(--color-ai-soft);
-  color: var(--color-ai);
-  border: 1px solid var(--color-ai);
+  /* Same skin as the PR view's AI button (.btn--ai): darker fill, multicolour border. */
+  background:
+    linear-gradient(var(--color-bg-secondary), var(--color-bg-secondary)) padding-box,
+    linear-gradient(135deg, var(--color-ai) 0%, #c084fc 50%, var(--color-ai) 100%) border-box;
+  color: var(--color-text);
+  border: 1px solid transparent;
   border-radius: calc(var(--radius-md) - 3px) 0 0 calc(var(--radius-md) - 3px);
   cursor: pointer;
   transition: background var(--transition-hover), border-color var(--transition-hover), color var(--transition-hover);
@@ -2491,34 +2455,40 @@ function formatActivityDate(dateStr: string): string {
   line-height: 1;
 }
 
-.commit-ai-chevron {
+.commit-ai-wrapper :deep(.commit-ai-chevron) {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 14px;
-  background: var(--color-ai-soft);
-  color: var(--color-ai);
-  border: 1px solid var(--color-ai);
+  background:
+    linear-gradient(var(--color-bg-secondary), var(--color-bg-secondary)) padding-box,
+    linear-gradient(135deg, var(--color-ai) 0%, #c084fc 50%, var(--color-ai) 100%) border-box;
+  color: var(--color-text);
+  border: 1px solid transparent;
   margin-left: -1px;
   border-radius: 0 calc(var(--radius-md) - 3px) calc(var(--radius-md) - 3px) 0;
   cursor: pointer;
   transition: background var(--transition-hover), border-color var(--transition-hover);
 }
 
-.commit-ai-chevron:hover:not(:disabled) {
-  background: var(--color-ai);
+.commit-ai-wrapper :deep(.commit-ai-chevron:hover:not(:disabled)) {
   color: var(--color-ai-text);
+  background:
+    linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-hover) 100%) padding-box,
+    linear-gradient(135deg, var(--color-accent) 0%, #c084fc 50%, var(--color-accent) 100%) border-box;
   z-index: 1;
 }
 
-.commit-ai-chevron:disabled {
+.commit-ai-wrapper :deep(.commit-ai-chevron:disabled) {
   opacity: 0.35;
   cursor: not-allowed;
 }
 
 .commit-ai-btn:hover:not(:disabled) {
-  background: var(--color-ai);
   color: var(--color-ai-text);
+  background:
+    linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-hover) 100%) padding-box,
+    linear-gradient(135deg, var(--color-accent) 0%, #c084fc 50%, var(--color-accent) 100%) border-box;
   z-index: 1;
 }
 
@@ -2529,137 +2499,6 @@ function formatActivityDate(dateStr: string): string {
 
 .commit-ai-btn--loading {
   color: var(--color-ai);
-}
-
-.commit-ai-menu {
-  position: absolute;
-  right: 0;
-  bottom: 100%;
-  margin-bottom: var(--space-2);
-  min-width: 180px;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-popover);
-  z-index: 100;
-  list-style: none;
-  padding: var(--space-2) 0;
-}
-
-.commit-ai-menu li {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  padding: var(--space-3) var(--space-5);
-  font-size: var(--font-size-sm);
-  color: var(--color-text);
-  cursor: pointer;
-  transition: background var(--transition-hover);
-}
-
-.commit-ai-menu li:hover:not(.disabled) {
-  background: var(--color-bg-tertiary);
-}
-
-.commit-ai-menu li.disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-
-.commit-ai-menu-parent {
-  position: relative;
-}
-
-.commit-ai-menu-arrow {
-  margin-left: auto;
-  opacity: 0.5;
-}
-
-.commit-ai-submenu {
-  position: absolute;
-  right: 100%;
-  bottom: 0;
-  margin-right: var(--space-1);
-  min-width: 120px;
-  max-height: 280px;
-  overflow-y: auto;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-popover);
-  list-style: none;
-  padding: var(--space-1) 0;
-  z-index: 101;
-}
-
-.commit-ai-submenu li {
-  position: relative;
-  display: flex;
-  align-items: center;
-  padding: 4px 10px 4px 26px;
-  font-size: var(--font-size-sm);
-  color: var(--color-text);
-  cursor: pointer;
-  transition: background var(--transition-hover);
-}
-
-.commit-ai-submenu li:hover {
-  background: var(--color-bg-tertiary);
-}
-
-.commit-ai-submenu li.is-active {
-  font-weight: 600;
-}
-
-/* Check sits in the fixed 30px gutter so toggling it never reflows the label. */
-.commit-ai-check {
-  position: absolute;
-  left: 8px;
-  top: 50%;
-  transform: translateY(-50%);
-  flex-shrink: 0;
-}
-
-/* Separator line in AI menu (v2.13) */
-.commit-ai-menu-sep {
-  border: none;
-  border-top: 1px solid var(--color-border);
-  margin: 3px 0;
-  padding: 0;
-  list-style: none;
-  pointer-events: none;
-}
-
-/* Separator line inside a submenu */
-.commit-ai-submenu-sep {
-  border: none;
-  border-top: 1px solid var(--color-border);
-  margin: 2px 0;
-  padding: 0;
-  list-style: none;
-  pointer-events: none;
-}
-
-/* Preset submenu — slightly wider to show preset names */
-.commit-ai-preset-submenu {
-}
-
-/* Preset label inline in the menu entry */
-.commit-ai-preset-label {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.commit-ai-preset-name {
-  font-size: 9px;
-  opacity: 0.7;
-  font-weight: 400;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .commit-ai-error {
@@ -2705,10 +2544,19 @@ function formatActivityDate(dateStr: string): string {
 }
 
 /* ─── Conventional Commits type chips ───────────────────── */
+/* Chips take the remaining width; the identity selector sits at the right. */
+.commit-top-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
 .cc-types-wrapper {
   position: relative;
   display: flex;
   align-items: center;
+  flex: 1;
+  min-width: 0;
 }
 
 .cc-types {
@@ -3495,6 +3343,7 @@ function formatActivityDate(dateStr: string): string {
   position: relative;
   display: flex;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .commit-identity-btn {
@@ -3504,17 +3353,20 @@ function formatActivityDate(dateStr: string): string {
   padding: 3px var(--space-3);
   font-size: 11px;
   font-weight: 500;
-  color: var(--color-text-subtle);
-  background: var(--color-bg-tertiary);
+  /* Input background, slightly muted text: a grey-filled button with muted
+     text read as disabled. */
+  color: color-mix(in srgb, var(--color-text) 60%, var(--color-text-muted));
+  background: var(--color-bg);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   cursor: pointer;
   max-width: 160px;
-  transition: background var(--transition-hover), color var(--transition-hover);
+  transition: background var(--transition-hover), border-color var(--transition-hover), color var(--transition-hover);
 }
 
 .commit-identity-btn:hover {
-  background: var(--color-bg-elevated);
+  background: var(--color-bg-tertiary);
+  border-color: var(--color-accent);
   color: var(--color-text);
 }
 
@@ -3530,11 +3382,10 @@ function formatActivityDate(dateStr: string): string {
   text-overflow: ellipsis;
 }
 
+/* Teleported to <body> (see toggleIdentityMenu); top/right set inline. */
 .commit-identity-menu {
-  position: absolute;
-  bottom: calc(100% + 4px);
-  left: 0;
-  z-index: 200;
+  position: fixed;
+  z-index: 1000;
   min-width: 240px;
   background: var(--color-bg-secondary);
   border: 1px solid var(--color-border);
@@ -3554,6 +3405,29 @@ function formatActivityDate(dateStr: string): string {
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background var(--transition-hover);
+}
+
+/* Pushed to the right edge; fixed width so it never shifts the label. */
+.commit-identity-check {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 12px;
+  margin-left: auto;
+  color: var(--color-accent);
+}
+
+.commit-identity-sep {
+  height: 1px;
+  margin: var(--space-1) 0;
+  background: var(--color-border);
+}
+
+.commit-identity-manage {
+  color: var(--color-text-muted);
+}
+
+.commit-identity-manage:hover {
+  color: var(--color-text);
 }
 
 .commit-identity-item:hover {
@@ -3576,14 +3450,14 @@ function formatActivityDate(dateStr: string): string {
 }
 
 .commit-identity-item-label {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
   color: var(--color-text);
 }
 
 .commit-identity-item-meta {
   font-size: 11px;
-  color: var(--color-text-subtle);
+  color: var(--color-text-meta);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
