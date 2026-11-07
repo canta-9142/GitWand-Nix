@@ -48,9 +48,28 @@ import BranchSelector from "./header/BranchSelector.vue";
 import SyncSplitButton from "./header/SyncSplitButton.vue";
 import BranchMenu from "./header/BranchMenu.vue";
 import SearchTrigger from "./header/SearchTrigger.vue";
+import AiSparkle from "./AiSparkle.vue";
+import { useAIProvider } from "../composables/useAIProvider";
+import { isGeneratingReleaseNotes } from "../composables/releaseNotesState";
+import { useCollapseOnOverflow } from "../composables/useCollapseOnOverflow";
 import type { RepoTab } from "../composables/useRepoTabs";
 
 const { t } = useI18n();
+
+// Secondary actions drop their label one by one, right to left (see
+// data-collapse-order), only as far as the row needs to fit — label widths
+// vary by locale, branch names by repo. A collapsed button's tooltip stands in
+// for its label.
+const headerRow = ref<HTMLElement | null>(null);
+const { collapsed: collapsedActions, wrapped: headerWrapped } = useCollapseOnOverflow(headerRow, {
+  collapsedClass: "header-action-btn--icon",
+  // Last resort once every action is icon-only: actions drop to their own row.
+  wrapClass: "app-header__row--wrapped",
+});
+const isCollapsed = (key: string) => collapsedActions.value.has(key);
+const iconTooltip = (key: string, text: string) => ({ text, when: () => isCollapsed(key) });
+const ai = useAIProvider();
+const releaseNotesBusy = computed(() => isGeneratingReleaseNotes(props.cwd));
 const askConfirm = inject<(options: any) => Promise<boolean>>("askConfirm");
 
 const props = defineProps<{
@@ -85,6 +104,8 @@ const props = defineProps<{
   isFetching?: boolean;
   /** 0-100 while a user-initiated fetch streams progress; 0 otherwise (v3.10.0). */
   fetchPercent?: number;
+  /** Why the opt-in auto fast-forward is holding back a behind branch, or null. */
+  autoFfBlock?: { reason: string; detail?: string } | null;
   /** True when the device has no network connectivity. */
   isOffline?: boolean;
   // Branch popover
@@ -151,6 +172,7 @@ const emit = defineEmits<{
   /** v3.11 — apply from the Conflict Predictor. */
   applyFromPreview: [operation: string, ref: string, estimatedHunks: number];
   dismissApply: [];
+  scratchCleanupWarning: [detail: string];
   openResidual: [path: string];
   loadBranches: [];
   // ── Other overlays ───────────────────────────────────────────
@@ -167,6 +189,7 @@ const emit = defineEmits<{
   openHelp: [];
   openStash: [];
   openTags: [];
+  openReleaseNotes: [];
   /** v3.8: the rewind popover's footer link opens the full Time Machine. */
   openTimeMachine: [];
   discardAll: [];
@@ -251,6 +274,7 @@ function rowLabel(item: TimelineItem): string {
     reset: t("timeMachine.kindReset"),
     checkout: t("timeMachine.kindCheckout"),
     resolution: t("timeMachine.kindResolution"),
+    "merge-back": t("timeMachine.kindMergeBack"),
   };
   return map[item.kind] ?? item.kind;
 }
@@ -445,7 +469,7 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
     </div>
 
     <!-- ── Row 2: Main action row ───────────────────────────── -->
-    <div class="app-header__row">
+    <div ref="headerRow" class="app-header__row" :class="{ 'app-header__row--wrapped': headerWrapped }">
       <!-- Left cluster: branch selector + sync + branch actions -->
       <div class="header-left">
         <!-- Fallback: "Open" button when no repo is open -->
@@ -482,6 +506,7 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
             :apply-outcome="props.applyOutcome ?? null"
             @apply-from-preview="(op, r, n) => emit('applyFromPreview', op, r, n)"
             @dismiss-apply="emit('dismissApply')"
+            @scratch-cleanup-warning="(d) => emit('scratchCleanupWarning', d)"
             @open-residual="(p) => emit('openResidual', p)"
           />
 
@@ -513,6 +538,7 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
             :force-push-preferred="forcePushPreferred"
             :is-fetching="isFetching ?? false"
             :fetch-percent="fetchPercent ?? 0"
+            :auto-ff-block="autoFfBlock ?? null"
             :can-push="canPush"
             :can-pull="canPull"
             :is-offline="isOffline"
@@ -525,68 +551,6 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
             @merge-remote="emit('mergeRemote')"
             @force-push="emit('forcePush')"
           />
-
-          <!-- Stash button -->
-          <div class="header-action-sep" aria-hidden="true"></div>
-          <button
-            class="btn btn--secondary header-action-btn"
-            :title="t('stash.title')"
-            :aria-label="t('stash.title')"
-            @click="emit('openStash')"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21 8v13H3V8"/>
-              <path d="M1 3h22v5H1z"/>
-              <path d="M10 12h4"/>
-            </svg>
-            <span>{{ t('stash.title') }}</span>
-            <span v-if="(stashCount ?? 0) > 0" class="header-action-btn__count">{{ stashCount }}</span>
-          </button>
-
-          <!-- Tags button -->
-          <button
-            class="btn btn--secondary header-action-btn"
-            :title="t('tags.title')"
-            :aria-label="t('tags.title')"
-            @click="emit('openTags')"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M2 2h6l6 6-6 6-6-6V2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
-              <circle cx="5.5" cy="5.5" r="1.2" fill="currentColor"/>
-            </svg>
-            <span>{{ t('tags.title') }}</span>
-          </button>
-
-          <!-- Worktrees button -->
-          <button
-            class="btn btn--secondary header-action-btn"
-            :title="t('worktree.title')"
-            :aria-label="t('worktree.title')"
-            @click="emit('openWorktrees')"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none" />
-              <rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none" />
-              <rect x="5.5" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none" />
-              <path d="M4.5 7v1.5M11.5 7v1.5M4.5 8.5h7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-            </svg>
-            <span>{{ t('worktree.title') }}</span>
-          </button>
-
-          <!-- Submodules button -->
-          <button
-            class="btn btn--secondary header-action-btn"
-            :title="t('submodule.title')"
-            :aria-label="t('submodule.title')"
-            @click="emit('openSubmodules')"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <rect x="3" y="3" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.3" fill="none" />
-              <rect x="6" y="6" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="1.3" fill="none" />
-            </svg>
-            <span>{{ t('submodule.title') }}</span>
-            <span v-if="(submoduleUpdateCount ?? 0) > 0" class="header-action-btn__count">{{ submoduleUpdateCount }}</span>
-          </button>
 
           <!-- Merge-into picker (triggered by BranchMenu → onBranchMenuMerge) -->
           <div v-if="showMergePopover" class="merge-popover-anchor">
@@ -688,6 +652,100 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
         </template>
       </div>
 
+      <!-- Secondary actions: own group so it can drop to a second row on narrow windows. -->
+      <div v-if="hasRepo" class="header-actions">
+        <!-- Stash button -->
+        <div class="header-action-sep" aria-hidden="true"></div>
+        <button
+          class="btn btn--secondary header-action-btn"
+          :class="{ 'header-action-btn--icon': isCollapsed('stash') }"
+          data-collapse-key="stash"
+          data-collapse-order="5"
+          v-tooltip="iconTooltip('stash', t('stash.title'))"
+          :aria-label="t('stash.title')"
+          @click="emit('openStash')"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 8v13H3V8"/>
+            <path d="M1 3h22v5H1z"/>
+            <path d="M10 12h4"/>
+          </svg>
+          <span class="header-action-btn__label">{{ t('stash.title') }}</span>
+          <span v-if="(stashCount ?? 0) > 0" class="header-action-btn__count">{{ stashCount }}</span>
+        </button>
+
+        <!-- Tags button -->
+        <button
+          class="btn btn--secondary header-action-btn"
+          :class="{ 'header-action-btn--icon': isCollapsed('tags') }"
+          data-collapse-key="tags"
+          data-collapse-order="4"
+          v-tooltip="iconTooltip('tags', t('tags.title'))"
+          :aria-label="t('tags.title')"
+          @click="emit('openTags')"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M2 2h6l6 6-6 6-6-6V2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+            <circle cx="5.5" cy="5.5" r="1.2" fill="currentColor"/>
+          </svg>
+          <span class="header-action-btn__label">{{ t('tags.title') }}</span>
+        </button>
+
+        <!-- Worktrees button -->
+        <button
+          class="btn btn--secondary header-action-btn"
+          :class="{ 'header-action-btn--icon': isCollapsed('worktrees') }"
+          data-collapse-key="worktrees"
+          data-collapse-order="3"
+          v-tooltip="iconTooltip('worktrees', t('worktree.title'))"
+          :aria-label="t('worktree.title')"
+          @click="emit('openWorktrees')"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none" />
+            <rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none" />
+            <rect x="5.5" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none" />
+            <path d="M4.5 7v1.5M11.5 7v1.5M4.5 8.5h7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+          <span class="header-action-btn__label">{{ t('worktree.title') }}</span>
+        </button>
+
+        <!-- Submodules button -->
+        <button
+          class="btn btn--secondary header-action-btn"
+          :class="{ 'header-action-btn--icon': isCollapsed('submodules') }"
+          data-collapse-key="submodules"
+          data-collapse-order="2"
+          v-tooltip="iconTooltip('submodules', t('submodule.title'))"
+          :aria-label="t('submodule.title')"
+          @click="emit('openSubmodules')"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="3" y="3" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.3" fill="none" />
+            <rect x="6" y="6" width="4" height="4" rx="0.5" stroke="currentColor" stroke-width="1.3" fill="none" />
+          </svg>
+          <span class="header-action-btn__label">{{ t('submodule.title') }}</span>
+          <span v-if="(submoduleUpdateCount ?? 0) > 0" class="header-action-btn__count">{{ submoduleUpdateCount }}</span>
+        </button>
+
+        <!-- Release notes button -->
+        <template v-if="ai.isAvailable.value">
+          <div class="header-action-sep" aria-hidden="true"></div>
+          <button
+            class="btn btn--secondary header-action-btn"
+            :class="{ 'header-action-btn--icon': isCollapsed('releaseNotes') }"
+            data-collapse-key="releaseNotes"
+            data-collapse-order="1"
+            v-tooltip="t('dashboard.releaseNotesHint')"
+            :aria-label="t('dashboard.releaseNotes')"
+            @click="emit('openReleaseNotes')"
+          >
+            <AiSparkle :size="14" :busy="releaseNotesBusy" />
+            <span class="header-action-btn__label" :class="{ 'ai-loading': releaseNotesBusy }">{{ t('dashboard.releaseNotes') }}</span>
+          </button>
+        </template>
+      </div>
+
       <SearchTrigger v-if="hasRepo" class="header-search" @open-search="emit('openSearch')" />
 
     </div>
@@ -722,8 +780,8 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
 .app-header__row {
   display: flex;
   align-items: center;
-  gap: var(--space-6);
-  height: var(--header-height);
+  gap: var(--space-4);
+  min-height: var(--header-height);
   padding: 0 var(--space-6);
 }
 
@@ -735,8 +793,89 @@ onUnmounted(() => document.removeEventListener("click", onDocClick, true));
   position: relative; /* anchor for merge + undo popovers */
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
 .header-search {
   margin-left: auto;
+}
+
+/* Collapsed by useCollapseOnOverflow when the row would overflow: icon-only,
+   the label stays in aria-label and in the v-tooltip. */
+.header-action-btn--icon .header-action-btn__label {
+  display: none;
+}
+
+/* Set by useCollapseOnOverflow when even icon-only actions don't fit: they
+   drop to their own row under branch + sync (and usually get their labels
+   back there). */
+.app-header__row--wrapped {
+  flex-wrap: wrap;
+  row-gap: var(--space-3);
+  padding-block: var(--space-3);
+}
+.app-header__row--wrapped .header-actions {
+  order: 1;
+  flex-basis: 100%;
+}
+/* Branch + actions + sync can outgrow the row on their own (long labels,
+   ~640–700px): they share the first line with the search and the sync button
+   drops under them, instead of overflowing or pushing the search to a line of
+   its own. */
+.app-header__row--wrapped .header-left {
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  row-gap: var(--space-3);
+}
+.app-header__row--wrapped .header-actions > .header-action-sep:first-child {
+  display: none;
+}
+
+/* Once the header spans several rows, popovers anchor to the whole row
+   instead of .header-left, so they open below the other rows, not over them. */
+.app-header__row--wrapped {
+  position: relative;
+}
+.app-header__row--wrapped .header-left {
+  position: static;
+}
+.app-header__row--wrapped .merge-popover-anchor,
+.app-header__row--wrapped .undo-popover-anchor {
+  left: var(--space-6);
+}
+
+@media (max-width: 640px) {
+  .app-header__row {
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    position: relative; /* multi-row here too: see popover anchoring above */
+  }
+  .header-left {
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    position: static;
+  }
+  .header-action-sep {
+    display: none;
+  }
+  .header-search {
+    order: 2;
+    flex: 1 1 100%;
+    margin-left: 0;
+  }
+  .app-header__row .merge-popover-anchor,
+  .app-header__row .undo-popover-anchor {
+    left: var(--space-4);
+  }
+  .merge-popover,
+  .undo-popover {
+    width: min(340px, calc(100vw - 2 * var(--space-4)));
+  }
 }
 
 .header-action-sep {

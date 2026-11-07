@@ -44,6 +44,18 @@ export { isChangelogFile } from "./resolver/validation.js";
 export { findEcosystem, REGEN_ECOSYSTEMS, type RegenEcosystem } from "./regenerate/registry.js";
 export { buildRegenerationPlan, type RegenerationPlan } from "./regenerate/plan.js";
 export { mergeNonOverlapping, computeDiff, lcs } from "./diff.js";
+// Unified-diff hunk bodies: tell `---`/`+++` file headers from hunk lines
+// whose content starts with `--`/`++`.
+export {
+  parseHunkHeader,
+  noHunkBody,
+  hunkBodyFor,
+  hunkBodyFromHeader,
+  classifyHunkLine,
+  type HunkHeaderRange,
+  type HunkBody,
+  type HunkLineKind,
+} from "./hunk-body.js";
 
 // v2.1 — nouveaux backends diff exposés
 export {
@@ -170,7 +182,15 @@ export type { LockfileMergeResult } from "./resolvers/lockfile-npm.js";
 export type { YarnLockMergeResult } from "./resolvers/lockfile-yarn.js";
 export type { PnpmLockMergeResult } from "./resolvers/lockfile-pnpm.js";
 export type { ImportSortStrategy } from "./resolvers/imports.js";
-export type { MergePolicy, PolicyConfig, GitWandrcConfig } from "./config.js";
+export type {
+  MergePolicy,
+  PolicyConfig,
+  GitWandrcConfig,
+  WorktreeConfig,
+  WorktreeIncludeEntry,
+  WorktreeIncludeMode,
+} from "./config.js";
+export { parseWorktreeInclude, mergeWorktreeInclude } from "./config.js";
 
 // v3.4 — "Recoverable-before-model" tier metric (derived, TS-only — see stats/tiers.ts)
 export { summarizeTiers } from "./stats/tiers.js";

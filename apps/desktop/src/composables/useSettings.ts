@@ -9,10 +9,13 @@
  *   const { settings, refreshSettings } = useSettings()
  */
 
-import { ref } from "vue";
+import { ref, toRaw } from "vue";
+import { detectLocale, isSupportedLocale } from "../locales";
 import type { DiffMode } from "../utils/diffMode";
 import type { BlameAlgorithm } from "../utils/backend";
 import type { AIProvider } from "./useAIProvider";
+import { normalizeEndpointSetting, stashLegacyAiApiKey, stripAiApiKey, toPersistedSettings } from "./useAiApiKey";
+import { DEFAULT_TEMPLATE_PROMPTS, LEGACY_RELEASE_NOTES_RULES_HEADER } from "./aiTemplateDefaults";
 import type { SwitchBehavior } from "../utils/branchSwitchDecision";
 import type { PullDirtyBehavior } from "../utils/pullDirtyDecision";
 
@@ -28,14 +31,16 @@ export type LaunchpadTab = "inbox" | "wip" | "prs" | "issues" | "team";
 /** Granularity of PR-activity OS notifications (v2.16). */
 export type NotificationLevel = "all" | "reviews" | "ci" | "none";
 /** Dock entry ids (subset of ViewMode) — used for dock ordering (v3). */
-export type DockEntryId = "launchpad" | "dashboard" | "prs" | "graph" | "changes";
+export type DockEntryId = "launchpad" | "dashboard" | "prs" | "graph";
 /** Canonical default dock order, left → right. */
-export const DEFAULT_DOCK_ORDER: DockEntryId[] = ["launchpad", "dashboard", "prs", "graph", "changes"];
+export const DEFAULT_DOCK_ORDER: DockEntryId[] = ["launchpad", "dashboard", "prs", "graph"];
 
 /**
- * Normalise a stored dock order so all five entries are present exactly once:
+ * Normalise a stored dock order so every entry is present exactly once:
  * keep the known/persisted order, then append any missing entries in default
  * order. Shared by AppDock (render order) and SettingsPanel (reorder list).
+ * Unknown ids are dropped — e.g. the retired "changes" entry, now the WIP tab
+ * glued to the Git Tree entry.
  */
 export function normalizeDockOrder(stored: DockEntryId[] | undefined): DockEntryId[] {
   const order = stored?.length ? stored : DEFAULT_DOCK_ORDER;
@@ -44,7 +49,7 @@ export function normalizeDockOrder(stored: DockEntryId[] | undefined): DockEntry
   return [...known, ...missing];
 }
 
-/** Per-entry "hidden from dock" flag. Git Tree & Changes are never hideable. */
+/** Per-entry "hidden from dock" flag. Git Tree (and its WIP tab) is never hideable. */
 export function isDockEntryHidden(
   id: DockEntryId,
   flags: Pick<AppSettings, "dockHideLaunchpad" | "dockHideDashboard" | "dockHidePrs">,
@@ -81,15 +86,11 @@ export interface CommitTemplate {
   body: string;
 }
 
-/** Named release note template (v3). */
-export interface ReleaseNoteTemplate {
-  /** UUID v4. */
-  id: string;
-  /** Display name, e.g. "Security focus", "SaaS". */
-  name: string;
-  /** Custom rules to be appended to the prompt. */
-  customRules: string;
-}
+/**
+ * Named release note template. Same shape as every AI template: a full system
+ * prompt replacing the default one (see useAiTemplates).
+ */
+export type ReleaseNoteTemplate = AiPromptPreset;
 
 
 /**
@@ -134,19 +135,16 @@ export interface AppSettings {
   blameAlgorithm: BlameAlgorithm;
   /** Auto-update channel (v2.0). "stable" = Tauri plugin auto-install; "beta" = manual fetch + browser-open. */
   updateChannel: "stable" | "beta";
-  /** Language used for AI-generated commit messages. "" = follow UI locale. */
+  /** Language used for AI-generated commit messages (locale code). "" = English. */
   commitMessageLang: string;
-  /**
-   * Language for AI-generated PR title/body. "english" (default — PRs are most
-   * often written in English) or "ui" to match the app's current locale.
-   */
-  prAiLanguage: "english" | "ui";
+  /** Language used for AI-generated release notes (locale code). "" = English. */
+  releaseNotesLang: string;
+  /** Language used for AI-generated PR titles and descriptions (locale code). "" = English. */
+  prDescriptionLang: string;
   /** Whether AI features are enabled. */
   aiEnabled: boolean;
   /** Active AI provider. */
   aiProvider: AIProvider;
-  /** API key for Claude / OpenAI providers. */
-  aiApiKey: string;
   /** API endpoint override (Claude / OpenAI-compatible). */
   aiApiEndpoint: string;
   /** Model name for Claude / OpenAI providers. */
@@ -157,6 +155,11 @@ export interface AppSettings {
    * each one's previous choice; empty/absent means "CLI default".
    */
   aiModelByProvider: Partial<Record<AIProvider, string>>;
+  /**
+   * Per-provider reasoning effort (`low` … `max`), keyed like
+   * `aiModelByProvider`. Empty/absent means "the model's own default".
+   */
+  aiEffortByProvider: Partial<Record<AIProvider, string>>;
   /** Ollama base URL. */
   aiOllamaUrl: string;
   /** Ollama model name. */
@@ -233,8 +236,6 @@ export interface AppSettings {
   dockHideTerminal: boolean;
   /** Hide the Files (File Explorer) tile from the bottom dock. */
   dockHideFiles: boolean;
-  /** Hide the Changes entry from the dock while the working tree is clean. */
-  dockHideChangesWhenEmpty: boolean;
   /** Show only icons in the bottom dock (hide text labels). */
   dockIconsOnly: boolean;
   /** Lay the dock out vertically (column) with vertically-oriented labels. */
@@ -345,6 +346,23 @@ export interface AppSettings {
    * "use the default prompt". Special value "__builtin_*" for built-in presets.
    */
   activePresetIdByRepo: Record<string, string | null>;
+  // ── AI Templates: pull requests ───────────────────────────
+  /** User-defined AI templates for PR title + description generation. */
+  prTemplates: AiPromptPreset[];
+
+  /**
+   * Output language picked per repo (keyed by cwd) and per AI template kind
+   * ("commit" | "pr" | "releaseNotes") from the AI button menu. Absent = the
+   * global default (commitMessageLang / prDescriptionLang / releaseNotesLang).
+   */
+  aiTemplateLangByRepo: Record<string, Record<string, string>>;
+
+  /**
+   * ID of the active PR template per repo (keyed by cwd).
+   * Null / absent / "__builtin_default" means "use the default prompt".
+   */
+  activePrTemplateIdByRepo: Record<string, string | null>;
+
   // ── v3 Release Note Templates ─────────────────────────────
   /** Saved release note templates (v3). */
   releaseNoteTemplates: ReleaseNoteTemplate[];
@@ -445,6 +463,29 @@ export interface AppSettings {
    * which is what network mounts and FUSE filesystems need.
    */
   liveRepoWatcher: boolean;
+  /**
+   * Opt-in: after the 30 s background fetch, fast-forward the current branch
+   * when it is purely behind its upstream (no local commits, no tracked edits,
+   * no operation in progress). Never merges, rebases or stashes. Off by default.
+   */
+  autoFastForward: boolean;
+  /**
+   * Load images from remote hosts in rendered markdown (PR bodies, comments,
+   * READMEs). Off by default: an image URL in someone else's PR is a tracking
+   * pixel that learns your IP and when you read it.
+   */
+  allowRemoteImages: boolean;
+  /**
+   * Projects whose README may load remote images although
+   * `allowRemoteImages` is off — the user clicked "Always show for this
+   * project" on the README. Keyed by `normaliseCwd(repo path)`.
+   */
+  remoteImagesByRepo: Record<string, boolean>;
+  /**
+   * Look up commit authors on Gravatar. Off by default: it sends a hash of
+   * every author email of the repos you browse to a third party.
+   */
+  gravatarEnabled: boolean;
 }
 
 export type TerminalMode = "floating" | "fullscreen" | "bottom";
@@ -468,14 +509,17 @@ export const defaultAppSettings: AppSettings = {
   notificationsByPeople: true,
   blameAlgorithm: "histogram",
   updateChannel: "stable",
-  commitMessageLang: "",
-  prAiLanguage: "english",
+  commitMessageLang: "en",
+  releaseNotesLang: "en",
+  prDescriptionLang: "en",
   aiEnabled: false,
   aiProvider: "none",
-  aiApiKey: "",
   aiApiEndpoint: "https://api.anthropic.com",
-  aiModel: "claude-sonnet-4-20250514",
+  // Same as `DEFAULT_CLAUDE_API_MODEL` (useAIProvider) — not imported, since
+  // loading useAIProvider starts CLI detection as a side effect.
+  aiModel: "claude-opus-5-5",
   aiModelByProvider: {},
+  aiEffortByProvider: {},
   aiOllamaUrl: "http://localhost:11434",
   aiOllamaModel: "codellama",
   aiHistoryEnabled: true,
@@ -497,7 +541,6 @@ export const defaultAppSettings: AppSettings = {
   dockHidePrs: false,
   dockHideTerminal: false,
   dockHideFiles: false,
-  dockHideChangesWhenEmpty: true,
   dockIconsOnly: false,
   dockVertical: false,
   dockIdleOpacity: 0.45,
@@ -524,6 +567,9 @@ export const defaultAppSettings: AppSettings = {
   aiPromptPresets:        [],
   activePresetIdByRepo:   {},
   // v3
+  prTemplates:                       [],
+  aiTemplateLangByRepo:              {},
+  activePrTemplateIdByRepo:          {},
   releaseNoteTemplates:              [],
   activeReleaseNoteTemplateIdByRepo: {},
   // v3.x terminal
@@ -547,6 +593,10 @@ export const defaultAppSettings: AppSettings = {
   snapshotMaxCount:                  200,
   snapshotAiLabels:                  false,
   liveRepoWatcher:                   true,
+  autoFastForward:                   false,
+  allowRemoteImages:                 false,
+  remoteImagesByRepo:                {},
+  gravatarEnabled:                   false,
 };
 
 const SETTINGS_KEY = "gitwand-settings";
@@ -562,10 +612,87 @@ export function normaliseCwd(cwd: string): string {
 
 // ─── Load / save helpers ──────────────────────────────────
 
+/**
+ * Release note templates used to hold only `customRules` appended to the
+ * default prompt. Turn such a legacy entry into a full-prompt template that
+ * sends the model exactly what it used to receive.
+ */
+function migrateReleaseNoteTemplates(list: unknown): ReleaseNoteTemplate[] {
+  if (!Array.isArray(list)) return [];
+  return list.map((tpl) => {
+    if (typeof tpl?.systemPrompt === "string") return tpl as ReleaseNoteTemplate;
+    const rules = typeof tpl?.customRules === "string" ? tpl.customRules.trim() : "";
+    const base = DEFAULT_TEMPLATE_PROMPTS.releaseNotes;
+    return {
+      id: String(tpl?.id ?? crypto.randomUUID()),
+      name: String(tpl?.name ?? ""),
+      systemPrompt: rules ? `${base}\n\n${LEGACY_RELEASE_NOTES_RULES_HEADER}\n${rules}` : base,
+    };
+  });
+}
+
+/** UI locale as useI18n resolves it: the saved override, else OS detection. */
+function resolveUiLocale(): string {
+  try {
+    const saved = localStorage.getItem("gitwand-locale");
+    if (saved && isSupportedLocale(saved)) return saved;
+  } catch {
+    // ignore
+  }
+  return detectLocale();
+}
+
+/**
+ * Before the AI templates unification, "which language does the AI write in"
+ * followed the UI locale in most places: `commitMessageLang: ""` = UI locale,
+ * `prAiLanguage: "ui" | "english"` (default "english"), release notes always
+ * the UI locale. The new settings hold an explicit language code each (default
+ * "en"), so an existing install must carry its old behaviour over once.
+ *
+ * `stored` is the raw persisted object. Returns the patch to apply, or null
+ * when the settings are already migrated (`releaseNotesLang` present) or were
+ * never stored.
+ */
+export function migrateAiLanguages(
+  stored: Record<string, unknown>,
+  uiLocale: string,
+): Pick<AppSettings, "commitMessageLang" | "prDescriptionLang" | "releaseNotesLang"> | null {
+  if (typeof stored.releaseNotesLang === "string") return null;
+  const commit = stored.commitMessageLang;
+  return {
+    commitMessageLang: typeof commit === "string" && commit ? commit : uiLocale,
+    prDescriptionLang:
+      typeof stored.prDescriptionLang === "string"
+        ? stored.prDescriptionLang
+        : stored.prAiLanguage === "ui" ? uiLocale : "en",
+    releaseNotesLang: uiLocale,
+  };
+}
+
 export function loadSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...defaultAppSettings, ...JSON.parse(raw) };
+    if (raw) {
+      const stored = JSON.parse(raw);
+      // The AI API key moved to the OS keychain: hand a legacy value over and
+      // keep it out of the in-memory settings (see useAiApiKey).
+      if (stored && typeof stored === "object" && "aiApiKey" in stored) {
+        stashLegacyAiApiKey(stored.aiApiKey, stored.aiApiEndpoint);
+      }
+      const s: AppSettings = stripAiApiKey({ ...defaultAppSettings, ...stored });
+      s.releaseNoteTemplates = migrateReleaseNoteTemplates(s.releaseNoteTemplates);
+      // An endpoint saved without a scheme (`localhost:8080/v1`) never worked
+      // and cannot carry the key binding: give it the one the migration of
+      // the key used (see repairLegacyEndpoint), in memory — persisted with
+      // the next save.
+      s.aiApiEndpoint = normalizeEndpointSetting(s.aiApiEndpoint);
+      const langs = migrateAiLanguages(stored, resolveUiLocale());
+      if (langs) {
+        Object.assign(s, langs);
+        saveSettings(s); // once: the keys now exist, so it never runs again
+      }
+      return s;
+    }
   } catch {
     // ignore
   }
@@ -574,7 +701,9 @@ export function loadSettings(): AppSettings {
 
 export function saveSettings(s: AppSettings): void {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    // Never the key itself — except a legacy one whose move to the keychain
+    // has not succeeded yet, which is its only copy (see useAiApiKey).
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(toPersistedSettings(s)));
   } catch {
     // ignore
   }
@@ -583,12 +712,18 @@ export function saveSettings(s: AppSettings): void {
   // useArchivedBranches, …) have no other reactive dependency, so without this
   // bump their computeds would stay stale until a full reload.
   settingsRevision.value++;
+  // Keep the shared ref in step with what was just written. Many writers
+  // (useAiTemplates, useIdentity, …) save a fresh loadSettings() copy; if the
+  // ref kept its old value, the next saveSettings(settings.value) from a
+  // component (dock, terminal, file explorer…) would write that stale copy
+  // back and silently drop their changes — e.g. the per-repo AI language and
+  // template picked from the commit AI menu.
+  // Merged in place: only the keys whose value changed notify their readers.
+  if (toRaw(s) !== toRaw(_settings.value)) Object.assign(_settings.value, stripAiApiKey({ ...s }));
 }
 
 // ─── Singleton reactive ref ───────────────────────────────
 // Shared across all useSettings() calls in the same Vue app instance.
-
-const _settings = ref<AppSettings>(loadSettings());
 
 /**
  * Monotonic counter bumped on every saveSettings() / refreshSettings().
@@ -596,7 +731,14 @@ const _settings = ref<AppSettings>(loadSettings());
  * dependency on "settings changed", even when the underlying value is read
  * straight from localStorage rather than the `_settings` ref.
  */
+// Declared before `_settings`: the one-time AI language migration in
+// loadSettings() saves (and bumps this) while the module is still loading.
 export const settingsRevision = ref(0);
+
+// Created before the first loadSettings(): its one-time migration saves, and
+// saveSettings() syncs this ref.
+const _settings = ref<AppSettings>({ ...defaultAppSettings });
+_settings.value = loadSettings();
 
 /** Re-read all settings from localStorage (call after SettingsPanel saves). */
 export function refreshSettings(): void {

@@ -3,10 +3,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::Serialize;
 use tauri::ipc::Channel;
 
 use crate::git::safe_repo_path;
@@ -22,6 +25,14 @@ struct PtyHandle {
     /// Writer wrappé dans son propre Arc<Mutex> pour découpler les I/O du verrou du registre.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// The session's working directory, canonical: what a worktree's
+    /// processes are matched by.
+    cwd: PathBuf,
+    /// The leader's pid, which is also its session id on Unix.
+    leader: Option<u32>,
+    /// Windows: the Job Object the session's tree runs in.
+    #[cfg(windows)]
+    job: Option<job::Job>,
 }
 
 fn sessions() -> &'static Mutex<HashMap<u64, PtyHandle>> {
@@ -35,6 +46,39 @@ fn lock_sessions() -> std::sync::MutexGuard<'static, HashMap<u64, PtyHandle>> {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Every session GitWand spawned, as (leader pid = session id, canonical
+/// cwd), kept after the session ends: a background job an interactive shell
+/// left behind keeps that session id, and stopping a worktree must still
+/// recognise it as GitWand's (spec §8: "GitWand records its session id").
+/// Bounded: the oldest entries go first.
+const SPAWNED_CAP: usize = 256;
+
+fn spawned() -> &'static Mutex<std::collections::VecDeque<(u32, PathBuf)>> {
+    static S: OnceLock<Mutex<std::collections::VecDeque<(u32, PathBuf)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn record_spawned(sid: u32, cwd: &std::path::Path) {
+    let mut list = spawned().lock().unwrap_or_else(|e| e.into_inner());
+    if list.len() >= SPAWNED_CAP {
+        list.pop_front();
+    }
+    list.push_back((sid, cwd.to_path_buf()));
+}
+
+/// The session ids of every session GitWand spawned in `root` or under it,
+/// ended or not.
+pub(crate) fn recorded_sessions_under(root: &std::path::Path) -> std::collections::HashSet<u32> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    spawned()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, cwd)| cwd.starts_with(&root))
+        .map(|(sid, _)| *sid)
+        .collect()
+}
 
 /// Résout le shell à lancer : override explicite, sinon $SHELL (Unix) /
 /// %ComSpec% ou powershell (Windows).
@@ -94,63 +138,192 @@ fn login_flag(shell_path: &str) -> Option<&'static str> {
     }
 }
 
-#[tauri::command]
-pub(crate) fn terminal_open(
-    cwd: String,
-    shell: Option<String>,
-    agent: Option<String>,
-    cols: u16,
-    rows: u16,
-    on_output: Channel<String>,
-) -> Result<u64, String> {
-    // Validate and canonicalize cwd through the single audited guard (AGENTS.md:
-    // "every file-system operation on user-supplied paths must go through
-    // safe_repo_path()"). Using "." as the relative component mirrors the
-    // pattern in scratch.rs:canonical_cwd — safe_repo_path(cwd, ".") resolves
-    // and traversal-guards the directory itself, keeping this in sync with any
-    // future improvements to the shared guard.
-    let canon = safe_repo_path(cwd.trim(), ".").map_err(|e| format!("invalid cwd: {e}"))?;
-    if !canon.is_dir() {
-        return Err("cwd is not a directory".to_string());
+/// The program, arguments and extra environment that run `command` through
+/// the user's shell (spec §4): `$SHELL [-l] -c <command>` on Unix,
+/// `cmd /D /C` on Windows. Shared by PTY sessions and the captured `url` hook.
+pub(crate) fn shell_invocation(
+    shell: &Option<String>,
+    command: &str,
+) -> (String, Vec<String>, Vec<(String, String)>) {
+    #[cfg(windows)]
+    {
+        let _ = shell;
+        cmd_invocation(command)
     }
+    #[cfg(not(windows))]
+    {
+        let program = resolve_shell(shell);
+        let mut args = Vec::new();
+        if let Some(flag) = login_flag(&program) {
+            args.push(flag.to_string());
+        }
+        args.push("-c".to_string());
+        args.push(command.to_string());
+        (program, args, Vec::new())
+    }
+}
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("openpty failed: {e}"))?;
+/// `cmd.exe` cannot be handed a command line as one argument: both std and
+/// portable-pty quote it MSVCRT-style (`"` → `\"`), which cmd does not
+/// understand. The command travels in an environment variable instead, and
+/// the only argument is `%GITWAND_HOOK_COMMAND%` (no space, no quote, passed
+/// as is). cmd expands it once, then parses the result as if typed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn cmd_invocation(command: &str) -> (String, Vec<String>, Vec<(String, String)>) {
+    (
+        "cmd".to_string(),
+        vec![
+            "/D".to_string(),
+            "/C".to_string(),
+            "%GITWAND_HOOK_COMMAND%".to_string(),
+        ],
+        vec![("GITWAND_HOOK_COMMAND".to_string(), command.to_string())],
+    )
+}
+
+/// The only environment variables a caller may add to a session (spec §10.2).
+/// Anything else is refused: an added variable can then never bring back a
+/// secret `CLAUDE_AUTH_OVERRIDE_ENV` stripped.
+pub(crate) const WORKTREE_ENV_ALLOWLIST: [&str; 5] = [
+    "GITWAND_WORKTREE_NAME",
+    "GITWAND_WORKTREE_PATH",
+    "GITWAND_WORKTREE_BRANCH",
+    "GITWAND_WORKTREE_BASE",
+    "GITWAND_REPO_ROOT",
+];
+
+/// What a session runs.
+pub(crate) enum SpawnKind {
+    /// An interactive shell: the override, or the user's default shell.
+    Shell(Option<String>),
+    /// A first-class agent CLI (`claude`, `codex`, …), resolved by name.
+    Agent(String),
+    /// A command line run by the user's shell (`$SHELL [-l] -c`, `cmd /C`).
+    /// Rust-internal: no IPC command takes one, so that repository commands
+    /// only run through the hook trust gate (`assert_hooks_trusted`).
+    Command {
+        command: String,
+        shell: Option<String>,
+    },
+}
+
+pub(crate) struct SpawnSpec {
+    /// Already validated and canonical (`safe_repo_path`).
+    pub cwd: PathBuf,
+    pub kind: SpawnKind,
+    /// Checked against `WORKTREE_ENV_ALLOWLIST`.
+    pub env: HashMap<String, String>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// What `terminal_open` streams on its one channel: output chunks, then one
+/// `Exit`, last. One channel, because Tauri only orders messages within a
+/// channel (a large payload is fetched, a small one evaluated directly): an
+/// exit on a second channel could overtake the last chunk. `code` is `None`
+/// when GitWand closed the session, or the status could not be read.
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TerminalEvent {
+    Chunk { data: String },
+    Exit { code: Option<i32> },
+}
+
+/// `spawn_session`'s two callbacks, both sending to one ordered `send`.
+pub(crate) type ChunkSink = Box<dyn FnMut(String) -> bool + Send>;
+pub(crate) type ExitSink = Box<dyn FnOnce(Option<i32>) + Send>;
+
+pub(crate) fn event_sinks(
+    send: impl Fn(TerminalEvent) -> bool + Send + Sync + 'static,
+) -> (ChunkSink, ExitSink) {
+    let send = Arc::new(send);
+    let for_exit = Arc::clone(&send);
+    (
+        Box::new(move |data| send(TerminalEvent::Chunk { data })),
+        Box::new(move |code| {
+            let _ = for_exit(TerminalEvent::Exit { code });
+        }),
+    )
+}
+
+/// Opens a PTY session and starts streaming its output. `on_chunk` gets each
+/// UTF-8 chunk and returns false once its consumer is gone; `on_exit` is
+/// called exactly once, after the last chunk.
+pub(crate) fn spawn_session(
+    spec: SpawnSpec,
+    mut on_chunk: ChunkSink,
+    on_exit: ExitSink,
+) -> Result<u64, String> {
+    if let Some(key) = spec
+        .env
+        .keys()
+        .find(|k| !WORKTREE_ENV_ALLOWLIST.contains(&k.as_str()))
+    {
+        return Err(format!(
+            "environment variable not allowed for a terminal session: {key}"
+        ));
+    }
 
     // First-class agent vs shell resolution. Each agent is resolved via its
     // dedicated binary resolver (same logic as detect_*_cli) rather than
     // relying on the PTY's PATH, which may not include user-local install
     // paths (e.g. ~/.opencode/bin, ~/.claude/local, ~/.local/bin).
-    let agent_kind = agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let program = match agent_kind {
-        Some("claude") => super::ai::resolve_claude_binary()
-            .ok_or_else(|| "Binaire `claude` introuvable. Installez-le avec `npm install -g @anthropic-ai/claude-code`.".to_string())?,
-        Some("codex") => super::ai::resolve_codex_binary()
-            .ok_or_else(|| "Binaire `codex` introuvable. Installez-le avec `npm install -g @openai/codex`.".to_string())?,
-        Some("opencode") => super::ai::resolve_opencode_binary()
-            .ok_or_else(|| "Binaire `opencode` introuvable. Installez-le avec `npm install -g opencode-ai` ou via `curl -fsSL https://opencode.ai/install | bash`.".to_string())?,
-        Some("antigravity") => super::ai::resolve_antigravity_binary()
-            .ok_or_else(|| "Binaire `agy` introuvable. Installez-le avec `curl -fsSL https://antigravity.google/cli/install.sh | bash`.".to_string())?,
-        _ => resolve_shell(&shell),
-    };
-    let mut cmd = CommandBuilder::new(&program);
-    // Login shell sur Unix pour charger le profil utilisateur (PATH, aliases…).
-    // Seulement pour les shells qui acceptent `-l` (cf. login_flag) — sinon
-    // le PTY meurt avec `unknown option '-l'`. Un agent n'est jamais un login shell.
-    #[cfg(not(windows))]
-    if agent_kind.is_none() {
-        if let Some(flag) = login_flag(&program) {
-            cmd.arg(flag);
+    let mut cmd = match &spec.kind {
+        SpawnKind::Agent(agent) => {
+            let program = match agent.as_str() {
+                "claude" => super::ai::resolve_claude_binary()
+                    .ok_or_else(|| "Binaire `claude` introuvable. Installez-le avec `npm install -g @anthropic-ai/claude-code`.".to_string())?,
+                "codex" => super::ai::resolve_codex_binary()
+                    .ok_or_else(|| "Binaire `codex` introuvable. Installez-le avec `npm install -g @openai/codex`.".to_string())?,
+                "opencode" => super::ai::resolve_opencode_binary()
+                    .ok_or_else(|| "Binaire `opencode` introuvable. Installez-le avec `npm install -g opencode-ai` ou via `curl -fsSL https://opencode.ai/install | bash`.".to_string())?,
+                "antigravity" => super::ai::resolve_antigravity_binary()
+                    .ok_or_else(|| "Binaire `agy` introuvable. Installez-le avec `curl -fsSL https://antigravity.google/cli/install.sh | bash`.".to_string())?,
+                // Unknown agent names keep the historical behavior: a shell.
+                _ => return spawn_session(
+                    SpawnSpec { kind: SpawnKind::Shell(None), ..spec },
+                    on_chunk,
+                    on_exit,
+                ),
+            };
+            // An agent is never a login shell.
+            CommandBuilder::new(&program)
         }
-    }
-    cmd.cwd(&canon);
+        SpawnKind::Shell(shell) => {
+            let program = resolve_shell(shell);
+            #[allow(unused_mut)]
+            let mut cmd = CommandBuilder::new(&program);
+            // Login shell sur Unix pour charger le profil utilisateur (PATH, aliases…).
+            // Seulement pour les shells qui acceptent `-l` (cf. login_flag) — sinon
+            // le PTY meurt avec `unknown option '-l'`.
+            #[cfg(not(windows))]
+            if let Some(flag) = login_flag(&program) {
+                cmd.arg(flag);
+            }
+            cmd
+        }
+        SpawnKind::Command { command, shell } => {
+            let (program, args, env) = shell_invocation(shell, command);
+            let mut cmd = CommandBuilder::new(&program);
+            cmd.args(&args);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            cmd
+        }
+    };
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: spec.rows,
+            cols: spec.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty failed: {e}"))?;
+
+    cmd.cwd(&spec.cwd);
     // Strip GitWand's sensitive auth env vars before handing over an interactive
     // PTY. Mirrors strip_claude_auth_env (ai.rs) / claudeSpawnEnv (dev-server):
     // keeps API keys held by the GitWand process from leaking into the terminal,
@@ -166,11 +339,18 @@ pub(crate) fn terminal_open(
     if let Some(extra) = crate::git::macos_enriched_path() {
         cmd.env("PATH", extra);
     }
+    // Allow-listed above; applied after the stripping.
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
 
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("spawn shell failed: {e}"))?;
+    // Drop our copy of the slave, so the reader sees EOF once the child's
+    // side is closed.
+    drop(pair.slave);
 
     // Obtain the reader and writer BEFORE inserting into the registry. If either
     // step fails after spawn_command() succeeded we must kill the child — otherwise
@@ -191,6 +371,18 @@ pub(crate) fn terminal_open(
     };
 
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let leader = child.process_id();
+    if let Some(pid) = leader {
+        record_spawned(pid, &spec.cwd);
+    }
+    #[cfg(windows)]
+    let job = leader.and_then(|pid| match job::Job::assign(pid) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            eprintln!("[terminal] Job Object not set up, closing kills the leader only: {e}");
+            None
+        }
+    });
     let master_arc: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
         Arc::new(Mutex::new(pair.master));
     let writer_arc: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
@@ -201,6 +393,10 @@ pub(crate) fn terminal_open(
             master: master_arc,
             writer: writer_arc,
             child,
+            cwd: spec.cwd,
+            leader,
+            #[cfg(windows)]
+            job,
         },
     );
 
@@ -234,22 +430,77 @@ pub(crate) fn terminal_open(
                     };
 
                     carry = remainder;
-                    if !chunk.is_empty() && on_output.send(chunk).is_err() {
+                    if !chunk.is_empty() && !on_chunk(chunk) {
                         break; // frontend parti
                     }
                 }
-                Err(_) => break,
+                Err(_) => break, // EIO on Linux once the slave side is closed
             }
         }
         // Flush any remaining carry bytes on EOF.
         if !carry.is_empty() {
-            let _ = on_output.send(String::from_utf8_lossy(&carry).to_string());
+            let _ = on_chunk(String::from_utf8_lossy(&carry).to_string());
         }
-        // Nettoyage : retirer la session du registre quand le PTY se ferme.
-        lock_sessions().remove(&id);
+        // Nettoyage : retirer la session du registre quand le PTY se ferme,
+        // puis lire le code de sortie du leader. Si `terminal_close` l'a déjà
+        // retirée, GitWand l'a arrêtée : pas de code.
+        let handle = lock_sessions().remove(&id);
+        let code = handle.and_then(|mut h| exit_code(&mut *h.child));
+        on_exit(code);
     });
 
     Ok(id)
+}
+
+/// The leader's exit code, waiting at most 2 s: the PTY reached EOF, so the
+/// leader has exited or is about to, unless a process it left behind closed
+/// the terminal last.
+fn exit_code(child: &mut (dyn portable_pty::Child + Send + Sync)) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.exit_code() as i32),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => return None,
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn terminal_open(
+    cwd: String,
+    shell: Option<String>,
+    agent: Option<String>,
+    cols: u16,
+    rows: u16,
+    on_output: Channel<TerminalEvent>,
+) -> Result<u64, String> {
+    // Validate and canonicalize cwd through the single audited guard (AGENTS.md:
+    // "every file-system operation on user-supplied paths must go through
+    // safe_repo_path()"). Using "." as the relative component mirrors the
+    // pattern in scratch.rs:canonical_cwd — safe_repo_path(cwd, ".") resolves
+    // and traversal-guards the directory itself, keeping this in sync with any
+    // future improvements to the shared guard.
+    let canon = safe_repo_path(cwd.trim(), ".").map_err(|e| format!("invalid cwd: {e}"))?;
+    if !canon.is_dir() {
+        return Err("cwd is not a directory".to_string());
+    }
+    let kind = match agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => SpawnKind::Agent(a.to_string()),
+        None => SpawnKind::Shell(shell),
+    };
+    let (on_chunk, on_exit) = event_sinks(move |event| on_output.send(event).is_ok());
+    spawn_session(
+        SpawnSpec {
+            cwd: canon,
+            kind,
+            env: HashMap::new(),
+            cols,
+            rows,
+        },
+        on_chunk,
+        on_exit,
+    )
 }
 
 #[tauri::command]
@@ -295,18 +546,593 @@ pub(crate) fn terminal_resize(id: u64, cols: u16, rows: u16) -> Result<(), Strin
     result
 }
 
+/// Async, with the shutdown on a blocking thread: it waits for the processes.
 #[tauri::command]
-pub(crate) fn terminal_close(id: u64) -> Result<(), String> {
-    if let Some(mut h) = lock_sessions().remove(&id) {
-        let _ = h.child.kill();
+pub(crate) async fn terminal_close(id: u64) -> Result<(), String> {
+    let handle = lock_sessions().remove(&id);
+    if let Some(h) = handle {
+        tauri::async_runtime::spawn_blocking(move || close_sessions(vec![h], true))
+            .await
+            .map_err(|e| format!("terminal close failed: {e}"))?;
     }
     Ok(())
 }
 
-/// Tue toutes les sessions (appelé au quit de l'app).
+/// The open sessions whose working directory is `root` or inside it
+/// (component-wise).
+pub(crate) fn sessions_under(root: &std::path::Path) -> Vec<u64> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut ids: Vec<u64> = lock_sessions()
+        .iter()
+        .filter(|(_, h)| h.cwd.starts_with(&root))
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Closes these sessions like `terminal_close`, and returns their leaders'
+/// pids (their session ids on Unix).
+pub(crate) fn close_session_ids(ids: &[u64]) -> std::collections::HashSet<u32> {
+    let handles: Vec<PtyHandle> = {
+        let mut map = lock_sessions();
+        ids.iter().filter_map(|id| map.remove(id)).collect()
+    };
+    let leaders = handles.iter().filter_map(|h| h.leader).collect();
+    close_sessions(handles, true);
+    leaders
+}
+
+/// Tue toutes les sessions (appelé au quit de l'app, sur le thread de la
+/// boucle d'événements) : grâce SIGHUP courte (100 ms au total, pas par
+/// session), sans attendre les leaders ensuite.
 pub(crate) fn terminal_close_all() {
-    let mut map = lock_sessions();
-    for (_, mut h) in map.drain() {
+    let handles: Vec<PtyHandle> = lock_sessions().drain().map(|(_, h)| h).collect();
+    close_sessions(handles, false);
+}
+
+/// Stop sessions' processes, not only their leaders, and reap the leaders:
+/// once this returns they no longer write anywhere (merge-back of an AI task
+/// reads the scratch right after). SIGHUP first, as a terminal hanging up
+/// does, so shells save their history and agents their session; SIGKILL for
+/// whatever is left after a grace period. `wait_leaders` then waits for the
+/// leaders, bounded, for a process stuck in an uninterruptible syscall.
+///
+/// Unix: besides the groups, every process still in a leader's session is
+/// signalled one by one, which reaches the shell's background jobs (their
+/// own group) and an orphaned foreground job; only a process that called
+/// `setsid` itself escapes, and the worktree sweep catches it by cwd.
+/// Windows: the session's Job Object is terminated, which takes its whole
+/// tree; without one (assignment failed), only the leader is killed.
+fn close_sessions(mut handles: Vec<PtyHandle>, wait_leaders: bool) {
+    if handles.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let groups: Vec<libc::pid_t> = handles.iter().flat_map(session_groups).collect();
+        let members = session_members(&handles);
+        let grace = Duration::from_millis(if wait_leaders { 500 } else { 100 });
+        stop_groups(&groups, &members, grace, || {
+            // Reap the leaders, so a zombie doesn't keep its group alive.
+            for h in &mut handles {
+                let _ = h.child.try_wait();
+            }
+        });
+    }
+    #[cfg(windows)]
+    for h in &mut handles {
+        if let Some(job) = &h.job {
+            job.terminate();
+        }
         let _ = h.child.kill();
+    }
+    #[cfg(not(any(unix, windows)))]
+    for h in &mut handles {
+        let _ = h.child.kill();
+    }
+    if !wait_leaders {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for h in &mut handles {
+        while matches!(h.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// The process groups of a session. The leader runs in its own session and
+/// group (portable-pty `setsid`s it); what it spawns stays in that group,
+/// except jobs an interactive shell moves to their own, of which the
+/// foreground one is the terminal's group — taken only while its leader is
+/// still in this session, so a stale, reused id is never signalled. Survive:
+/// a background job of the shell, a process that called `setsid`, and a
+/// foreground job whose leader already exited.
+#[cfg(unix)]
+fn session_groups(h: &PtyHandle) -> Vec<libc::pid_t> {
+    let Some(leader) = h.child.process_id().map(|p| p as libc::pid_t) else {
+        return Vec::new();
+    };
+    let mut groups = vec![leader];
+    let foreground = h.master.lock().ok().and_then(|m| m.process_group_leader());
+    if let Some(fg) = foreground {
+        // SAFETY: plain syscall, no memory is shared with it.
+        if fg != leader && unsafe { libc::getsid(fg) } == leader {
+            groups.push(fg);
+        }
+    }
+    groups
+}
+
+/// The processes still in the sessions' sessions, leaders excluded (their
+/// group already covers them). Never pid ≤ 1, GitWand itself or a member of
+/// GitWand's group.
+#[cfg(unix)]
+fn session_members(handles: &[PtyHandle]) -> Vec<libc::pid_t> {
+    let leaders: std::collections::HashSet<u32> = handles.iter().filter_map(|h| h.leader).collect();
+    if leaders.is_empty() {
+        return Vec::new();
+    }
+    let own = std::process::id();
+    // SAFETY: plain syscall.
+    let own_group = unsafe { libc::getpgrp() };
+    crate::process_tree::list_processes()
+        .into_iter()
+        .map(|p| p.pid)
+        .filter(|&pid| pid > 1 && pid != own && !leaders.contains(&pid))
+        .filter(|&pid| {
+            crate::process_tree::session_of(pid).is_some_and(|sid| leaders.contains(&sid))
+        })
+        .filter_map(|pid| libc::pid_t::try_from(pid).ok())
+        // SAFETY: plain syscall.
+        .filter(|&pid| unsafe { libc::getpgid(pid) } != own_group)
+        .collect()
+}
+
+/// SIGHUP `groups` and `pids`, give them up to `grace` to be gone, then
+/// SIGKILL what is left. Every group member counts, not only the leaders: an
+/// agent still saving its session after its shell exited gets the whole
+/// grace period. `reap` runs before each check, for the caller to reap its
+/// own children. An emptied group, or a pid gone, is not signalled again:
+/// its id is free for reuse.
+#[cfg(unix)]
+fn stop_groups(
+    groups: &[libc::pid_t],
+    pids: &[libc::pid_t],
+    grace: Duration,
+    mut reap: impl FnMut(),
+) {
+    signal_groups(groups, libc::SIGHUP);
+    signal_pids(pids, libc::SIGHUP);
+    let deadline = Instant::now() + grace;
+    let mut alive: Vec<libc::pid_t> = groups.to_vec();
+    let mut alive_pids: Vec<libc::pid_t> = pids.to_vec();
+    loop {
+        reap();
+        alive.retain(|&g| group_alive(g));
+        alive_pids.retain(|&p| pid_alive(p));
+        if (alive.is_empty() && alive_pids.is_empty()) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    signal_groups(&alive, libc::SIGKILL);
+    signal_pids(&alive_pids, libc::SIGKILL);
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks the pid exists. EPERM is a live process.
+    let probed = unsafe { libc::kill(pid, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn signal_pids(pids: &[libc::pid_t], signal: libc::c_int) {
+    let own = std::process::id() as libc::pid_t;
+    for &pid in pids {
+        // Never 0/-1 (groups, everyone), init or GitWand itself.
+        if pid > 1 && pid != own {
+            // SAFETY: plain syscall, no memory is shared with it.
+            unsafe {
+                libc::kill(pid, signal);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn group_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks the group has a member. Only ESRCH means
+    // empty: EPERM (a setuid member, `sudo`) is a member still running.
+    let probed = unsafe { libc::killpg(pgid, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn signal_groups(groups: &[libc::pid_t], signal: libc::c_int) {
+    for &pgid in groups {
+        // Never 0 (our own group), 1 (init's) or GitWand's own group.
+        // SAFETY: plain syscalls, no memory is shared with them.
+        if pgid > 1 && pgid != unsafe { libc::getpgrp() } {
+            unsafe {
+                libc::killpg(pgid, signal);
+            }
+        }
+    }
+}
+
+/// A Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: every process the
+/// session's leader starts stays in it, and terminating or closing it kills
+/// the whole tree, grandchildren included (spec §8).
+#[cfg(windows)]
+mod job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    pub(super) struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel object reference, usable from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        /// Creates a kill-on-close job and puts `pid` in it.
+        pub(super) fn assign(pid: u32) -> Result<Job, String> {
+            // SAFETY: plain Win32 calls; every handle opened here is closed
+            // on each path (the job's by `Drop`).
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return Err(format!(
+                        "CreateJobObjectW: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let job = Job(handle);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) == 0
+                {
+                    return Err(format!(
+                        "SetInformationJobObject: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process.is_null() {
+                    return Err(format!("OpenProcess: {}", std::io::Error::last_os_error()));
+                }
+                let assigned = AssignProcessToJobObject(job.0, process);
+                let err = std::io::Error::last_os_error();
+                CloseHandle(process);
+                if assigned == 0 {
+                    return Err(format!("AssignProcessToJobObject: {err}"));
+                }
+                Ok(job)
+            }
+        }
+
+        pub(super) fn terminate(&self) {
+            // SAFETY: the handle is open until `Drop`.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closed once, here. Kill-on-close ends what is left.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    fn alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// A leader in its own group, with a child that outlives a plain kill of
+    /// the leader, like an agent's subprocess. Returns (leader, child pid).
+    fn spawn_group(script: &str) -> (std::process::Child, libc::pid_t) {
+        let mut leader = Command::new("sh")
+            .args(["-c", script])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let child: libc::pid_t = line.trim().parse().unwrap();
+        assert!(alive(child));
+        (leader, child)
+    }
+
+    pub(crate) fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("gitwand-term-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    fn spec(cwd: &std::path::Path, kind: SpawnKind, env: HashMap<String, String>) -> SpawnSpec {
+        SpawnSpec {
+            cwd: cwd.to_path_buf(),
+            kind,
+            env,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    fn sh(command: &str) -> SpawnKind {
+        SpawnKind::Command {
+            command: command.into(),
+            shell: Some("/bin/sh".into()),
+        }
+    }
+
+    /// Runs a session to its end: (all output, exit code).
+    fn run(name: &str, kind: SpawnKind, env: HashMap<String, String>) -> (String, Option<i32>) {
+        let dir = scratch_dir(name);
+        let out = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&out);
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_session(
+            spec(&dir, kind, env),
+            Box::new(move |c| {
+                sink.lock().unwrap().push_str(&c);
+                true
+            }),
+            Box::new(move |code| {
+                let _ = tx.send(code);
+            }),
+        )
+        .unwrap();
+        let code = rx.recv_timeout(Duration::from_secs(10)).expect("no exit");
+        let out = out.lock().unwrap().clone();
+        (out, code)
+    }
+
+    #[test]
+    fn command_exit_code_arrives_after_output() {
+        let (out, code) = run("exit3", sh("printf hello; exit 3"), HashMap::new());
+        assert!(out.contains("hello"), "output: {out:?}");
+        assert_eq!(code, Some(3));
+        let (_, code) = run("exit7", sh("exit 7"), HashMap::new());
+        assert_eq!(code, Some(7));
+    }
+
+    /// What `terminal_open` sends on its one channel: chunks, then exactly
+    /// one exit, last — one channel, so IPC keeps that order.
+    #[test]
+    fn channel_events_end_with_the_exit() {
+        let dir = scratch_dir("events");
+        let events = Arc::new(Mutex::new(Vec::<TerminalEvent>::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink = Arc::clone(&events);
+        let (on_chunk, on_exit) = event_sinks(move |e: TerminalEvent| {
+            let exit = matches!(e, TerminalEvent::Exit { .. });
+            sink.lock().unwrap().push(e);
+            if exit {
+                let _ = tx.send(());
+            }
+            true
+        });
+        spawn_session(
+            spec(&dir, sh("printf out; exit 4"), HashMap::new()),
+            on_chunk,
+            on_exit,
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).expect("no exit");
+        let events = events.lock().unwrap();
+        let (last, chunks) = events.split_last().unwrap();
+        assert!(
+            matches!(last, TerminalEvent::Exit { code: Some(4) }),
+            "{last:?}"
+        );
+        assert!(chunks
+            .iter()
+            .all(|e| matches!(e, TerminalEvent::Chunk { .. })));
+        assert_eq!(
+            serde_json::to_string(last).unwrap(),
+            r#"{"type":"exit","code":4}"#
+        );
+    }
+
+    #[test]
+    fn command_sees_allowlisted_env() {
+        let env = HashMap::from([("GITWAND_WORKTREE_NAME".to_string(), "fix login".to_string())]);
+        let (out, code) = run("env", sh("printf %s \"$GITWAND_WORKTREE_NAME\""), env);
+        assert!(out.contains("fix login"), "output: {out:?}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn env_outside_allowlist_is_refused() {
+        let dir = scratch_dir("env-refused");
+        let env = HashMap::from([("ANTHROPIC_API_KEY".to_string(), "x".to_string())]);
+        let err = spawn_session(
+            spec(&dir, sh("true"), env),
+            Box::new(|_| true),
+            Box::new(|_| {}),
+        )
+        .unwrap_err();
+        assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn session_records_canonical_cwd_and_leader() {
+        let dir = scratch_dir("leader");
+        let id = spawn_session(
+            spec(&dir, sh("sleep 5"), HashMap::new()),
+            Box::new(|_| true),
+            Box::new(|_| {}),
+        )
+        .unwrap();
+        let handle = lock_sessions().remove(&id).expect("session registered");
+        assert_eq!(handle.cwd, dir);
+        assert!(handle.leader.is_some());
+        close_sessions(vec![handle], true);
+    }
+
+    #[test]
+    fn close_kills_background_job_in_own_group() {
+        let dir = scratch_dir("bgjob");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let id = spawn_session(
+            spec(
+                &dir,
+                sh("set -m; sleep 300 & echo BG:$!; wait"),
+                HashMap::new(),
+            ),
+            Box::new(move |c| tx.send(c).is_ok()),
+            Box::new(|_| {}),
+        )
+        .unwrap();
+        let mut out = String::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let bg: libc::pid_t = loop {
+            if let Some(rest) = out.split("BG:").nth(1) {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if rest.len() > digits.len() && !digits.is_empty() {
+                    break digits.parse().unwrap();
+                }
+            }
+            assert!(Instant::now() < deadline, "no BG pid in {out:?}");
+            if let Ok(c) = rx.recv_timeout(Duration::from_millis(100)) {
+                out.push_str(&c);
+            }
+        };
+        let leader = lock_sessions().get(&id).unwrap().leader.unwrap() as libc::pid_t;
+        assert!(alive(bg));
+        // SAFETY: plain syscall.
+        assert_ne!(
+            unsafe { libc::getpgid(bg) },
+            leader,
+            "job control must move it"
+        );
+
+        let leaders = close_session_ids(&[id]);
+        assert!(leaders.contains(&(leader as u32)));
+        assert!(wait_gone(bg), "the background job must be stopped too");
+    }
+
+    #[test]
+    fn sessions_under_matches_by_cwd() {
+        let a = scratch_dir("under-a");
+        let ab = scratch_dir("under-a-b");
+        let open = |d: &std::path::Path| {
+            spawn_session(
+                spec(d, sh("sleep 30"), HashMap::new()),
+                Box::new(|_| true),
+                Box::new(|_| {}),
+            )
+            .unwrap()
+        };
+        let (ia, iab) = (open(&a), open(&ab));
+        assert_eq!(sessions_under(&a), vec![ia]);
+        assert_eq!(sessions_under(&ab), vec![iab]);
+        close_session_ids(&[ia, iab]);
+        assert!(sessions_under(&a).is_empty());
+    }
+
+    fn wait_gone(pid: libc::pid_t) -> bool {
+        // An orphan is reaped by init, asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !alive(pid)
+    }
+
+    #[test]
+    fn stopping_the_group_takes_the_leaders_children_too() {
+        // The child ignores SIGHUP: only the SIGKILL that follows stops it.
+        let (mut leader, child) = spawn_group("(trap '' HUP; sleep 30) & echo $!; wait");
+        let leader_pid = leader.id() as libc::pid_t;
+
+        stop_groups(&[leader_pid], &[], Duration::from_millis(500), || {
+            let _ = leader.try_wait();
+        });
+        leader.wait().unwrap();
+        assert!(wait_gone(child), "the leader's child must be killed too");
+    }
+
+    #[test]
+    fn stopping_the_group_gives_children_the_grace_period_too() {
+        // The leader exits at once on SIGHUP; its child needs 200 ms to
+        // "save" before exiting, like an agent writing its session.
+        let marker =
+            std::env::temp_dir().join(format!("gitwand-term-grace-{}", std::process::id()));
+        // The child prints its pid only once its trap is set.
+        let script = format!(
+            r#"sh -c 'trap "sleep 0.2; echo saved > {}; exit 0" HUP; echo $$; while :; do sleep 0.05; done' & trap 'exit 0' HUP; wait"#,
+            marker.display()
+        );
+        let (mut leader, child) = spawn_group(&script);
+        let leader_pid = leader.id() as libc::pid_t;
+
+        stop_groups(&[leader_pid], &[], Duration::from_millis(500), || {
+            let _ = leader.try_wait();
+        });
+        let _ = leader.wait();
+        assert!(wait_gone(child));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            "saved\n",
+            "the child must get to finish before SIGKILL"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn stopping_the_group_hangs_up_before_killing() {
+        let marker = std::env::temp_dir().join(format!("gitwand-term-hup-{}", std::process::id()));
+        let script = format!(
+            "trap 'echo hup > {}; exit 0' HUP; sleep 30 & echo $!; wait",
+            marker.display()
+        );
+        let (mut leader, child) = spawn_group(&script);
+        let leader_pid = leader.id() as libc::pid_t;
+
+        let mut status = None;
+        stop_groups(&[leader_pid], &[], Duration::from_millis(500), || {
+            if status.is_none() {
+                status = leader.try_wait().unwrap();
+            }
+        });
+        let status = status.or_else(|| leader.wait().ok()).unwrap();
+        assert!(status.success(), "the leader exits on its own on SIGHUP");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "hup\n");
+        assert!(wait_gone(child));
+        let _ = std::fs::remove_file(marker);
     }
 }

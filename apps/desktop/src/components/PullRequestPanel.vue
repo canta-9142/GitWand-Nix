@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from "vue";
 import { safeHtml } from "../composables/useSafeHtml";
+import { escapeHtml } from "../utils/escapeHtml";
 import {
   ghListPrs,
   ghCreatePr,
@@ -23,7 +24,6 @@ import {
   type CICheck,
   type RemoteInfo,
   type GitDiff,
-  type DiffHunk,
   type DiffLine,
   type PrReviewComment,
   type CreatePrCommentParams,
@@ -39,6 +39,8 @@ import PrIntelligencePanel from "./PrIntelligencePanel.vue";
 import { forgeFromRemoteInfo, githubProvider } from "../composables/forge/useForge";
 import type { DiffMode } from "../utils/diffMode";
 import { getPersistedDiffMode } from "../utils/diffMode";
+// Shared parser: keeps hunk lines whose content starts with `--`/`++`.
+import { parseUnifiedDiff } from "../utils/unifiedDiff";
 
 const props = defineProps<{
   cwd: string;
@@ -149,54 +151,6 @@ const FORGE_LABELS: Record<string, string> = {
 };
 const forgeLabel = computed(() => FORGE_LABELS[forge.value.name] ?? "Web");
 
-// ─── Parse unified diff ─────────────────────────────────
-function parseUnifiedDiff(rawDiff: string): GitDiff[] {
-  const files: GitDiff[] = [];
-  if (!rawDiff.trim()) return files;
-  const lines = rawDiff.split("\n");
-  let currentFile: GitDiff | null = null;
-  let currentHunk: DiffHunk | null = null;
-  let oldLine = 0, newLine = 0;
-  for (const line of lines) {
-    if (line.startsWith("diff --git ")) {
-      if (currentFile) files.push(currentFile);
-      const match = line.match(/diff --git a\/(.+) b\/(.+)/);
-      currentFile = { path: match ? match[2] : "unknown", hunks: [] };
-      currentHunk = null;
-      continue;
-    }
-    if (line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ") ||
-        line.startsWith("old mode ") || line.startsWith("new mode ") || line.startsWith("new file ") ||
-        line.startsWith("deleted file ") || line.startsWith("similarity index ") ||
-        line.startsWith("rename from ") || line.startsWith("rename to ") || line.startsWith("Binary files ")) continue;
-    const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)/);
-    if (hunkMatch && currentFile) {
-      currentHunk = {
-        header: line,
-        oldStart: parseInt(hunkMatch[1], 10),
-        oldCount: parseInt(hunkMatch[2] ?? "1", 10),
-        newStart: parseInt(hunkMatch[3], 10),
-        newCount: parseInt(hunkMatch[4] ?? "1", 10),
-        lines: [],
-      };
-      currentFile.hunks.push(currentHunk);
-      oldLine = parseInt(hunkMatch[1], 10);
-      newLine = parseInt(hunkMatch[3], 10);
-      continue;
-    }
-    if (currentHunk) {
-      if (line.startsWith("+")) {
-        currentHunk.lines.push({ type: "add", content: line.substring(1), newLineNo: newLine++ });
-      } else if (line.startsWith("-")) {
-        currentHunk.lines.push({ type: "delete", content: line.substring(1), oldLineNo: oldLine++ });
-      } else if (line.startsWith(" ") || line === "") {
-        currentHunk.lines.push({ type: "context", content: line.startsWith(" ") ? line.substring(1) : line, oldLineNo: oldLine++, newLineNo: newLine++ });
-      }
-    }
-  }
-  if (currentFile) files.push(currentFile);
-  return files;
-}
 
 // ─── Data loading ───────────────────────────────────────
 async function loadRemote() {
@@ -340,7 +294,7 @@ async function handleReplyComment(inReplyToId: number, body: string) {
 
 async function handleEditComment(id: number, body: string) {
   try {
-    await ghPrUpdateComment(props.cwd, id, body);
+    await ghPrUpdateComment(props.cwd, id, body, selectedPr.value?.number);
     // Update locally
     const idx = prComments.value.findIndex((c) => c.id === id);
     if (idx !== -1) prComments.value[idx] = { ...prComments.value[idx], body, updated_at: new Date().toISOString() };
@@ -349,7 +303,7 @@ async function handleEditComment(id: number, body: string) {
 
 async function handleDeleteComment(id: number) {
   try {
-    await ghPrDeleteComment(props.cwd, id);
+    await ghPrDeleteComment(props.cwd, id, selectedPr.value?.number);
     prComments.value = prComments.value.filter((c) => c.id !== id && c.in_reply_to_id !== id);
     if (prDetail.value && prDetail.value.reviewComments > 0) prDetail.value.reviewComments--;
   } catch (err: any) { error.value = err.message; }
@@ -512,8 +466,7 @@ const checksUrl = computed(() => {
 
 
 function renderBody(body: string): string {
-  return body
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  return escapeHtml(body)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/`(.+?)`/g, '<code class="pr-code">$1</code>')
     .replace(/\n/g, "<br />");

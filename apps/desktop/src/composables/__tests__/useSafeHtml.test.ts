@@ -11,8 +11,13 @@
  * DOMPurify a real `window`/`document` to parse against.
  */
 
-import { describe, expect, it } from "vitest";
-import { renderMarkdown, safeHtml } from "../useSafeHtml";
+import { afterEach, describe, expect, it } from "vitest";
+import { renderMarkdown, safeHtml, hasBlockedRemoteImages } from "../useSafeHtml";
+import { useSettings } from "../useSettings";
+
+afterEach(() => {
+  useSettings().settings.value.allowRemoteImages = false;
+});
 
 describe("safeHtml — raw HTML sanitization", () => {
   it("strips <script> tags", () => {
@@ -97,6 +102,13 @@ describe("safeHtml — raw HTML sanitization", () => {
     expect(out).toContain("<th>A</th>");
   });
 
+  it("drops a comment spanning blank lines inside a list item", () => {
+    const out = renderMarkdown("- item <!-- TODO\n\nhidden\n\n-->\n- next");
+    expect(out).not.toContain("hidden");
+    expect(out).not.toContain("--&gt;");
+    expect(out).toContain("next");
+  });
+
   it("returns empty string for nullish input", () => {
     expect(safeHtml(null)).toBe("");
     expect(safeHtml(undefined)).toBe("");
@@ -114,7 +126,7 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
   });
 
   it("strips raw HTML <script> tags embedded in markdown", () => {
-    // markdown-it (html: true) parses the raw HTML tag, and DOMPurify strips it.
+    // The renderer passes the raw HTML tag through, and DOMPurify strips it.
     const out = renderMarkdown("normal\n\n<script>alert(1)</script>\n\nmore");
     expect(out).not.toContain("<script");
     expect(out).not.toContain("alert(1)");
@@ -124,7 +136,7 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
 
   it("strips XSS payloads smuggled via inline HTML in markdown", () => {
     const out = renderMarkdown('click <img src=x onerror="alert(1)"> here');
-    // markdown-it (html: true) parses the raw HTML tag. DOMPurify allows the img tag,
+    // The renderer passes the raw HTML tag through. DOMPurify allows the img tag,
     // but strips the onerror handler.
     expect(out).toContain('<img src="x">');
     expect(out.toLowerCase()).not.toContain("onerror");
@@ -132,13 +144,83 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
   });
 
   it("renders raw HTML img tags with width and height in markdown", () => {
+    useSettings().settings.value.allowRemoteImages = true;
     const out = renderMarkdown('hello <img width="2521" height="203" alt="image" src="https://github.com/user-attachments/assets/5284ccc2-4567-40f0-88b7-1faec2289bbe" /> world');
     expect(out).toContain('<img width="2521" height="203" alt="image" src="https://github.com/user-attachments/assets/5284ccc2-4567-40f0-88b7-1faec2289bbe">');
   });
 
+  it("withholds remote images by default (tracking pixels)", () => {
+    const url = "https://tracker.example/pixel.gif?pr=42";
+    for (const src of [url, "//tracker.example/p.gif", "http://tracker.example/p.gif"]) {
+      const out = renderMarkdown(`![logo](${src}) <img src="${src}">`);
+      expect(out).not.toMatch(/src="(https?:)?\/\//);
+      expect(out).toContain('class="md-img-blocked"');
+    }
+    // The URL stays visible as a title, alt text is kept.
+    const out = renderMarkdown(`![logo](${url})`);
+    expect(out).toContain('alt="logo"');
+    expect(out).toContain(url.replace(/&/g, "&amp;"));
+  });
+
+  it("withholds remote images whatever spelling the URL parser forgives", () => {
+    // Each of these is fetched from tracker.example by a browser: the URL
+    // parser drops ASCII tab / newline anywhere and C0 controls / spaces at
+    // the ends, reads `\` as `/` in special schemes, and takes `https:host`
+    // as `https://host`. A prefix regex on the raw text missed them.
+    const payloads = [
+      "h&#9;ttps://tracker.example/p.gif",
+      "ht&#10;tp://tracker.example/p.gif",
+      "https:&#13;//tracker.example/p.gif",
+      "&#1;https://tracker.example/p.gif",
+      "&#31; //tracker.example/p.gif",
+      "\\\\tracker.example/p.gif",
+      "/\\tracker.example/p.gif",
+      "\\/tracker.example/p.gif",
+      "HTTPS://tracker.example/p.gif",
+      "https:tracker.example/p.gif",
+      "ftp://tracker.example/p.gif",
+    ];
+    for (const p of payloads) {
+      const out = safeHtml(`<img src="${p}" alt="a">`);
+      const img = new DOMParser().parseFromString(out, "text/html").querySelector("img");
+      expect(img?.getAttribute("src"), p).toBeNull();
+      expect(img?.className, p).toBe("md-img-blocked");
+    }
+    // DOMPurify drops a `file:` src on its own, before our hook sees it.
+    expect(safeHtml('<img src="file:///etc/p.png">')).not.toContain("file:");
+  });
+
+  it("keeps relative (same-document) images when remote ones are blocked", () => {
+    for (const src of ["x", "./img/a.png", "/abs/a.png", "img/a%20b.png"]) {
+      const out = safeHtml(`<img src="${src}">`);
+      expect(out, src).toContain(`src="${src}"`);
+      expect(hasBlockedRemoteImages(out), src).toBe(false);
+    }
+  });
+
+  it("drops non-image data: URLs even when disguised by whitespace", () => {
+    const out = safeHtml('<img src="&#9;data:text/html;base64,PHNjcmlwdD4=">');
+    expect(out).not.toContain("data:text/html");
+  });
+
+  it("loads remote images for one render when the caller passes consent", () => {
+    const md = "![shot](https://example.com/s.png)";
+    const allowed = renderMarkdown(md, { allowRemoteImages: true });
+    expect(allowed).toContain('src="https://example.com/s.png"');
+    expect(hasBlockedRemoteImages(allowed)).toBe(false);
+    // The consent does not leak into the next render.
+    const next = renderMarkdown(md);
+    expect(next).not.toContain('src="https://example.com/s.png"');
+    expect(hasBlockedRemoteImages(next)).toBe(true);
+  });
+
+  it("still renders inline data: images when remote ones are blocked", () => {
+    const tiny = "data:image/png;base64,iVBORw0KGgo=";
+    expect(safeHtml(`<img src="${tiny}" alt="p">`)).toContain(`src="${tiny}"`);
+  });
 
   it("neutralises javascript: links in markdown", () => {
-    // markdown-it's default link validator rejects javascript: URIs, so
+    // The renderer's link validator rejects javascript: URIs, so
     // the link is not parsed as a link at all — the source text remains
     // as inert markdown syntax. We assert no real <a href="javascript:">
     // ever reaches the DOM.
@@ -181,6 +263,20 @@ describe("renderMarkdown — markdown → sanitized HTML", () => {
   it("does not render single newlines as <br> when breaks is false (README behaviour)", () => {
     const out = renderMarkdown("line one\nline two", { breaks: false });
     expect(out).not.toContain("<br>");
+  });
+
+  it("drops HTML comments but keeps them inside code", () => {
+    const out = renderMarkdown("a <!-- hidden --> b\n\n<!-- block -->\n\n`<!-- code -->`");
+    expect(out).not.toContain("hidden");
+    expect(out).not.toContain("block");
+    expect(out).toContain("&lt;!-- code --&gt;");
+  });
+
+  it("drops a mid-paragraph comment spanning blank lines (README section hiding)", () => {
+    const out = renderMarkdown("text <!-- start\n\nhidden\n\nend --> more");
+    expect(out).not.toContain("hidden");
+    expect(out).toContain("text");
+    expect(out).toContain("more");
   });
 
   it("returns empty string for nullish input", () => {
