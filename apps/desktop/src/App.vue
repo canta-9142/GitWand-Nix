@@ -52,10 +52,14 @@ import { useSnapshots } from "./composables/useSnapshots";
 const TagsPanel = defineAsyncComponent(() => import("./components/TagsPanel.vue"));
 const WorktreeManager = defineAsyncComponent(() => import("./components/WorktreeManager.vue"));
 const SubmodulePanel = defineAsyncComponent(() => import("./components/SubmodulePanel.vue"));
+const ReleaseNotesModal = defineAsyncComponent(() => import("./components/ReleaseNotesModal.vue"));
 const LaunchpadView = defineAsyncComponent(() => import("./components/LaunchpadView.vue"));
 const AgentSessionsPanel = defineAsyncComponent(() => import("./components/AgentSessionsPanel.vue"));
 const AiTaskCloseModal = defineAsyncComponent(() => import("./components/AiTaskCloseModal.vue"));
+const WorktreeRemoveDialog = defineAsyncComponent(() => import("./components/WorktreeRemoveDialog.vue"));
+const MergeBackDialog = defineAsyncComponent(() => import("./components/MergeBackDialog.vue"));
 const AiTaskNameModal = defineAsyncComponent(() => import("./components/AiTaskNameModal.vue"));
+const WorktreeHookTrustModal = defineAsyncComponent(() => import("./components/WorktreeHookTrustModal.vue"));
 const CommandLogPanel = defineAsyncComponent(() => import("./components/CommandLogPanel.vue"));
 const SearchPalette = defineAsyncComponent(() => import("./components/header/SearchPalette.vue"));
 const BranchRenameModal = defineAsyncComponent(() => import("./components/header/BranchRenameModal.vue"));
@@ -93,9 +97,11 @@ import { useApplyFromPreview, assertOperationSucceeded, type ApplyOutcome } from
 import { useResolutionMemory, type ResolutionMemoryEntry, type ResolutionStrategy } from "./composables/useResolutionMemory";
 import { useRepoTabs } from "./composables/useRepoTabs";
 import { useAiTasks } from "./composables/useAiTasks";
+import { useWorktreeHookTrust } from "./composables/useWorktreeHookTrust";
 import { usePinnedBranches } from "./composables/usePinnedBranches";
-import { computeCheckoutPrompt, isUpdatePromptSkipped, skipUpdatePrompt } from "./composables/useBranchUpdatePrompt";
-import { useGitRepo, type ViewMode } from "./composables/useGitRepo";
+import { computeCheckoutPrompt, isUpdatePromptSkipped, isUpstreamRewriteOnly, skipUpdatePrompt } from "./composables/useBranchUpdatePrompt";
+import { useGitRepo, type ViewMode, type RepoFileEntry } from "./composables/useGitRepo";
+import { useHeaderAlign } from "./composables/useHeaderAlign";
 import { useWorkspaceScope } from "./composables/useWorkspaceScope";
 import { useTheme } from "./composables/useTheme";
 import { useI18n } from "./composables/useI18n";
@@ -104,7 +110,9 @@ import { useNetworkStatus } from "./composables/useNetworkStatus";
 import { useConnectivity } from "./composables/useConnectivity";
 import { useScheduler } from "./composables/useScheduler";
 import { useRepoPoller } from "./composables/useRepoPoller";
+import { useAutoFastForward } from "./composables/useAutoFastForward";
 import { useRepoWatcher } from "./composables/useRepoWatcher";
+import { useTrackedIgnored, shouldRecheckTrackedIgnored } from "./composables/useTrackedIgnored";
 import { useWatcherRefreshQueue } from "./composables/useWatcherRefreshQueue";
 import { useLaunchpadPoller } from "./composables/useLaunchpadPoller";
 import { useSecretsScanner } from "./composables/useSecretsScanner";
@@ -122,7 +130,7 @@ import { resolveCommitReviewShortcut } from "./composables/commitReviewKeymap";
 import { useLaunchpadPrs } from "./composables/useLaunchpadPrs";
 import { diffLaunchpad, isBotAuthor, type LaunchpadEvent } from "./composables/useLaunchpadNotifications";
 import { osNotify } from "./composables/useOsNotification";
-import { useReleaseNotes } from "./composables/useReleaseNotes";
+import { getTemplateLang } from "./composables/useAiTemplates";
 import { useFolderHistory } from "./composables/useFolderHistory";
 import { useAppMenu } from "./composables/useAppMenu";
 import { useLogs } from "./composables/useLogs";
@@ -136,9 +144,17 @@ import {
   LAUNCHPAD_OPEN_REQUEST_KEY,
   TOGGLE_GIT_TREE_KEY,
   OPEN_SETTINGS_KEY,
+  COMMIT_MESSAGE_SINK_KEY,
+  type SettingsSectionTarget,
 } from "./composables/branchPickerBridge";
-import { gitStash, gitStashPop, gitStashList, openInEditor, setGitConfig, gitDiscard, gitAddToGitignore, gitDeleteBranch, gitDeleteTag, gitDeleteRemoteTag, gitRemoteInfo, gitUnpushedTags, gitPushTags, gitMergeBase, gitResetToCommit, gitCommitSubmoduleChanges, gitSubmoduleCheckUpdates, scratchWorktreeCreate, scratchWorktreeDiscard, scratchWorktreeMergeBack, gitWorktreeList, gitWorktreeRemove, type CommitSubmoduleChange, type ScratchWorktree } from "./utils/backend";
+import { gitStash, gitStashPop, gitStashList, openInEditor, setGitConfig, gitDiscard, gitAddToGitignore, gitDeleteBranch, gitDeleteTag, gitDeleteRemoteTag, gitRemoteInfo, gitUnpushedTags, gitPushTags, gitMergeBase, gitResetToCommit, gitCommitSubmoduleChanges, gitSubmoduleCheckUpdates, gitWorktreeList, type CommitSubmoduleChange, type RemoveOutcome, worktreeRunHook, worktreeResolveBase, type BaseResolution, type CreatedWorktree, type SnapshotMeta } from "./utils/backend";
+import { useWorktreeCreation, registerSetupRunner } from "./composables/useWorktreeCreation";
+import { registerRemovalHost } from "./composables/useWorktreeRemoval";
+import { registerMergeBackHost } from "./composables/useWorktreeMergeBack";
+import type { HookTrustDecision } from "./composables/useWorktreeHookTrust";
+import { aiTaskName, describeBase } from "./utils/worktreeBase";
 import { useCommitActions } from "./composables/useCommitActions";
+import { useConflictEditorSelection } from "./composables/useConflictEditorSelection";
 
 const { t, locale } = useI18n();
 const { settings, refreshSettings } = useSettings();
@@ -181,6 +197,7 @@ import type { ForgeName } from "./composables/forge/types";
 import { onMarkdownLinkClick } from "./composables/useSafeHtml";
 import { resolveDirtySwitchAction, type DirtyFile } from "./utils/branchSwitchDecision";
 import { resolveDirtyPullAction } from "./utils/pullDirtyDecision";
+import { planDiscard, selectDiscardEntries, summarizeDiscard } from "./utils/discardPlan";
 import { requireOnline } from "./utils/networkGuard";
 // UpdateModal moved above (lazy-loaded) — type imported as UpdateModalType for the template ref
 
@@ -233,6 +250,7 @@ const {
   logLoadingMore,
   setLogAuthorFilter,
   setLogBranchFilter,
+  setLogViewAnchor,
   loading: repoLoading,
   error: repoError,
   successMessage: repoSuccess,
@@ -296,7 +314,7 @@ const {
   loadBranches,
   createBranch,
   switchBranch,
-  updateBranchFastForward,
+  updateBranchToUpstream,
   carryChangesToBranch,
   deleteBranch,
   deleteRemoteBranch,
@@ -335,21 +353,27 @@ const commitReviewNav = useCommitReviewNav({
   onHelp: () => showCommitReviewNavHelp(),
 });
 
-/** Shared transient toast for Commit Review's own non-error feedback (the
- *  `?` help reminder, a clean-pass confirmation) — reuses the existing toast
- *  affordance rather than inventing a second one (verifier issue #5). */
-function showCommitReviewToast(title: string, detail: string) {
+/**
+ * The shared toast (Commit Review feedback, Launchpad actions, repo
+ * successes…), shown for `ms`. `ms = 0` makes it sticky: shown until
+ * dismissed; a toast shown meanwhile parks it, and it comes back once that
+ * one is gone.
+ */
+function showDetailToast(title: string, detail: string | null, ms = 3000) {
+  if (stickyToast) parkedToasts.push(stickyToast);
   if (successTimer != null) { window.clearTimeout(successTimer); successTimer = null; }
+  if (dismissTimer != null) { window.clearTimeout(dismissTimer); dismissTimer = null; }
+  stickyToast = ms === 0 ? { title, detail } : null;
   successToastLeaving.value = false;
   successToast.value = title;
-  successToastDetail.value = detail;
-  successTimer = window.setTimeout(dismissToast, 3000);
+  successToastDetail.value = detail || null;
+  if (ms > 0) successTimer = window.setTimeout(dismissToast, ms);
 }
 
 /** `?` — a one-line toast (per the plan: reuse the existing toast
  *  affordance, no new help modal). */
 function showCommitReviewNavHelp() {
-  showCommitReviewToast(
+  showDetailToast(
     t("commitReview.navHelp"),
     `${t("commitReview.navNext")} (N) · ${t("commitReview.navPrev")} (P) · ${t("commitReview.dismiss")} (X)`,
   );
@@ -361,7 +385,7 @@ function showCommitReviewNavHelp() {
  *  Called from `reviewStaged` below only when the run actually completed
  *  (not skipped, not superseded) and produced no error. */
 function showCommitReviewCleanToast() {
-  showCommitReviewToast(t("commitReview.summaryClean"), "");
+  showDetailToast(t("commitReview.summaryClean"), null);
 }
 
 /** Task 2 (v3.7.0) — the commit-review keymap is only "active" (bare-letter
@@ -386,20 +410,21 @@ watch(commitReview.lastError, (val) => {
 // Monorepo scope (v2.21.0) — restore persisted scope on repo open.
 const { loadScope } = useWorkspaceScope();
 
-function switchToChangesWithFirstFile() {
+// Applying / popping a stash selects the WIP on the Git Tree: the right rail
+// shows the Changes pane, but no file is auto-opened over the graph.
+function focusWip() {
   viewMode.value = "changes";
-  const first = repoFiles.value[0];
-  if (first) repoSelectFile(first.path, first.section === "staged");
+  wipDiffOpen.value = false;
 }
 
 async function applyStash(index: number) {
   await applyStashRepo(index);
-  switchToChangesWithFirstFile();
+  focusWip();
 }
 
 async function popStash(index: number) {
   await popStashRepo(index);
-  switchToChangesWithFirstFile();
+  focusWip();
 }
 
 // ─── Git Tree (now a full-screen view) ───────────────────
@@ -503,7 +528,16 @@ provide(UNDO_POPOVER_REQUEST_KEY, undoPopoverRequest);
 provide(LOG_FOCUS_SEARCH_KEY, logFocusRequest);
 provide(LAUNCHPAD_OPEN_REQUEST_KEY, launchpadOpenRequest);
 provide(TOGGLE_GIT_TREE_KEY, () => { showGitTree.value = !showGitTree.value; });
-provide(OPEN_SETTINGS_KEY, (tab) => { settingsInitialTab.value = tab; showSettings.value = true; });
+provide(OPEN_SETTINGS_KEY, (tab, section) => {
+  settingsInitialTab.value = tab;
+  settingsInitialSection.value = section;
+  showSettings.value = true;
+});
+provide(COMMIT_MESSAGE_SINK_KEY, (cwd, summary, description) => {
+  if (cwd !== (repoFolderPath.value ?? "")) return;
+  commitSummary.value = summary;
+  commitDescription.value = description;
+});
 provide("askConfirm", askConfirm);
 
 // ─── Multi-repo tabs (lightweight — paths only) ─────────
@@ -513,6 +547,7 @@ const {
   openTab,
   closeTab,
   selectWorktree,
+  forgetCheckout,
   activeRepoPath,
   switchTab,
   reorderTabs,
@@ -520,6 +555,11 @@ const {
 
 // ─── AI-task scratch worktrees (registry + worktree submenu) ──
 const aiTasks = useAiTasks();
+// v3.13: AI tasks now live on `task/<name>`, so the Git Tree knows them by
+// the registry rather than by the `gitwand-scratch-` prefix alone.
+const aiTaskBranches = computed(() => new Set(Object.values(aiTasks.tasks.value).map((task) => task.branch)));
+// v3.13 — trust prompt for a repository's worktree commands (asked by creation/removal).
+const hookTrust = useWorktreeHookTrust();
 
 // Non-main worktree count per project path — drives whether the chip shows its
 // submenu caret (no caret when a project has only its main worktree). Keyed by
@@ -719,26 +759,29 @@ const successToastDetail = ref<string | null>(null);
 const successToastLeaving = ref(false);
 const memorizeToast = ref<{ path: string; strategy: ResolutionStrategy } | null>(null);
 let successTimer: number | null = null;
+// The fade-out of a dismissed toast, cancelled when a new one replaces it.
+let dismissTimer: number | null = null;
+// The sticky toast on screen, and the ones covered since, shown again in turn.
+let stickyToast: { title: string; detail: string | null } | null = null;
+const parkedToasts: { title: string; detail: string | null }[] = [];
 
 function dismissToast() {
+  if (dismissTimer != null) return; // already fading out (double click)
+  // Dismissed by hand before its timer: the timer must not close the next one.
+  if (successTimer != null) { window.clearTimeout(successTimer); successTimer = null; }
+  stickyToast = null;
   successToastLeaving.value = true;
-  window.setTimeout(() => {
+  dismissTimer = window.setTimeout(() => {
     successToast.value = null;
     successToastDetail.value = null;
     successToastLeaving.value = false;
     successTimer = null;
+    dismissTimer = null;
+    const parked = parkedToasts.pop();
+    if (parked) showDetailToast(parked.title, parked.detail, 0);
   }, 200);
 }
 
-/** Transient toast for Launchpad mutating actions (merge/nudge) — reuses the
- *  existing toast affordance rather than inventing a second one. */
-function showLaunchpadToast(title: string) {
-  if (successTimer != null) { window.clearTimeout(successTimer); successTimer = null; }
-  successToastLeaving.value = false;
-  successToast.value = title;
-  successToastDetail.value = null;
-  successTimer = window.setTimeout(dismissToast, 3000);
-}
 
 watch(repoSuccess, (val) => {
   if (!val) return;
@@ -749,9 +792,6 @@ watch(repoSuccess, (val) => {
   // Respect the notifications setting
   if (!settings.value.notifications) return;
 
-  if (successTimer != null) { window.clearTimeout(successTimer); successTimer = null; }
-  successToastLeaving.value = false;
-
   const meta: Record<string, { key: string; detail?: string }> = {
     "already-up-to-date": { key: "header.syncUpToDate" },
     "sync-done": { key: "header.syncDone" },
@@ -760,36 +800,30 @@ watch(repoSuccess, (val) => {
     "merge-done": { key: "header.mergeDone" },
     "merge-aborted": { key: "header.mergeAborted" },
     "cherry-pick-done": { key: "header.cherryPickDone" },
+    "cherry-pick-wip-done": { key: "header.cherryPickWipDone" },
     "cherry-pick-aborted": { key: "header.cherryPickAborted" },
     "autostash-parked": { key: "header.pullAutostashParked" },
   };
   const info = meta[val];
-  successToast.value = info ? t(info.key as any) : val;
-  successToastDetail.value = new Date().toLocaleString(undefined, {
-    weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit",
-  });
-  successTimer = window.setTimeout(dismissToast, 3000);
+  showDetailToast(
+    info ? t(info.key as any) : val,
+    new Date().toLocaleString(undefined, {
+      weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit",
+    }),
+  );
 });
 
 // ─── Conflict handling ──────────────────────────────────
-// When a conflicted file is selected, load it in useGitWand for resolution
-const showingMergeEditor = ref(false);
-
-// Watch both the conflicted flag AND the selected file path —
-// switching between two conflicted files keeps isConflicted=true
-// so we need to also react to the file path changing.
-watch(
-  [isSelectedFileConflicted, repoSelectedFile],
-  async ([isConflicted, filePath]) => {
-    if (isConflicted && repoFolderPath.value && filePath) {
-      await mergeOpenPath(repoFolderPath.value);
-      mergeSelectFile(filePath);
-      showingMergeEditor.value = true;
-    } else {
-      showingMergeEditor.value = false;
-    }
-  },
-);
+// When a conflicted file is selected, load it in useGitWand for resolution.
+// `mergeEditorPending` covers the load, so the diff never renders the raw
+// conflict markers in the meantime.
+const { showing: showingMergeEditor, pending: mergeEditorPending } = useConflictEditorSelection({
+  isConflicted: isSelectedFileConflicted,
+  filePath: repoSelectedFile,
+  repoPath: repoFolderPath,
+  openConflicts: mergeOpenPath,
+  selectConflict: mergeSelectFile,
+});
 
 /**
  * After resolving a hunk or file, check if the file is fully resolved.
@@ -957,6 +991,7 @@ async function handleApplyFromPreview(operation: string, ref_: string, estimated
     // Land the user on the first file that still needs them, if any.
     if (out.residualFiles.length > 0) {
       viewMode.value = "changes";
+      wipDiffOpen.value = true;
       await repoSelectFile(out.residualFiles[0], false);
     }
   } catch (err: unknown) {
@@ -968,6 +1003,7 @@ async function handleApplyFromPreview(operation: string, ref_: string, estimated
 
 async function handleOpenResidual(path: string) {
   viewMode.value = "changes";
+  wipDiffOpen.value = true;
   await repoSelectFile(path, false);
 }
 
@@ -1157,7 +1193,8 @@ async function onRebaseBannerSplit() {
  */
 async function handleSplitCompleted(_hashes: { firstHash: string; secondHash: string }) {
   if (viewMode.value === "history" || showGitTree.value) {
-    await loadLog();
+    // Force: splitting rewrites HEAD, which may not be the log's top commit.
+    await loadLog(undefined, true);
   }
   // Refresh branches too — if we split the HEAD commit on a branch tip,
   // the branch's resolved SHA will have changed.
@@ -1179,6 +1216,7 @@ const {
   handleCreateBranchFromCommit,
   handleTagCommit,
   handleCherryPickCommit,
+  handleCherryPickCommitAsWip,
   handleViewOnForge,
   handleDeleteBranchRequest,
   handleDeleteTagRequest,
@@ -1195,7 +1233,6 @@ const {
 } = useCommitActions({
   repoFolderPath,
   repoError,
-  loadLog,
   loadBranches,
   repoRefresh,
   onReset: () => {
@@ -1332,11 +1369,10 @@ watch(viewMode, async (mode) => {
   }
 });
 
-// When the Changes entry hides itself on a clean tree (opt-in), a user sitting
-// on the Changes view would be left staring at an empty pane — fall back to the
-// Git Tree instead.
-watch([() => repoFiles.value.length, () => settings.value.dockHideChangesWhenEmpty], ([count, hideWhenEmpty]) => {
-  if (hideWhenEmpty && count === 0 && viewMode.value === "changes") viewMode.value = "graph";
+// The WIP row disappears from the graph on a clean tree, so a user sitting in
+// the WIP mode would be left on an empty Changes pane — fall back to the Git Tree.
+watch(() => repoFiles.value.length, (count) => {
+  if (count === 0 && viewMode.value === "changes") viewMode.value = "graph";
 });
 
 // Also refresh the dashboard sidebar data when the repo itself changes.
@@ -1349,6 +1385,7 @@ watch(hasRepo, (has) => {
 
 // ─── Repo sidebar events ────────────────────────────────
 function onRepoFileSelect(path: string, staged: boolean) {
+  wipDiffOpen.value = true;
   repoSelectFile(path, staged);
 }
 
@@ -1357,10 +1394,9 @@ function onViewModeChange(mode: ViewMode) {
   if (showTerminal.value && settings.value.terminalHideOnNav) showTerminal.value = false;
   if (showFiles.value && settings.value.filesHideOnNav) showFiles.value = false;
   viewMode.value = mode;
-  if (mode === "changes" && !repoSelectedFile.value && repoFiles.value.length > 0) {
-    const first = repoFiles.value[0];
-    repoSelectFile(first.path, first.section === "staged");
-  }
+  // Entering the WIP (row or dock) only swaps the right rail to the Changes
+  // pane; the diff stays closed until the user picks a file there.
+  if (mode === "changes") wipDiffOpen.value = false;
 }
 
 // ─── Shared RepoSidebar binding (full-screen panes) ──────
@@ -1644,10 +1680,12 @@ const repoSidebarListeners = {
   commit: (trailers: string) => handleCommitRequest(trailers),
   "update:commitSummary": (val: string) => { commitSummary.value = val; },
   "update:commitDescription": (val: string) => { commitDescription.value = val; },
-  discard: (path: string, section: string) => discardFiles([path], section === "untracked"),
+  discard: (path: string, section: string) => discardEntries(
+    repoFiles.value.filter(f => f.path === path && f.section === section),
+  ),
   discardSection: (sectionKey: string, paths: string[]) => onDiscardSection(sectionKey, paths),
   addToGitignore: (path: string) => addToGitignore(path),
-  refresh: () => repoRefresh(),
+  refresh: () => { trackedIgnored.scheduleCheck(); return repoRefresh(); },
   openStash: () => { showStash.value = true; },
   openTags: () => { showTags.value = true; },
   openLaunchpad: () => handleLaunchpadShortcut(),
@@ -1702,8 +1740,16 @@ watch(
 // whatever Vouch/Skip/ran decision applied to the PREVIOUS repo. Deliberately
 // separate from the staged-set watcher above — the decision must survive a
 // plain staging change within the SAME repo (e.g. the "Review now" round trip).
+/**
+ * v3.13 — true while a merge-back brings the checkout it runs in to the
+ * front: the user set the bar and the per-hunk choices on the preview of
+ * THAT checkout, so the switch must not reset them before the apply.
+ */
+let keepResolutionSelection = false;
+
 watch(repoFolderPath, () => {
   commitReviewDecision.value = null;
+  if (keepResolutionSelection) return;
   // v3.11 — the per-hunk opt-out set is keyed by repo-relative path, so it
   // must not survive a repo change: the same path means a different file. The
   // confidence bar does: it is a user preference, so it is re-seeded from
@@ -1730,6 +1776,7 @@ const fileHistoryPath = ref<string | null>(null);
 
 function openFileHistory(path: string) {
   fileHistoryPath.value = path;
+  wipDiffOpen.value = true;
 }
 
 function closeFileHistory() {
@@ -1797,7 +1844,9 @@ async function handleSwitchBranch(name: string, isRemote = false) {
     })) {
       try {
         await gitResetToCommit(repoFolderPath.value, remote, "hard", settings.value.snapshotsEnabled);
-        await repoRefresh();
+        // Force the log: HEAD moved, but the all-refs log's top commit may not have.
+        // The forced log reload also refreshes the branch list (useGitRepo).
+        await repoRefresh(true);
         return;
       } catch (err: any) {
         repoError.value = `reset: ${err.message}`;
@@ -1836,16 +1885,23 @@ async function handleSwitchBranch(name: string, isRemote = false) {
 async function promptPullIfBehind() {
   const s = repoStatus.value;
   if (!s || !repoFolderPath.value) return;
+  const diverged = !!s.remote && aheadCount.value > 0 && behindCount.value > 0;
   const kind = computeCheckoutPrompt({
     ahead: aheadCount.value,
     behind: behindCount.value,
     hasUpstream: !!s.remote,
+    // Only probed when diverged: a force-pushed upstream makes a branch with no
+    // commits of its own look diverged (#223).
+    upstreamRewritten: diverged && await isUpstreamRewriteOnly(repoFolderPath.value),
     // Lazy: only hits the settings blob when the branch is behind-only.
     isSkipped: () => isUpdatePromptSkipped(repoFolderPath.value!, s.branch),
   });
-  if (kind === "update") {
-    // Behind-only, no local divergence: dedicated fast-forward prompt.
-    branchUpdatePrompt.value = { branch: s.branch, behind: behindCount.value, remote: s.remote! };
+  if (kind === "update" || kind === "rewritten") {
+    // Behind-only, or diverged only through an upstream rewrite: dedicated
+    // prompt that updates the branch to its remote state.
+    branchUpdatePrompt.value = {
+      branch: s.branch, behind: behindCount.value, remote: s.remote!, rewritten: kind === "rewritten",
+    };
     return;
   }
   if (kind === "genericPull" && await askConfirm({
@@ -1853,7 +1909,8 @@ async function promptPullIfBehind() {
     message: t("branches.pullAfterCheckout"),
     confirmLabel: t("header.pull"),
   })) {
-    await handlePull(false);
+    // Honour the user's pull mode, like every other pull entry point.
+    await handlePull();
   }
 }
 
@@ -2066,6 +2123,7 @@ const paletteActions = computed<PaletteAction[]>(() => {
     { id: "view-changes", label: t("header.paletteViewChanges") },
     { id: "view-log", label: t("header.paletteViewLog") },
     { id: "view-graph", label: t("header.paletteViewGraph") },
+    { id: "toggle-file-explorer", label: t("header.paletteToggleFileExplorer") },
   );
 
   // Overlays
@@ -2104,6 +2162,7 @@ function onPaletteAction(id: string) {
     case "view-changes": viewMode.value = "changes"; break;
     case "view-log": viewMode.value = "history"; break;
     case "view-graph": viewMode.value = "graph"; break;
+    case "toggle-file-explorer": toggleFiles(); break;
     case "open-settings": showSettings.value = true; break;
     case "open-stash": showStash.value = true; break;
     case "open-worktrees": showWorktrees.value = true; break;
@@ -2127,7 +2186,9 @@ function onPaletteSelectCommit(hash: string) {
 
 // ─── Settings panel ─────────────────────────────────────
 const showSettings = ref(false);
-const settingsInitialTab = ref<"general" | "dock" | "git" | "editor" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "releaseNotes" | undefined>(undefined);
+const settingsInitialTab = ref<"general" | "dock" | "git" | "editor" | "ai" | "automations" | "logs" | "hooks" | "accounts" | "mcp" | "aiTemplates" | undefined>(undefined);
+/** Section to scroll to; only OPEN_SETTINGS_KEY sets it, closing clears it. */
+const settingsInitialSection = ref<SettingsSectionTarget | undefined>(undefined);
 
 // ─── Error log (in-memory ring buffer, feeds SettingsPanel Logs tab) ─
 // Uses the useLogs() singleton composable — no localStorage persistence so a
@@ -2165,6 +2226,158 @@ const showTerminal = ref(false);
 const termSessions = useTerminalSessions();
 const terminalPanelRef = ref<any>(null);
 
+/** Shows the terminal panel and waits for it to mount; false if it never does. */
+async function ensureTerminalPanel(): Promise<boolean> {
+  showTerminal.value = true;
+  // defineAsyncComponent needs multiple ticks to load; wait until ref is set.
+  if (terminalPanelRef.value) return true;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      // Guard against a chunk-load failure or JS error in the TerminalPanel
+      // dynamic import: if the component never mounts, the watch fires on
+      // nothing and the Promise hangs forever, leaving the UI frozen with
+      // showTerminal=true but nothing rendered.
+      const timer = setTimeout(() => {
+        stop();
+        reject(new Error("TerminalPanel mount timeout"));
+      }, 10_000);
+      const stop = watch(terminalPanelRef, val => {
+        if (val) { clearTimeout(timer); stop(); resolve(); }
+      });
+    });
+    return true;
+  } catch {
+    showTerminal.value = false;
+    return false;
+  }
+}
+
+// ─── v3.13 worktree setup tabs ───────────────────────────
+// A new worktree's `setup` runs in a read-only tab listed under `repoPath`;
+// it ends on a ✓/✗ line. Registered once: useWorktreeCreation calls it.
+const worktreeCreation = useWorktreeCreation();
+
+/**
+ * Runs a worktree hook (`setup` or `teardown`) in a read-only terminal tab
+ * and resolves with its exit code once it ends.
+ */
+async function runHookTab(
+  hook: "setup" | "teardown",
+  repoPath: string,
+  cwd: string,
+  path: string,
+  name: string,
+  hash: string,
+): Promise<{ code: number | null; tabId: number }> {
+  if (!(await ensureTerminalPanel())) throw new Error("TerminalPanel mount timeout");
+  let resolveExit!: (code: number | null) => void;
+  const exited = new Promise<number | null>((r) => (resolveExit = r));
+  let tabId = -1;
+  let pendingLine: string | null = null;
+  const write = (id: number, text: string) => terminalPanelRef.value?.writeChunk(id, text);
+  const setup = hook === "setup";
+  try {
+    const tab = await termSessions.openTab(
+      repoPath,
+      path,
+      (id, chunk) => {
+        write(id, chunk);
+        termSessions.notifyOutput(repoPath);
+      },
+      {
+        type: "setup",
+        title: setup ? t("worktree.setupTabTitle", name) : t("worktree.teardownTabTitle", name),
+        readOnly: true,
+        spawn: (onChunk, onExit) => worktreeRunHook(cwd, path, hook, hash, { cols: 80, rows: 24, onExit }, onChunk),
+        onExit: (code) => {
+          const line = code === 0
+            ? `\r\n\x1b[32m✓ ${setup ? t("worktree.setupDone") : t("worktree.teardownDone")}\x1b[0m\r\n`
+            : code === null
+              ? `\r\n\x1b[31m✗ ${setup ? t("worktree.setupStopped") : t("worktree.teardownStopped")}\x1b[0m\r\n`
+              : `\r\n\x1b[31m✗ ${setup ? t("worktree.setupFailedCode", code) : t("worktree.teardownFailedCode", code)}\x1b[0m\r\n`;
+          if (tabId >= 0) write(tabId, line);
+          else pendingLine = line;
+          resolveExit(code);
+        },
+      },
+    );
+    tabId = tab.id;
+    if (pendingLine) write(tabId, pendingLine);
+  } catch (err) {
+    if (setup) repoError.value = t("worktree.setupStartFailed", String((err as { message?: string })?.message ?? err));
+    throw err;
+  }
+  return { code: await exited, tabId };
+}
+
+registerSetupRunner((repoPath, cwd, path, name, hash) => runHookTab("setup", repoPath, cwd, path, name, hash));
+
+registerRemovalHost({
+  runTeardown: (repoPath, cwd, path, name, hash) => runHookTab("teardown", repoPath, cwd, path, name, hash),
+  // Every tab open in the worktree, whichever repo key it is listed under
+  // (spec §8 step 4), and the file explorer's watcher on it.
+  disposeTabs: async (path) => {
+    fileExplorer.disposeRepo(path);
+    await termSessions.disposeRepo(path).catch(() => {});
+    await termSessions.disposeCwd(path).catch(() => {});
+  },
+  closeRepoTabs: (path) => forgetCheckout(path),
+});
+
+/** Include entries the service skipped, if any, as one toast. */
+function reportIncludeWarnings(created: CreatedWorktree) {
+  if (created.warnings.length === 0) return;
+  showDetailToast(
+    t("worktree.includeWarnings", created.warnings.map((w) => `${w.path} (${w.reason})`).join(", ")),
+    null,
+    6000,
+  );
+}
+
+/**
+ * A worktree created from the worktree manager: open it when asked
+ * (quick-create), then run its setup there, or under the current repo.
+ */
+async function onWorktreeCreated(payload: { cwd: string; created: CreatedWorktree; decision: HookTrustDecision; open: boolean }) {
+  reportIncludeWarnings(payload.created);
+  let repoPath = repoFolderPath.value ?? payload.cwd;
+  if (payload.open) {
+    openTab(payload.created.path);
+    showWorktrees.value = false;
+    pendingWorktreeBranch.value = undefined;
+    pendingQuickCreate.value = false;
+    repoPath = payload.created.path;
+  }
+  await worktreeCreation.runSetup(repoPath, payload.cwd, payload.created, payload.decision);
+}
+
+/**
+ * v3.13 — a removed worktree's snapshot back as a new worktree (spec §9):
+ * trust first, then the restore, then `include` (backend) and `setup`, as
+ * for any new worktree.
+ */
+async function onRestoreWorktree(snapshot: SnapshotMeta) {
+  const cwd = repoFolderPath.value;
+  if (!cwd) return;
+  showTimeMachine.value = false;
+  try {
+    const result = await worktreeCreation.restore(cwd, snapshot.id);
+    if (!result) return; // cancelled at the trust prompt
+    showDetailToast(t("timeMachine.restoredAsWorktree", result.created.path), null, 6000);
+    void refreshWorktreeCount(cwd);
+    await loadBranches();
+    await onWorktreeCreated({ cwd, created: result.created, decision: result.decision, open: false });
+  } catch (err) {
+    repoError.value = t("timeMachine.restoreAsWorktreeFailed", String((err as { message?: string })?.message ?? err));
+  }
+}
+
+/** "Open the log" on a worktree card: focus its setup tab. */
+async function onOpenSetupLog(payload: { repoPath: string; tabId: number }) {
+  if (!(await ensureTerminalPanel())) return;
+  termSessions.setActive(payload.repoPath, payload.tabId);
+}
+
 async function openTerminalTab(cwd?: string, type?: TerminalTabType) {
   if (!repoFolderPath.value) return;
   // Capture the repo this tab belongs to at open time. The output callback
@@ -2173,28 +2386,7 @@ async function openTerminalTab(cwd?: string, type?: TerminalTabType) {
   // switches/closes the repo, and reading repoFolderPath.value at fire time
   // would refresh the wrong (or a closed/null) repo.
   const repoPath = repoFolderPath.value;
-  showTerminal.value = true;
-  // defineAsyncComponent needs multiple ticks to load; wait until ref is set.
-  if (!terminalPanelRef.value) {
-    try {
-      await new Promise<void>((resolve, reject) => {
-        // Guard against a chunk-load failure or JS error in the TerminalPanel
-        // dynamic import: if the component never mounts, the watch fires on
-        // nothing and the Promise hangs forever, leaving the UI frozen with
-        // showTerminal=true but nothing rendered.
-        const timer = setTimeout(() => {
-          stop();
-          reject(new Error("TerminalPanel mount timeout"));
-        }, 10_000);
-        const stop = watch(terminalPanelRef, val => {
-          if (val) { clearTimeout(timer); stop(); resolve(); }
-        });
-      });
-    } catch {
-      showTerminal.value = false;
-      return;
-    }
-  }
+  if (!(await ensureTerminalPanel())) return;
   const shell = settings.value.terminalShell || undefined;
   // `type` carries the agent identity ("claude"/"codex"); `shell` is always the
   // user's configured shell. openTab maps the type to a first-class agent spawn.
@@ -2241,6 +2433,15 @@ function toggleFiles() {
   // Opening the File Explorer is a dock switch too: dismiss the terminal
   // (opt-out via its own terminalHideOnNav setting), same as changing views.
   if (opening && showTerminal.value && settings.value.terminalHideOnNav) showTerminal.value = false;
+}
+
+/**
+ * v3.11.2 — the panel hands a file to the Changes view (merge editor, file
+ * history). That is a navigation like a dock switch, so the same
+ * `filesHideOnNav` rule dismisses the panel, which would otherwise cover it.
+ */
+function hideFilesOnHandoff(): void {
+  if (showFiles.value && settings.value.filesHideOnNav) showFiles.value = false;
 }
 
 async function onRequestCloseFileTab(tabId: number) {
@@ -2295,16 +2496,35 @@ function reportAgentLaunchError(tabType: TerminalTabType, err: unknown) {
 const aiTaskNamePrompt = ref(false);
 const aiTaskNameBusy = ref(false);
 
+// v3.13: the base the task will start from, fetched while the user types.
+const aiTaskBase = ref<BaseResolution | null>(null);
+const aiTaskBaseLine = computed(() => {
+  if (!aiTaskBase.value) return t("worktree.baseResolving");
+  const line = describeBase(aiTaskBase.value);
+  return t(line.key, ...line.args);
+});
+
 function onNewAiTask() {
   if (!repoFolderPath.value || activeTabId.value === null) return;
   aiTaskNamePrompt.value = true;
+  aiTaskBase.value = null;
+  const projectTab = repoTabs.value.find((t) => t.id === activeTabId.value);
+  const origin = projectTab?.path ?? repoFolderPath.value;
+  worktreeResolveBase(origin)
+    .then((info) => {
+      if (aiTaskNamePrompt.value) aiTaskBase.value = info.base;
+    })
+    .catch(() => {
+      /* creation resolves the base itself */
+    });
 }
 
 /**
- * v3.7.0 (Task 3) — the scratch-worktree creation sequence used by "New AI
- * task" (`confirmNewAiTask`): create -> register -> select -> open. Returns
- * `null` (without throwing) when there's no active project tab to base the
- * scratch on — the caller decides how to surface that.
+ * v3.7.0 (Task 3), v3.13 — the worktree creation sequence used by "New AI
+ * task" (`confirmNewAiTask`): create (through the worktree service, after
+ * the hook trust question) -> register -> select -> open. Returns `null`
+ * (without throwing) when there's no active project tab, or the user
+ * cancelled at the trust prompt.
  *
  * Commit Review's "Fix with agent" used to also call this (optionally
  * opening the agent in a scratch worktree), but that option was removed
@@ -2313,36 +2533,55 @@ function onNewAiTask() {
  * misinterprets the piped prompt. This function is no longer reachable from
  * Commit Review at all — only `confirmNewAiTask` calls it now.
  */
-async function createAiTaskScratchWorktree(name?: string): Promise<ScratchWorktree | null> {
+async function createAiTaskWorktree(name: string) {
   if (!repoFolderPath.value || activeTabId.value === null) return null;
-  // Always base the scratch on the active project's root, not whatever
+  // Always base the task on the active project's root, not whatever
   // worktree is currently selected, so AI tasks branch from the project.
   const projectTab = repoTabs.value.find((t) => t.id === activeTabId.value);
   const origin = projectTab?.path ?? repoFolderPath.value;
-  const scratch = await scratchWorktreeCreate(origin, undefined, name || undefined);
+  const result = await worktreeCreation.create(origin, {
+    // A blank or unusable name (no Latin letter or digit) keeps the
+    // historical timestamp naming.
+    name: aiTaskName(name),
+    // The base the dialog already fetched, so creation does not fetch again.
+    base: aiTaskBase.value?.base_ref,
+    kind: "task",
+  });
+  if (!result) return null;
+  const { created } = result;
   aiTasks.register({
-    path: scratch.path,
+    path: created.path,
     originCwd: origin,
-    branch: scratch.branch,
-    createdAt: scratch.created_at,
+    branch: created.branch,
+    createdAt: created.created_at,
   });
   void refreshWorktreeCount(origin);
-  // Switch the project's checkout to the new scratch worktree in place, then
-  // load it so a spawned agent terminal lands in the right cwd.
-  selectWorktree(activeTabId.value, scratch.path);
-  await openRepo(scratch.path);
-  return scratch;
+  // Switch the project's checkout to the new worktree in place, then load it
+  // so the setup tab and the agent terminal land in the right cwd.
+  selectWorktree(activeTabId.value, created.path);
+  await openRepo(created.path);
+  return { ...result, origin };
 }
 
-/** Create the AI-task scratch worktree once the user has named it. */
+/**
+ * Create the AI task once the user has named it, run its setup, then launch
+ * the agent: right away without setup (or when skipped), only after a
+ * successful one otherwise (spec §5.4).
+ */
 async function confirmNewAiTask(name: string) {
   if (!repoFolderPath.value || activeTabId.value === null) return;
   aiTaskNameBusy.value = true;
   try {
-    const scratch = await createAiTaskScratchWorktree(name);
+    const result = await createAiTaskWorktree(name);
     aiTaskNamePrompt.value = false;
-    if (!scratch) return;
-    await openTerminalTab(scratch.path, "claude");
+    if (!result) return;
+    reportIncludeWarnings(result.created);
+    const status = await worktreeCreation.runSetup(result.created.path, result.origin, result.created, result.decision);
+    if (status === "failed") {
+      repoError.value = t("aiTask.setupFailed", result.created.name);
+      return;
+    }
+    await openTerminalTab(result.created.path, "claude");
   } catch (err) {
     aiTaskNamePrompt.value = false;
     reportAgentLaunchError("claude", err);
@@ -2360,7 +2599,7 @@ async function confirmNewAiTask(name: string) {
  *
  * Always targets the CURRENT repo — deliberately scope-narrowed for PR2
  * (not a bug fix): this used to optionally open the agent in a fresh
- * scratch worktree via `createAiTaskScratchWorktree`, but manual QA against
+ * scratch worktree via `createAiTaskWorktree`, but manual QA against
  * real `claude`/`codex` CLIs found that a brand-new working directory
  * (exactly what a scratch worktree always is) hits a first-run "trust this
  * directory?" onboarding screen before the agent's normal input box exists.
@@ -2372,7 +2611,7 @@ async function confirmNewAiTask(name: string) {
  * scratch-worktree option is removed until there's a real fix — e.g.
  * pre-trusting the directory before launching the agent, or detecting the
  * onboarding screen before writing — tracked as a roadmap follow-up.
- * `createAiTaskScratchWorktree` itself is untouched and still used by the
+ * `createAiTaskWorktree` itself is untouched and still used by the
  * existing "New AI task" button (`confirmNewAiTask`).
  *
  * Verifier item #5 — manual QA performed via the dev-server's real
@@ -2553,6 +2792,23 @@ function onAiTaskCancel() {
   aiTaskCloseError.value = null;
 }
 
+/** v3.13 — the removal dialog (guards, processes, snapshot, teardown). */
+type RemovalDialogState = {
+  cwd: string;
+  path: string;
+  projectPath: string;
+  deleteBranch: boolean;
+  autoStart: boolean;
+  /** Opened right after a merge-back: the work is in the main checkout. */
+  merged: boolean;
+};
+const removalDialog = ref<RemovalDialogState | null>(null);
+
+/**
+ * Delete: the removal dialog opens on its confirmation, which shows
+ * "Also delete branch" (spec §7.2 step 6): a task's unmerged agent commits
+ * go only if the user leaves it ticked.
+ */
 async function onAiTaskDelete() {
   const target = aiTaskClose.value;
   if (!target || aiTaskCloseBusy.value) return;
@@ -2560,18 +2816,8 @@ async function onAiTaskDelete() {
   aiTaskCloseError.value = null;
   try {
     const origin = await resolveAiTaskOrigin(target.path, target.projectPath);
-    // Kill the worktree's agent terminal first so no running process holds an
-    // index.lock or open handle that would block the worktree removal.
-    await termSessions.disposeRepo(target.path).catch(() => {});
-    fileExplorer.disposeRepo(target.path);
-    if (target.scratch) {
-      await scratchWorktreeDiscard(origin, target.path);
-    } else {
-      // Plain worktree: remove it, then delete its now-unreferenced branch.
-      await gitWorktreeRemove(origin, target.path, true);
-      if (target.branch) await gitDeleteBranch(origin, target.branch, true);
-    }
-    await finalizeWorktreeRemoval(target.path, target.projectPath);
+    aiTaskClose.value = null;
+    removalDialog.value = { cwd: origin, path: target.path, projectPath: target.projectPath, deleteBranch: true, autoStart: false, merged: false };
   } catch (err) {
     aiTaskCloseError.value = t("aiTask.errorDelete", String((err as { message?: string })?.message ?? err));
   } finally {
@@ -2579,6 +2825,11 @@ async function onAiTaskDelete() {
   }
 }
 
+// ─── Merge-back (v3.13, spec §6) ─────────────────────────
+type MergeBackDialogState = { cwd: string; path: string; projectPath: string; minimized: boolean };
+const mergeBackDialog = ref<MergeBackDialogState | null>(null);
+
+/** "Merge back" on an AI task (close modal, Git Tree): the merge-back dialog. */
 async function onAiTaskMergeBack() {
   const target = aiTaskClose.value;
   if (!target || aiTaskCloseBusy.value) return;
@@ -2586,16 +2837,155 @@ async function onAiTaskMergeBack() {
   aiTaskCloseError.value = null;
   try {
     const origin = await resolveAiTaskOrigin(target.path, target.projectPath);
-    // Kill the scratch's agent terminal first so no running process holds an
-    // index.lock or open handle that would block the worktree removal.
-    await termSessions.disposeRepo(target.path).catch(() => {});
-    fileExplorer.disposeRepo(target.path);
-    await scratchWorktreeMergeBack(origin, target.path);
-    await finalizeWorktreeRemoval(target.path, target.projectPath);
+    aiTaskClose.value = null;
+    mergeBackDialog.value = { cwd: origin, path: target.path, projectPath: target.projectPath, minimized: false };
   } catch (err) {
     aiTaskCloseError.value = t("aiTask.errorMergeBack", String((err as { message?: string })?.message ?? err));
   } finally {
     aiTaskCloseBusy.value = false;
+  }
+}
+
+/** "Merge back" from the worktree manager. */
+async function onManagerMergeBack(payload: { cwd: string; path: string }) {
+  showWorktrees.value = false;
+  try {
+    const entries = await gitWorktreeList(payload.cwd);
+    const main = entries.find((w) => w.is_main)?.path ?? payload.cwd;
+    mergeBackDialog.value = { cwd: main, path: payload.path, projectPath: main, minimized: false };
+  } catch (err) {
+    repoError.value = t("mergeBack.failed", String((err as { message?: string })?.message ?? err));
+  }
+}
+
+/**
+ * The main checkout's path as the project tab spells it, when that tab IS
+ * the main checkout; otherwise the backend's path. A tab can be a linked
+ * worktree opened on its own: merging there would merge into its branch.
+ */
+async function mainCheckoutSpelling(projectPath: string, canonicalMain: string): Promise<string> {
+  const entries = await gitWorktreeList(projectPath).catch(() => []);
+  const main = entries.find((w) => w.is_main)?.path;
+  return main !== undefined && main === projectPath ? projectPath : canonicalMain;
+}
+
+/**
+ * Brings a checkout of the project to the front: the operation runs there
+ * and its conflicts show there (spec §6.2), never in a checkout the user is
+ * not looking at.
+ */
+async function focusCheckout(path: string, projectPath: string) {
+  if (repoFolderPath.value !== path) await openRepo(path);
+  const owner = repoTabs.value.find((tab) => tab.path === projectPath);
+  if (owner) {
+    selectWorktree(owner.id, path);
+    if (activeTabId.value !== owner.id) switchTab(owner.id);
+  }
+}
+
+registerMergeBackHost({
+  apply: async (a) => {
+    const projectPath = mergeBackDialog.value?.projectPath ?? a.checkout;
+    // The main checkout is the project's own tab: use that spelling of its
+    // path, not the canonical one the backend reports (`/private/var`…).
+    const checkout = a.operation === "rebase" ? a.checkout : await mainCheckoutSpelling(projectPath, a.checkout);
+    keepResolutionSelection = true;
+    try {
+      await focusCheckout(checkout, projectPath);
+      await nextTick();
+    } finally {
+      keepResolutionSelection = false;
+    }
+    const { gitMerge, worktreeMergeBackSquash } = await import("./utils/backend");
+    const opts =
+      a.mode === "squash"
+        ? { runMerge: async () => { await worktreeMergeBackSquash(projectPath, a.path, a.target); }, skipFinalize: true }
+        : a.mode === "merge"
+          ? {
+              // `--no-ff --no-edit`: a merge commit, so the agent's commits are kept.
+              runMerge: async (ref_: string) => {
+                assertOperationSucceeded(await gitMerge(checkout, ref_, true), `merge ${ref_}`);
+              },
+            }
+          : {};
+    applyingFromPreview.value = true;
+    try {
+      const out = await runApplyFromPreview(a.operation, a.ref, a.estimated, opts);
+      if (out.residualFiles.length > 0) {
+        viewMode.value = "changes";
+        wipDiffOpen.value = true;
+        await repoSelectFile(out.residualFiles[0], false);
+      }
+      return out;
+    } finally {
+      applyingFromPreview.value = false;
+    }
+  },
+  disposeTabs: async (path) => {
+    fileExplorer.disposeRepo(path);
+    await termSessions.disposeRepo(path).catch(() => {});
+    await termSessions.disposeCwd(path).catch(() => {});
+  },
+});
+
+/** Merge-back done: "Remove the worktree" opens the removal dialog. */
+function onMergeBackCleanup(payload: { deleteBranch: boolean }) {
+  const mb = mergeBackDialog.value;
+  mergeBackDialog.value = null;
+  if (!mb) return;
+  removalDialog.value = {
+    cwd: mb.projectPath,
+    path: mb.path,
+    projectPath: mb.projectPath,
+    deleteBranch: payload.deleteBranch,
+    // A squash leaves the branch unmerged: the removal dialog asks.
+    autoStart: payload.deleteBranch,
+    merged: true,
+  };
+}
+
+/** Closed: refresh the project, whatever the merge-back got to. */
+async function onMergeBackClose() {
+  const mb = mergeBackDialog.value;
+  mergeBackDialog.value = null;
+  if (!mb) return;
+  try {
+    await focusCheckout(mb.projectPath, mb.projectPath);
+    await loadBranches();
+    if (viewMode.value === "history" || showGitTree.value) await loadLog();
+  } catch (err) {
+    console.error("[merge-back] refresh failed:", err);
+  }
+}
+
+/**
+ * Closed without removing. After a merge-back the work is already in the
+ * main checkout: refresh it, so the view does not offer the task as if it
+ * had not been merged.
+ */
+async function onRemovalClose() {
+  const closed = removalDialog.value;
+  removalDialog.value = null;
+  if (!closed?.merged) return;
+  try {
+    await openRepo(closed.projectPath);
+    await loadBranches();
+    if (viewMode.value === "history" || showGitTree.value) await loadLog();
+  } catch (err) {
+    console.error("[worktree] refresh after merge-back failed:", err);
+    showDetailToast(t("aiTask.mergedRefreshFailed"), String((err as { message?: string })?.message ?? err));
+  }
+}
+
+async function onRemovalDone(_outcome: RemoveOutcome) {
+  const done = removalDialog.value;
+  removalDialog.value = null;
+  if (!done) return;
+  try {
+    await finalizeWorktreeRemoval(done.path, done.projectPath);
+  } catch (err) {
+    console.error("[worktree] refresh after removal failed:", err);
+    if (done.merged) showDetailToast(t("aiTask.mergedRefreshFailed"), String((err as { message?: string })?.message ?? err));
   }
 }
 
@@ -2965,7 +3355,7 @@ async function openLaunchpadMergePr(pr: PullRequest & { repoPath?: string }) {
   // not `!prPanel.error.value` (sticky from any unrelated prior PR action,
   // so it can both mask a genuine failure and suppress today's success).
   if (prPanel.mergingPr.value === null) {
-    showLaunchpadToast(t("launchpad.toast.merged"));
+    showDetailToast(t("launchpad.toast.merged"), null);
   } else {
     // On failure `prPanel.error` is only rendered inside PrDetailView, which
     // isn't mounted from the Launchpad — funnel it into the app-wide
@@ -3029,7 +3419,7 @@ async function openLaunchpadAutoMergePr(pr: PullRequest & { repoPath?: string })
   if (prPanel.error.value) {
     repoError.value = prPanel.error.value;
   } else {
-    showLaunchpadToast(t("launchpad.toast.autoMergeArmed"));
+    showDetailToast(t("launchpad.toast.autoMergeArmed"), null);
   }
 }
 
@@ -3072,7 +3462,7 @@ async function confirmNudgePr() {
   try {
     await ghIssueAddComment(pr.repoPath!, pr.number, comment);
     nudgeConfirm.value = null;
-    showLaunchpadToast(t("launchpad.toast.nudged"));
+    showDetailToast(t("launchpad.toast.nudged"), null);
   } catch (err: any) {
     repoError.value = err?.message ?? String(err);
     if (nudgeConfirm.value) nudgeConfirm.value.busy = false;
@@ -3195,8 +3585,23 @@ const pendingQuickCreate = ref(false);
 // ─── Submodule panel ─────────────────────────────────────
 const showSubmodules = ref(false);
 
+// ─── Release notes modal (header button) ─────────────────
+const showReleaseNotes = ref(false);
+
 // ─── Discard-section confirmation modal ─────────────────
 const discardSectionConfirm = ref<{ sectionKey: string; paths: string[] } | null>(null);
+
+/** What the pending discard touches — drives the modal's wording and warnings. */
+const discardSummary = computed(() => {
+  const ctx = discardSectionConfirm.value;
+  return ctx ? summarizeDiscard(repoFiles.value, ctx.sectionKey, ctx.paths) : null;
+});
+
+const DISCARD_TEXT = {
+  staged: { title: "sidebar.discardStagedTitle", confirm: "sidebar.discardStagedConfirm" },
+  changes: { title: "sidebar.discardChangesTitle", confirm: "sidebar.discardChangesConfirm" },
+  all: { title: "sidebar.discardEverythingTitle", confirm: "sidebar.discardEverythingConfirm" },
+} as const;
 
 // ─── Generic confirmation modal ─────────────────────────
 const genericConfirm = ref<{
@@ -3262,14 +3667,16 @@ async function onOperationAction(action: "continue" | "abort" | "skip") {
 }
 
 // ─── Post-checkout "Update branch" prompt ────────────────
-// Shown when checking out a branch that is behind its upstream with no
-// local divergence (see useBranchUpdatePrompt.computeCheckoutPrompt).
+// Shown when checking out a branch that is behind its upstream with no local
+// divergence, or whose upstream was rewritten while it has no commits of its
+// own (see useBranchUpdatePrompt.computeCheckoutPrompt).
 
-const branchUpdatePrompt = ref<{ branch: string; behind: number; remote: string } | null>(null);
+const branchUpdatePrompt = ref<{ branch: string; behind: number; remote: string; rewritten: boolean } | null>(null);
 
 async function onBranchUpdateConfirm() {
+  const rewritten = branchUpdatePrompt.value?.rewritten ?? false;
   branchUpdatePrompt.value = null;
-  const res = await updateBranchFastForward();
+  const res = await updateBranchToUpstream(rewritten ? "rebase" : "ff-only");
   if (res.status === "pop-conflict") {
     repoError.value = t("branches.updatePopConflict");
     viewMode.value = "changes"; // surface the conflicted files
@@ -3308,37 +3715,15 @@ async function onDiscardSectionConfirmed() {
   if (!ctx) return;
   discardSectionConfirm.value = null;
 
-  const allFiles = repoFiles.value;
-  const targetFiles = ctx.sectionKey === 'all'
-    ? allFiles
-    : allFiles.filter(f => ctx.paths.includes(f.path));
+  await discardEntries(selectDiscardEntries(repoFiles.value, ctx.sectionKey, ctx.paths));
+}
 
-  const staged = targetFiles.filter(f => f.section === 'staged');
-  const unstaged = targetFiles.filter(f => f.section === 'unstaged');
-  const untracked = targetFiles.filter(f => f.section === 'untracked');
-
-  // 1. Unstage any staged files first
-  if (staged.length) {
-    await unstageFiles(staged.map(f => f.path));
-  }
-
-  // 2. Discard tracked files (was unstaged + was staged but not added)
-  const toCheckout = [
-    ...unstaged.map(f => f.path),
-    ...staged.filter(f => f.status !== 'added').map(f => f.path)
-  ];
-  if (toCheckout.length) {
-    await discardFiles(toCheckout, false);
-  }
-
-  // 3. Discard untracked files (was untracked + was staged added)
-  const toClean = [
-    ...untracked.map(f => f.path),
-    ...staged.filter(f => f.status === 'added').map(f => f.path)
-  ];
-  if (toClean.length) {
-    await discardFiles(toClean, true);
-  }
+/** Discard working-tree and index changes for the given entries (see `planDiscard`). */
+async function discardEntries(targetFiles: RepoFileEntry[]) {
+  const plan = planDiscard(targetFiles);
+  if (plan.unstage.length) await unstageFiles(plan.unstage);
+  if (plan.checkout.length) await discardFiles(plan.checkout, false);
+  if (plan.clean.length) await discardFiles(plan.clean, true);
 }
 
 function handleWipDiscardAll() {
@@ -3409,6 +3794,8 @@ async function deleteTagInModal(tagName: string) {
   if (!cwd) return;
   try {
     await gitDeleteTag(cwd, tagName);
+    // Force: the tag ref is gone but HEAD hasn't moved.
+    await repoRefresh(true);
     pendingUnpushedTags.value = pendingUnpushedTags.value.filter(t => t !== tagName);
     if (pendingUnpushedTags.value.length === 0) {
       pushTagsConfirm.value = false;
@@ -3453,7 +3840,8 @@ async function handleWipQuickStash() {
   if (!cwd) return;
   try {
     await gitStash(cwd);
-    await repoRefresh();
+    // Force: the new stash ref shows in the all-refs log without moving HEAD.
+    await repoRefresh(true);
     repoSuccess.value = "stash-done";
   } catch (err: any) {
     repoError.value = `Quick stash failed: ${err.message}`;
@@ -3468,7 +3856,8 @@ async function handleWipQuickStashAi() {
       locale: uiLocale.value,
     });
     await gitStash(cwd, message || undefined);
-    await repoRefresh();
+    // Force: the new stash ref shows in the all-refs log without moving HEAD.
+    await repoRefresh(true);
     repoSuccess.value = "stash-done";
   } catch (err: any) {
     repoError.value = `Quick stash AI failed: ${err.message}`;
@@ -3807,6 +4196,7 @@ async function applyGitConfig() {
 
 function onSettingsClose() {
   showSettings.value = false;
+  settingsInitialSection.value = undefined;
   refreshSettings();
   applyGitConfig();
   // v2.5 — `.gitwandrc.llmFallback` may have been edited in the AI tab.
@@ -3818,8 +4208,6 @@ function onSettingsClose() {
 
 
 // ─── Scheduler (v2.8) ────────────────────────────────────
-const { generate: generateReleaseNotesFn } = useReleaseNotes();
-
 const scheduler = useScheduler({
   cwd: repoFolderPath as import("vue").Ref<string>,
   settings,
@@ -3841,7 +4229,11 @@ const scheduler = useScheduler({
     const tags = await gitListTags(repoFolderPath.value);
     if (tags.length < 2) return;
     const sorted = [...tags].sort((a, b) => b.date.localeCompare(a.date));
-    await generateReleaseNotesFn(repoFolderPath.value, sorted[1].name, sorted[0].name);
+    // Loaded on demand: the generator stays out of the main bundle.
+    const { useReleaseNotes } = await import("./composables/useReleaseNotes");
+    await useReleaseNotes().generate(repoFolderPath.value, sorted[1].name, sorted[0].name, {
+      locale: getTemplateLang("releaseNotes", repoFolderPath.value),
+    });
   },
   triggerAiCommit: async () => {
     // Surface the commit panel — the user will see staged files there
@@ -3852,6 +4244,25 @@ const scheduler = useScheduler({
   hasStagedFiles: () => (repoStatus.value?.staged.length ?? 0) > 0,
 });
 const { triggerReleaseNotesIfEnabled } = scheduler;
+
+// ─── Opt-in auto fast-forward after fetch ─────────────────────────────
+// Off by default. The tooltip verdict is derived from the already-loaded
+// status (no git spawn on the polling tick); the git-backed check and the
+// fast-forward itself only run after a fetch. Never opens a modal: a refusal
+// is only reported in the tooltip.
+const { autoFfBlock, requestRun: requestAutoFastForward } = useAutoFastForward({
+  enabled: () => settings.value.autoFastForward,
+  cwd: () => repoFolderPath.value,
+  status: () => repoStatus.value,
+  operation: () => repoOperationState.value,
+  busy: () =>
+    isPushing.value || isPulling.value || isMerging.value || isCommitting.value || isSwitchingBranch.value,
+  fetching: () => isFetching.value,
+  onFastForwarded: async ({ branch, count }) => {
+    await repoRefresh(true);
+    showDetailToast(t("syncAction.autoFfDone", branch, count), null);
+  },
+});
 
 // ─── Consolidated poller (§2.1) — single 2s interval replacing 5 independent polls ──
 const poller = useRepoPoller({
@@ -3870,6 +4281,7 @@ const poller = useRepoPoller({
   },
   onFetchTick: async (cwd) => {
     await doFetch();
+    await requestAutoFastForward();
   },
   onNightlyTick: async () => {
     await scheduler.onNightlyTick();
@@ -3881,6 +4293,9 @@ const poller = useRepoPoller({
   },
 });
 watch(repoFolderPath, (p) => poller.setFolderPath(p), { immediate: true });
+
+const trackedIgnored = useTrackedIgnored();
+watch(repoFolderPath, (p) => { void trackedIgnored.check(p); }, { immediate: true });
 
 // ─── Live Repo watcher (v3.10.0) ─────────────────────────────────────
 // The watcher is the primary refresh driver; the poller above demotes itself
@@ -3916,10 +4331,21 @@ repoWatcher.on(["worktree", "index"], () => {
   });
 });
 
+// Tracked files that match an ignore rule: re-checked on repo open, on a
+// manual refresh, and here when an ignore file (.gitignore at any level,
+// .git/info/exclude) or HEAD changes. Never on the status poll. The "config"
+// kind carries .git/info/exclude (see classify_path in watcher.rs).
+repoWatcher.on(["worktree", "config", "head"], (ev) => {
+  if (shouldRecheckTrackedIgnored(ev)) trackedIgnored.scheduleCheck();
+});
+
 repoWatcher.on(["head", "refs"], () => {
   watcherRefreshQueue.schedule("head-refs", async () => {
-    await repoRefresh();
-    await loadLog();
+    // A head/refs event means decorations changed, possibly below the first
+    // page the non-forced compare can see (a branch moved deep in history, a
+    // tag on an old commit): force the log (#266). The forced reload also
+    // reloads an already-loaded branch list. Event-driven, not a poll tick.
+    await repoRefresh(true);
   });
 });
 
@@ -4073,6 +4499,7 @@ useAppMenu(
     toggleSidebar: () => {
       showSidebar.value = !showSidebar.value;
     },
+    toggleFileExplorer: () => toggleFiles(),
     findInLog: () => {
       // Switch to the log/history view first — focusing a hidden input
       // would silently no-op because the element isn't mounted.
@@ -4120,7 +4547,8 @@ async function handleRebaseResetOnto(base: string) {
     await gitResetToCommit(repoFolderPath.value, base, "hard", settings.value.snapshotsEnabled);
     showRebase.value = false;
     rebaseInitialBase.value = undefined;
-    await repoRefresh();
+    // Force the log: HEAD moved, but the all-refs log's top commit may not have.
+    await repoRefresh(true);
   } catch (err: any) {
     repoError.value = `reset: ${err?.message ?? String(err)}`;
   }
@@ -4140,7 +4568,8 @@ async function onRebaseDone() {
   showRebase.value = false;
   rebaseInitialBase.value = undefined;
   forcePushPreferred.value = true;
-  await repoRefresh();
+  // Force: the rebased branch may not hold the all-refs log's top commit.
+  await repoRefresh(true);
 }
 
 /**
@@ -4156,6 +4585,7 @@ async function onRebaseConflict() {
   await repoRefresh();
   viewMode.value = "changes";
   if (repoStatus.value?.conflicted.length) {
+    wipDiffOpen.value = true;
     await repoSelectFile(repoStatus.value.conflicted[0], false);
   } else {
     console.warn("[rebase] conflict halt reported but no conflicted files found in status");
@@ -4240,6 +4670,8 @@ const graphScrollIdx = ref<number | null>(null);
 
 /** Graph → select a commit: load its diffs, keep the graph, open no file. */
 function onGraphSelectCommit(hash: string) {
+  // Picking a commit while the WIP is selected leaves the WIP mode.
+  if (viewMode.value === "changes") viewMode.value = "graph";
   graphFileIdx.value = null;
   graphScrollIdx.value = null;
   selectCommit(hash);
@@ -4264,6 +4696,19 @@ function onGraphCloseDiff() {
   graphScrollIdx.value = null;
 }
 
+// ─── Git Tree WIP mode (viewMode === 'changes') ───────────
+// The WIP is the Git Tree's "uncommitted" selection: the right rail becomes the
+// Changes pane, and the selected WIP file's diff covers the graph until closed
+// (X returns to the graph, WIP still selected). Entering the WIP mode shows the
+// graph + Changes rail only; a file picked in the rail (or a flow that lands on
+// a specific file) opens the diff — a selection that moves on its own (stage,
+// refresh) does not.
+const wipDiffOpen = ref(false);
+/** Centers the WIP close button on the header of whichever viewer is shown. */
+const wipDiffEl = ref<HTMLElement | null>(null);
+const { top: wipCloseTop } = useHeaderAlign(wipDiffEl, ".diff-header, .editor-header, .fhv-header, .idv-header", 28);
+watch(viewMode, (mode) => { if (mode !== "changes") wipDiffOpen.value = false; });
+
 onMounted(() => {
   window.addEventListener("keydown", onKeyDown);
   applyGitConfig();
@@ -4286,7 +4731,7 @@ onUnmounted(() => {
       :main-commit-count="mainCommitCount" :push-remote="pushRemote"
       :ahead-push-count="aheadPushCount" :is-pushing="isPushing" :is-pulling="isPulling"
       :force-push-preferred="forcePushPreferred" :is-fetching="isFetching" :fetch-percent="fetchPercent"
-      :cwd="repoFolderPath ?? ''" :branches="branches" :worktree-branches="worktreeBranches" :branches-loading="branchesLoading"
+      :auto-ff-block="autoFfBlock" :cwd="repoFolderPath ?? ''" :branches="branches" :worktree-branches="worktreeBranches" :branches-loading="branchesLoading"
       :is-switching-branch="isSwitchingBranch" :is-merging="isMerging" :tabs="repoTabs" :active-tab-id="activeTabId"
       :active-repo-path="activeRepoPath" :load-worktrees="loadProjectWorktrees"
       :worktree-project-paths="worktreeProjectPaths"
@@ -4301,6 +4746,7 @@ onUnmounted(() => {
       :applying-from-preview="applyingFromPreview" :apply-outcome="applyOutcome"
       @apply-from-preview="handleApplyFromPreview"
       @dismiss-apply="applyOutcome = null"
+      @scratch-cleanup-warning="(d: string) => showDetailToast(t('aiTask.mergedCleanupFailed'), d, 0)"
       @open-residual="handleOpenResidual"
 
       :error-count="logUnreadCount" :is-offline="isOffline" @switch-branch="handleSwitchBranch" @open-logs="openLogsTab"
@@ -4311,11 +4757,11 @@ onUnmounted(() => {
       @open-worktrees="(branch) => { pendingWorktreeBranch = branch; showWorktrees = true; }"
       @open-submodules="showSubmodules = true" @open-submodule="handleOpenSubmodule" @open-search="handleOpenSearch" @open-help="showHelp = true"
       :submodule-update-count="submoduleUpdateCount"
-      :stash-count="stashCount" @open-stash="showStash = true" @open-tags="showTags = true"
+      :stash-count="stashCount" @open-stash="showStash = true" @open-tags="showTags = true" @open-release-notes="showReleaseNotes = true"
       @open-time-machine="showTimeMachine = true" />
 
     <div class="app-body" :style="{ '--sidebar-width': sidebarWidth + 'px' }">
-      <main class="main" :class="{ 'main--dashboard': viewMode === 'dashboard' || viewMode === 'launchpad' }">
+      <main class="main">
         <!-- No repo loaded → EmptyState full screen -->
         <EmptyState v-if="!hasRepo && !repoLoading" @open-folder="handleOpenFolder" @open-path="handleOpenPath"
           @open-clone="showCloneModal = true" @open-fork="showForkModal = true" />
@@ -4364,62 +4810,6 @@ onUnmounted(() => {
               :status="repoStats" :ahead="aheadCount" :behind="behindCount" :needs-publish="needsPublish"
               @change-view="onViewModeChange" @select-commit="onDashboardSelectCommit" @push="handlePush" @sync="() => handlePull()" />
 
-            <!-- ── Changes view: diff │ collapsible right rail (files + commit) ── -->
-            <div v-else-if="viewMode === 'changes'" class="view view--changes">
-              <div class="view__content">
-                <div v-if="memorizeToast && showingMergeEditor" class="me-memory-offer">
-                  <span>{{ t("mergeEditor.memorizeFileOffer", memorizeToast.path.split('/').pop() || memorizeToast.path) }}</span>
-                  <button class="me-memory-btn me-memory-btn--save" @click="acceptMemorizeToast">{{ t("mergeEditor.memorySave") }}</button>
-                  <button class="me-memory-btn" @click="dismissMemorizeToast">{{ t("common.close") }}</button>
-                </div>
-                <MergeEditor v-if="showingMergeEditor && mergeSelectedFile" :file="mergeSelectedFile"
-                  :cwd="repoFolderPath ?? undefined"
-                  @resolve="handleResolveFile" @resolve-hunk="(path, idx, choice) => handleResolveHunk(path, idx, choice)"
-                  @resolve-hunk-custom="(path, idx, content) => handleResolveHunkCustom(path, idx, content)"
-                  @resolve-file-bulk="(path, choice) => handleResolveFileBulk(path, choice)"
-                  @apply-file-memory="(path, entry) => handleApplyFileMemory(path, entry)"
-                  @resolve-tree-conflict="(path, choice) => handleResolveTreeConflict(path, choice)"
-                  @reconstruct-conflict="(path) => handleReconstructConflict(path)"
-                  @keep-working-tree="(path) => handleKeepWorkingTree(path)"
-                  @open-externally="(path) => handleOpenInEditor(path)" />
-                <FileHistoryViewer v-else-if="fileHistoryPath && repoFolderPath" :file-path="fileHistoryPath"
-                  :cwd="repoFolderPath" @close="closeFileHistory"
-                  @select-commit="(hash) => { closeFileHistory(); selectCommit(hash); viewMode = 'history'; }" />
-                <!--
-                Image files (PNG, JPEG, WebP, GIF, SVG) get the ImageDiffViewer
-                branch; the line-based DiffViewer would hit its "binary file"
-                dead-end and show nothing useful.
-              -->
-                <ImageDiffViewer v-else-if="isImagePath(repoSelectedFile) && repoFolderPath && repoSelectedFile"
-                  :cwd="repoFolderPath" :file-path="repoSelectedFile" old-rev="HEAD"
-                  :new-rev="repoSelectedFileStaged ? ':0' : ''" status="modified" />
-                <DiffViewer v-else ref="diffViewerRef" :diff="repoDiff" :file-path="repoSelectedFile" :diff-mode="diffMode" :selectable="true"
-                  :findings="findingsForSelectedFile"
-                  @update:diff-mode="onDiffModeChange" @open-file-history="openFileHistory"
-                  @open-in-editor="handleOpenInEditor" @stage-patch="stagePatch"
-                  @select-dir-file="(path) => repoSelectFile(path, false)"
-                  @open-repo-tab="handleOpenNestedRepo"
-                  @add-to-gitignore="addToGitignore"
-                  @dismiss-finding="(id) => commitReview.dismiss(id)"
-                  :editable="!repoSelectedFileStaged && !isSelectedFileConflicted"
-                  @edit-hunk="handleEditHunk" />
-              </div>
-
-              <div v-if="showCommitRail" class="sidebar-handle" :class="{ 'sidebar-handle--active': sidebarResizing }"
-                @mousedown="onSidebarMouseDown"></div>
-              <button class="commit-rail-toggle" :class="{ 'commit-rail-toggle--active': showCommitRail }"
-                @click="showCommitRail = !showCommitRail" :title="t('sidebar.toggleCommitPanel')"
-                :aria-pressed="showCommitRail">
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M13.5 3.5l-7 7L3 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                <span class="commit-rail-toggle__label">{{ t('sidebar.toggleCommitPanel') }}</span>
-              </button>
-              <aside v-if="showCommitRail" class="view__rail view__rail--right">
-                <RepoSidebar pane="changes" v-bind="repoSidebarProps" v-on="repoSidebarListeners" />
-              </aside>
-            </div>
-
             <!-- ── History view: commit list │ commit diff ── -->
             <div v-else-if="viewMode === 'history'" class="view view--history">
               <aside v-if="showSidebar" class="view__rail">
@@ -4456,11 +4846,62 @@ onUnmounted(() => {
             <!-- ── Git Tree view: full-screen commit graph ── -->
             <!-- Clicking a commit pops its file list in the right rail (no file
                  auto-focused); clicking a file swaps the graph for its diff while
-                 keeping the file rail visible. -->
-            <div v-else-if="viewMode === 'graph'" class="view view--graph">
+                 keeping the file rail visible.
+                 Clicking the WIP row enters the WIP mode (viewMode 'changes'):
+                 the rail becomes the Changes pane (files + commit) and the
+                 selected WIP file's diff covers the graph (X to return). -->
+            <div v-else-if="viewMode === 'graph' || viewMode === 'changes'" class="view view--graph">
               <div class="graph-main">
+                <div v-if="viewMode === 'changes' && wipDiffOpen" ref="wipDiffEl" class="graph-diff-full graph-diff-full--wip">
+                  <button class="graph-diff-close" :style="{ top: `${wipCloseTop - 1}px` }" @click="wipDiffOpen = false" :title="t('common.close')"
+                    :aria-label="t('common.close')">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                    </svg>
+                  </button>
+                  <div class="view__content">
+                    <div v-if="memorizeToast && showingMergeEditor" class="me-memory-offer">
+                      <span>{{ t("mergeEditor.memorizeFileOffer", memorizeToast.path.split('/').pop() || memorizeToast.path) }}</span>
+                      <button class="me-memory-btn me-memory-btn--save" @click="acceptMemorizeToast">{{ t("mergeEditor.memorySave") }}</button>
+                      <button class="me-memory-btn" @click="dismissMemorizeToast">{{ t("common.close") }}</button>
+                    </div>
+                    <MergeEditor v-if="showingMergeEditor && mergeSelectedFile" :file="mergeSelectedFile"
+                      :cwd="repoFolderPath ?? undefined"
+                      @resolve="handleResolveFile" @resolve-hunk="(path, idx, choice) => handleResolveHunk(path, idx, choice)"
+                      @resolve-hunk-custom="(path, idx, content) => handleResolveHunkCustom(path, idx, content)"
+                      @resolve-file-bulk="(path, choice) => handleResolveFileBulk(path, choice)"
+                      @apply-file-memory="(path, entry) => handleApplyFileMemory(path, entry)"
+                      @resolve-tree-conflict="(path, choice) => handleResolveTreeConflict(path, choice)"
+                      @reconstruct-conflict="(path) => handleReconstructConflict(path)"
+                      @keep-working-tree="(path) => handleKeepWorkingTree(path)"
+                      @open-externally="(path) => handleOpenInEditor(path)" />
+                    <div v-else-if="mergeEditorPending" class="view__merge-pending" role="status">{{ t("common.loading") }}</div>
+                    <FileHistoryViewer v-else-if="fileHistoryPath && repoFolderPath" :file-path="fileHistoryPath"
+                      :cwd="repoFolderPath" @close="closeFileHistory"
+                      @select-commit="(hash) => { closeFileHistory(); selectCommit(hash); viewMode = 'history'; }" />
+                    <!--
+                      Image files (PNG, JPEG, WebP, GIF, SVG) get the ImageDiffViewer
+                      branch; the line-based DiffViewer would hit its "binary file"
+                      dead-end and show nothing useful.
+                    -->
+                    <ImageDiffViewer v-else-if="isImagePath(repoSelectedFile) && repoFolderPath && repoSelectedFile"
+                      :cwd="repoFolderPath" :file-path="repoSelectedFile" old-rev="HEAD"
+                      :new-rev="repoSelectedFileStaged ? ':0' : ''" status="modified" />
+                    <DiffViewer v-else ref="diffViewerRef" :diff="repoDiff" :file-path="repoSelectedFile" :diff-mode="diffMode" :selectable="true"
+                      :findings="findingsForSelectedFile"
+                      @update:diff-mode="onDiffModeChange" @open-file-history="openFileHistory"
+                      @open-in-editor="handleOpenInEditor" @stage-patch="stagePatch"
+                      @select-dir-file="(path) => repoSelectFile(path, false)"
+                      @open-repo-tab="handleOpenNestedRepo"
+                      @add-to-gitignore="addToGitignore"
+                      @dismiss-finding="(id) => commitReview.dismiss(id)"
+                      :editable="!repoSelectedFileStaged && !isSelectedFileConflicted"
+                      @edit-hunk="handleEditHunk" />
+                  </div>
+                </div>
+
                 <!-- A clicked file replaces the graph with its diff (X to return). -->
-                <div v-if="graphFileIdx !== null && selectedCommitHash" class="graph-diff-full">
+                <div v-else-if="viewMode === 'graph' && graphFileIdx !== null && selectedCommitHash" class="graph-diff-full">
                   <button class="graph-diff-close" @click="onGraphCloseDiff" :title="t('common.close')"
                     :aria-label="t('common.close')">
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -4475,8 +4916,8 @@ onUnmounted(() => {
                 </div>
 
                 <CommitGraph v-else class="graph-canvas"
-                  :commits="repoLog" :selected-hash="selectedCommitHash" :current-branch="repoStatus?.branch"
-                  :fork-point-sha="graphForkPointSha" :repo-stats="repoStats" :branches="branches" :worktree-branches="worktreeBranches" :stashes="stashes"
+                  :commits="repoLog" :selected-hash="viewMode === 'changes' ? 'WIP' : selectedCommitHash" :current-branch="repoStatus?.branch"
+                  :fork-point-sha="graphForkPointSha" :repo-stats="repoStats" :branches="branches" :worktree-branches="worktreeBranches" :ai-task-branches="aiTaskBranches" :stashes="stashes"
                   :submodule-changes="submoduleChanges"
                   :branch-prs="branchPrs"
                   :cwd="repoFolderPath ?? ''"
@@ -4485,6 +4926,7 @@ onUnmounted(() => {
                   :pinned-branches="graphPinnedBranches"
                   :log-branch-filter="logBranchFilter"
                   :log-author-filter="logAuthorFilter"
+                  :wip-summary="commitSummary"
                   @set-log-branch-filter="setLogBranchFilter"
                   @set-log-author-filter="setLogAuthorFilter"
                   @select-commit="onGraphSelectCommit"
@@ -4498,6 +4940,7 @@ onUnmounted(() => {
                   @create-branch-from-commit="handleCreateBranchFromCommit"
                   @tag-commit="handleTagCommit"
                   @cherry-pick-commit="handleCherryPickCommit"
+                  @cherry-pick-commit-wip="handleCherryPickCommitAsWip"
                   @view-on-forge="handleViewOnForge"
                   @delete-branch="handleDeleteBranchRequest"
                   @delete-worktree="handleTreeDeleteWorktree"
@@ -4517,21 +4960,39 @@ onUnmounted(() => {
                   @wip-quick-stash="handleWipQuickStash"
                   @wip-quick-stash-ai="handleWipQuickStashAi"
                   @load-branches="loadBranches"
-                  @load-more="loadMoreLog" />
+                  @load-more="loadMoreLog"
+                  @view-anchor="setLogViewAnchor" />
               </div>
-              <div v-if="showGraphRail && selectedCommitHash" class="sidebar-handle"
-                :class="{ 'sidebar-handle--active': sidebarResizing }" @mousedown="onSidebarMouseDown"></div>
-              <button v-if="selectedCommitHash" class="commit-rail-toggle" :class="{ 'commit-rail-toggle--active': showGraphRail }"
-                @click="showGraphRail = !showGraphRail" :title="t('sidebar.toggleFilesPanel')" :aria-pressed="showGraphRail">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" />
-                </svg>
-                <span class="commit-rail-toggle__label">{{ t('sidebar.toggleFilesPanel') }}</span>
-              </button>
-              <aside v-if="showGraphRail && selectedCommitHash" class="view__rail view__rail--right">
-                <RepoSidebar pane="history" v-bind="repoSidebarProps"
-                  :visible-file-idx="graphFileIdx ?? -1" @scroll-to-file="onGraphOpenFile" />
-              </aside>
+              <template v-if="viewMode === 'changes'">
+                <div v-if="showCommitRail" class="sidebar-handle" :class="{ 'sidebar-handle--active': sidebarResizing }"
+                  @mousedown="onSidebarMouseDown"></div>
+                <button class="commit-rail-toggle" :class="{ 'commit-rail-toggle--active': showCommitRail }"
+                  @click="showCommitRail = !showCommitRail" :title="t('sidebar.toggleCommitPanel')"
+                  :aria-pressed="showCommitRail">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M13.5 3.5l-7 7L3 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                  <span class="commit-rail-toggle__label">{{ t('sidebar.toggleCommitPanel') }}</span>
+                </button>
+                <aside v-if="showCommitRail" class="view__rail view__rail--right">
+                  <RepoSidebar pane="changes" v-bind="repoSidebarProps" v-on="repoSidebarListeners" />
+                </aside>
+              </template>
+              <template v-else>
+                <div v-if="showGraphRail && selectedCommitHash" class="sidebar-handle"
+                  :class="{ 'sidebar-handle--active': sidebarResizing }" @mousedown="onSidebarMouseDown"></div>
+                <button v-if="selectedCommitHash" class="commit-rail-toggle" :class="{ 'commit-rail-toggle--active': showGraphRail }"
+                  @click="showGraphRail = !showGraphRail" :title="t('sidebar.toggleFilesPanel')" :aria-pressed="showGraphRail">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" />
+                  </svg>
+                  <span class="commit-rail-toggle__label">{{ t('sidebar.toggleFilesPanel') }}</span>
+                </button>
+                <aside v-if="showGraphRail && selectedCommitHash" class="view__rail view__rail--right">
+                  <RepoSidebar pane="history" v-bind="repoSidebarProps"
+                    :visible-file-idx="graphFileIdx ?? -1" @scroll-to-file="onGraphOpenFile" />
+                </aside>
+              </template>
             </div>
 
             <!-- Issue detail view: in-app issue review (v2.22) -->
@@ -4545,7 +5006,7 @@ onUnmounted(() => {
 
       <!-- Integrated git terminal (v3.0) — docked panel anchored at the bottom
            of app-body, below main, above the floating AppDock. -->
-      <!-- KeepAlive so toggling the panel deactivates (not unmounts) the xterm
+      <!-- KeepAlive so toggling the panel deactivates (not unmounts) the terminal
            instances — buffer + PTY view survive a hide/show cycle. -->
       <KeepAlive>
         <TerminalPanel
@@ -4568,8 +5029,12 @@ onUnmounted(() => {
           v-if="showFiles && repoFolderPath"
           :repo-path="repoFolderPath"
           :changed-files="repoFiles"
+          :watcher="repoWatcher"
           @close="showFiles = false"
           @request-close-tab="onRequestCloseFileTab"
+          @open-in-editor="handleOpenInEditor"
+          @open-merge-editor="(p: string) => { hideFilesOnHandoff(); handleOpenResidual(p); }"
+          @open-file-history="(p: string) => { hideFilesOnHandoff(); openFileHistory(p); viewMode = 'changes'; }"
         />
       </KeepAlive>
 
@@ -4620,11 +5085,11 @@ onUnmounted(() => {
 
     <!-- Stash manager (uses BaseModal, owns its own overlay) -->
     <StashManager v-if="showStash && repoFolderPath" :cwd="repoFolderPath" @close="showStash = false"
-      @refresh="repoRefresh()" />
+      @refresh="repoRefresh(true)" />
 
     <!-- Time Machine (v3.8) — full repo history, snapshots + reflog -->
     <TimeMachinePanel v-if="showTimeMachine && repoFolderPath" :cwd="repoFolderPath"
-      @close="showTimeMachine = false" @restored="onUndoPerformed()" />
+      @close="showTimeMachine = false" @restored="onUndoPerformed()" @restore-worktree="onRestoreWorktree" />
 
     <!-- Clone modal (v2.0) -->
     <CloneModal v-if="showCloneModal" @close="showCloneModal = false" @cloned="onCloned" />
@@ -4637,11 +5102,24 @@ onUnmounted(() => {
       @open-tab="(path) => { openTab(path); showAgents = false; }"
       @launch-agent="onLaunchAgent" />
 
+    <!-- v3.13 — ask before running a repository's worktree commands -->
+    <WorktreeHookTrustModal v-if="hookTrust.pending.value" :status="hookTrust.pending.value"
+      :error="hookTrust.error.value" :busy="hookTrust.busy.value" @answer="hookTrust.answer" />
+
     <!-- AI-task name prompt — names the scratch worktree after the task -->
-    <AiTaskNameModal v-if="aiTaskNamePrompt" :busy="aiTaskNameBusy" @cancel="aiTaskNamePrompt = false"
+    <AiTaskNameModal v-if="aiTaskNamePrompt" :busy="aiTaskNameBusy" :base-line="aiTaskBaseLine" @cancel="aiTaskNamePrompt = false"
       @create="confirmNewAiTask" />
 
     <!-- AI-task worktree removal — deletes / merges-back the scratch worktree -->
+    <MergeBackDialog v-if="mergeBackDialog" :cwd="mergeBackDialog.cwd" :path="mergeBackDialog.path"
+      :branches="branches.filter((b) => !b.isRemote).map((b) => b.name)" :minimized="mergeBackDialog.minimized"
+      @close="onMergeBackClose" @minimize="mergeBackDialog.minimized = true" @cleanup="onMergeBackCleanup"
+      @open-residual="handleOpenResidual" />
+    <button v-if="mergeBackDialog?.minimized" class="merge-back-resume" type="button"
+      @click="mergeBackDialog.minimized = false">{{ t("mergeBack.resumePill") }}</button>
+    <WorktreeRemoveDialog v-if="removalDialog" :cwd="removalDialog.cwd" :repo-path="removalDialog.projectPath"
+      :path="removalDialog.path" :delete-branch="removalDialog.deleteBranch" :auto-start="removalDialog.autoStart"
+      @close="onRemovalClose" @done="onRemovalDone" @open-log="onOpenSetupLog" />
     <AiTaskCloseModal v-if="aiTaskClose" :branch="aiTaskClose.branch" :mode="aiTaskClose.mode" :busy="aiTaskCloseBusy"
       :error="aiTaskCloseError" @cancel="onAiTaskCancel" @delete="onAiTaskDelete" @merge-back="onAiTaskMergeBack" />
 
@@ -4660,14 +5138,19 @@ onUnmounted(() => {
 
     <!-- Tags panel -->
     <TagsPanel v-if="showTags && repoFolderPath" :cwd="repoFolderPath" @close="showTags = false"
-      @refresh="repoRefresh()"
+      @refresh="repoRefresh(true)"
       @create-tag="showTags = false; handleTagCommit(repoLog[0] ?? null)" />
     <!-- Worktree manager (uses BaseModal internally → own Teleport + backdrop) -->
     <WorktreeManager v-if="showWorktrees && repoFolderPath" :cwd="repoFolderPath" :branches="branches"
       :suggested-branch="pendingWorktreeBranch" :open-quick-create="pendingQuickCreate"
       @close="showWorktrees = false; pendingWorktreeBranch = undefined; pendingQuickCreate = false;"
       @load-branches="loadBranches"
-      @open-tab="(path) => { openTab(path); showWorktrees = false; pendingWorktreeBranch = undefined; pendingQuickCreate = false; }" />
+      @open-tab="(path) => { openTab(path); showWorktrees = false; pendingWorktreeBranch = undefined; pendingQuickCreate = false; }"
+      @created="onWorktreeCreated" @open-setup-log="onOpenSetupLog" @merge-back="onManagerMergeBack" />
+
+    <!-- Release notes generator (shared modal, also on Dashboard + Tags panel) -->
+    <ReleaseNotesModal v-if="showReleaseNotes && repoFolderPath" :cwd="repoFolderPath"
+      @close="showReleaseNotes = false" />
 
     <!-- Submodule panel (uses BaseModal internally → own Teleport + backdrop) -->
     <SubmodulePanel v-if="showSubmodules && repoFolderPath" :cwd="repoFolderPath" :updates="submoduleUpdates"
@@ -4806,7 +5289,7 @@ onUnmounted(() => {
             @keydown.enter.prevent="confirmSwitchStash" @keydown.esc.prevent="cancelSwitchStash" />
           <button v-if="aiProvider.isAvailable.value" type="button" class="switch-stash-ai-btn"
             :disabled="isGeneratingSwitchStashMessage" @click="suggestSwitchStashMessage">
-            <span v-if="isGeneratingSwitchStashMessage">…</span>
+            <span v-if="isGeneratingSwitchStashMessage" class="ai-loading">…</span>
             <span v-else class="switch-stash-ai-label">
               <AiSparkle :size="13" />
               {{ t('common.ai') }}
@@ -4829,7 +5312,7 @@ onUnmounted(() => {
     <HelpView v-if="showHelp" @close="showHelp = false" />
 
     <!-- Settings panel -->
-    <SettingsPanel v-if="showSettings" :error-log="logEntries" :initial-tab="settingsInitialTab"
+    <SettingsPanel v-if="showSettings" :error-log="logEntries" :initial-tab="settingsInitialTab" :initial-section="settingsInitialSection"
       :cwd="repoFolderPath ?? undefined" @close="onSettingsClose" @update:commit-signature="onCommitSignatureChange"
       @update:diff-mode="onDiffModeChange" @update:pull-mode="onPullModeChange" @update:font-size="onFontSizeChange"
       @update:tab-size="onTabSizeChange" @clear-logs="clearErrorLog"
@@ -4873,7 +5356,7 @@ onUnmounted(() => {
       :subtitle="t('commitCtx.resetDesc', commitActionModal.entry?.hash ?? '')" size="sm" role="alertdialog"
       @close="closeCommitActionModal">
       <div class="cam-radio-group">
-        <label v-for="mode in (['soft', 'mixed', 'hard'] as const)" :key="mode" class="cam-radio">
+        <label v-for="mode in (['soft', 'mixed', 'keep', 'hard'] as const)" :key="mode" class="cam-radio">
           <input type="radio" name="resetMode" :value="mode" v-model="commitActionModal.resetMode" />
           <span class="cam-radio-label">
             <strong>--{{ mode }}</strong>
@@ -4963,10 +5446,10 @@ onUnmounted(() => {
         <!-- AI suggestion strip -->
         <div v-if="isAIAvailable" class="tag-ai-row">
           <span class="tag-ai-hint">{{ t('commitCtx.tagAiHint') }}</span>
-          <button class="bm-btn btn--ai tag-ai-btn" :disabled="commitActionModal.busy || isTagAISuggesting"
-            @click="suggestTagWithAI">
+          <button class="bm-btn btn--ai tag-ai-btn" :class="{ 'ai-loading': isTagAISuggesting }"
+            :disabled="commitActionModal.busy || isTagAISuggesting" @click="suggestTagWithAI">
             <AiSparkle :size="13" :animated="isTagAISuggesting" />
-            {{ isTagAISuggesting ? t('common.loading') : t('commitCtx.tagAiSuggest') }}
+            {{ isTagAISuggesting ? t('common.generating') : t('commitCtx.tagAiSuggest') }}
           </button>
         </div>
         <input v-model="commitActionModal.tagName" type="text" class="cam-input"
@@ -4987,12 +5470,18 @@ onUnmounted(() => {
     </BaseModal>
 
     <!-- Discard section confirmation -->
-    <BaseModal v-if="discardSectionConfirm" :title="t('sidebar.discardAll')" size="sm" role="alertdialog"
+    <BaseModal v-if="discardSectionConfirm && discardSummary" :title="t(DISCARD_TEXT[discardSummary.kind].title)" size="sm" role="alertdialog"
       @close="discardSectionConfirm = null">
-      <p class="ptc-desc">{{ t('sidebar.discardAllConfirm', discardSectionConfirm.paths.length) }}</p>
+      <p class="ptc-desc">{{ t(DISCARD_TEXT[discardSummary.kind].confirm, discardSummary.fileCount) }}</p>
+      <p v-if="discardSummary.kind === 'all' && discardSummary.stagedCount > 0" class="ptc-desc ptc-desc--warn">
+        {{ t('sidebar.discardAllStagedWarning', discardSummary.stagedCount) }}
+      </p>
+      <p v-if="discardSummary.alsoUnstagedCount > 0" class="ptc-desc ptc-desc--warn">
+        {{ t('sidebar.discardStagedAlsoUnstagedWarning', discardSummary.alsoUnstagedCount) }}
+      </p>
       <template #footer>
         <button class="bm-btn bm-btn--ghost" @click="discardSectionConfirm = null">{{ t('common.cancel') }}</button>
-        <button class="bm-btn bm-btn--danger" @click="onDiscardSectionConfirmed">{{ t('sidebar.discardAll') }}</button>
+        <button class="bm-btn bm-btn--danger" @click="onDiscardSectionConfirmed">{{ t(DISCARD_TEXT[discardSummary.kind].title) }}</button>
       </template>
     </BaseModal>
 
@@ -5024,10 +5513,12 @@ onUnmounted(() => {
       </template>
     </BaseModal>
 
-    <!-- Post-checkout "Update branch" prompt (behind-only, no divergence) -->
+    <!-- Post-checkout "Update branch" prompt (behind-only, or upstream rewritten) -->
     <BaseModal v-if="branchUpdatePrompt" :title="t('branches.updateAvailableTitle')" size="sm" role="alertdialog"
       @close="onBranchUpdateDismiss">
-      <p class="ptc-desc">{{ branchUpdatePrompt.behind === 1
+      <p class="ptc-desc">{{ branchUpdatePrompt.rewritten
+        ? t('branches.updateRewritten', branchUpdatePrompt.branch, branchUpdatePrompt.remote)
+        : branchUpdatePrompt.behind === 1
         ? t('branches.updateAvailableOne', branchUpdatePrompt.branch, branchUpdatePrompt.remote)
         : t('branches.updateAvailableMany', branchUpdatePrompt.branch, branchUpdatePrompt.behind, branchUpdatePrompt.remote) }}</p>
       <p v-if="isDirty()" class="ptc-desc">{{ t('branches.updateDirtyHint') }}</p>
@@ -5041,6 +5532,23 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+
+/* v3.13 — a merge-back waiting for the user to finish resolving. */
+.merge-back-resume {
+  position: fixed;
+  right: var(--space-6);
+  bottom: var(--space-6);
+  z-index: 900;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  background: var(--color-accent);
+  color: var(--color-on-accent, #fff);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  box-shadow: var(--shadow-md);
+}
+
 .app {
   display: flex;
   flex-direction: column;
@@ -5063,10 +5571,6 @@ onUnmounted(() => {
   position: relative;
 }
 
-.main--dashboard {
-  min-width: 760px;
-}
-
 /* ── Full-screen view scaffold (rail + content, composed per view) ── */
 .view {
   flex: 1;
@@ -5082,6 +5586,16 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   position: relative;
+}
+
+/* Stands in for the merge editor while a conflicted file's conflicts load. */
+.view__merge-pending {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
 }
 
 .view__rail {
@@ -5159,6 +5673,19 @@ onUnmounted(() => {
   color: var(--color-text-muted);
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
+}
+
+/* The WIP diff's own header carries actions on its right edge — keep them
+   clear of the floating close button. */
+.graph-diff-full--wip :deep(.diff-header),
+.graph-diff-full--wip :deep(.editor-header),
+.graph-diff-full--wip :deep(.fhv-header),
+.graph-diff-full--wip :deep(.idv-header) {
+  padding-right: 49px;
+}
+
+.graph-diff-full--wip .graph-diff-close {
+  right: 9px;
 }
 
 .graph-diff-close:hover {

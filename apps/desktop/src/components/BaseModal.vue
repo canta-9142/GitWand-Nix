@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "../composables/useI18n";
+import ModalCloseButton from "./ModalCloseButton.vue";
 import { focusableWithin, nextTrapTarget } from "../utils/focusTrap";
 
-type ModalSize = "sm" | "md" | "lg" | "xl" | "full" | "2x";
+type ModalSize = "sm" | "md" | "lg" | "xl" | "full" | "2x" | "screen";
 type ModalPosition = "center" | "top";
 
 const props = withDefaults(
@@ -12,7 +13,7 @@ const props = withDefaults(
     title?: string;
     /** Optional subtitle / secondary text shown next to or below the title (e.g. commit hash). */
     subtitle?: string;
-    /** Panel max-width preset. sm=400, md=520, lg=640, xl=960, full=90vw. 2x=800. */
+    /** Panel max-width preset. sm=400, md=520, lg=640, xl=960, full=90vw. 2x=800. screen=whole window (HelpView-style). */
     size?: ModalSize;
     /** Vertical alignment. "top" keeps the panel pinned toward the top (command palette style). */
     position?: ModalPosition;
@@ -92,7 +93,7 @@ function onKeyDown(e: KeyboardEvent) {
 
 // v3.7.0 review-round fix (finding #11): focus trap, initial focus, focus
 // restore. See docs/superpowers/plans/2026-08-19-v3.7.0-commit-review-review-fixes.md,
-// Task 11, for the full design rationale (nested modals, CodeMirror/xterm).
+// Task 11, for the full design rationale (nested modals, CodeMirror/terminal).
 const panelRef = ref<HTMLElement | null>(null);
 let previouslyFocused: HTMLElement | null = null;
 
@@ -101,7 +102,7 @@ let previouslyFocused: HTMLElement | null = null;
  * the Escape handler above): nested modals (e.g. `askConfirm` layered over
  * another modal) each get their own trap, and only the one that actually
  * contains focus reacts. An inner component that owns Tab itself
- * (CodeMirror indent, an xterm terminal) runs first in the bubble phase, so
+ * (CodeMirror indent, the integrated terminal) runs first in the bubble phase, so
  * this bails on `e.defaultPrevented`.
  */
 function onPanelKeyDown(e: KeyboardEvent) {
@@ -180,17 +181,7 @@ onUnmounted(() => {
             </div>
           </slot>
           <slot name="header-actions" />
-          <button
-            v-if="!hideClose"
-            class="base-modal__close"
-            type="button"
-            @click="requestClose"
-            :aria-label="t('common.close')"
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-              <path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z" />
-            </svg>
-          </button>
+          <ModalCloseButton v-if="!hideClose" @click="requestClose" />
         </header>
 
         <!-- Optional toolbar slot between header and body -->
@@ -268,6 +259,28 @@ onUnmounted(() => {
 .base-modal--xl   { width: min(960px, 94vw); max-height: 92vh; }
 .base-modal--full { width: min(1200px, 94vw); max-height: 92vh; }
 
+/* screen: covers the whole window, like HelpView. No card chrome; the
+   header adopts HelpView's compact app-bar look. */
+.base-modal--screen {
+  width: 100vw;
+  height: 100vh;
+  max-height: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--color-bg);
+}
+.base-modal--screen .base-modal__header {
+  min-height: var(--header-height, 48px);
+  padding: 0 var(--space-6, 20px);
+  background: var(--color-bg-secondary);
+  flex-shrink: 0;
+}
+.base-modal--screen .base-modal__title {
+  font-size: var(--font-size-2xl);
+  font-weight: var(--font-weight-bold);
+}
+
 @keyframes bm-slide-in {
   from { opacity: 0; transform: translateY(-10px) scale(0.98); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
@@ -312,29 +325,6 @@ onUnmounted(() => {
   font-size: var(--font-size-sm);
   color: var(--color-text-muted);
   line-height: 1.35;
-}
-
-.base-modal__close {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: none;
-  border-radius: var(--radius-pill);
-  background: transparent;
-  color: var(--color-text-muted);
-  cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
-}
-.base-modal__close:hover {
-  color: var(--color-text);
-  background: var(--color-bg-tertiary);
-}
-.base-modal__close:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
 }
 
 /* ─── Toolbar (optional strip between header and body) ─ */

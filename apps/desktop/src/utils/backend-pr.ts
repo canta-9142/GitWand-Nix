@@ -559,6 +559,12 @@ export async function ghPrReady(cwd: string, number: number): Promise<void> {
   return tauriInvoke<void>("gh_pr_ready", { cwd, number });
 }
 
+/** Edit a PR's title and/or description; an omitted field is left unchanged. */
+export async function ghPrEdit(cwd: string, number: number, edit: PrEdit): Promise<void> {
+  if (!isTauri()) throw new Error("ghPrEdit requires Tauri");
+  return tauriInvoke<void>("gh_pr_edit", { cwd, number, title: edit.title ?? null, body: edit.body ?? null });
+}
+
 /** Dismiss a submitted review (B4, v3.6.0). */
 export async function ghDismissReview(
   cwd: string,
@@ -599,6 +605,12 @@ export async function ghRequestReviewers(
 }
 
 // ─── PR Detail, Diff & Checks (Phase 9.1) ──────────────────
+
+/** A PR title and/or description change. An omitted field is left as is. */
+export interface PrEdit {
+  title?: string;
+  body?: string;
+}
 
 export interface PullRequestDetail {
   number: number;
@@ -649,6 +661,31 @@ export interface CICheck {
   state: string;
   conclusion: string;
   detailsUrl: string;
+  /** The commit this check ran on; "" (or absent, in an old cache) when the
+   *  forge does not say. See `checksCommitMismatch` in `utils/ciChecks.ts`. */
+  commitSha?: string;
+}
+
+/** A check as the Rust backends and the dev-server send it: Rust's `CICheck`
+ *  has no `rename_all = "camelCase"`, so the fields arrive in snake_case. */
+export interface CICheckRaw {
+  name: string;
+  state: string;
+  conclusion: string;
+  details_url: string;
+  commit_sha?: string;
+}
+
+/** Map a snake_case check off the wire. Every forge's wrapper goes through
+ *  it: a raw cast leaves `detailsUrl` undefined, and the link never shows. */
+export function mapCICheck(c: CICheckRaw): CICheck {
+  return {
+    name: c.name,
+    state: c.state,
+    conclusion: c.conclusion,
+    detailsUrl: c.details_url ?? "",
+    commitSha: c.commit_sha ?? "",
+  };
 }
 
 /**
@@ -803,26 +840,14 @@ export async function ghPrDiff(cwd: string, number: number): Promise<string> {
  */
 export async function ghPrChecks(cwd: string, number: number): Promise<CICheck[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<Array<{
-      name: string;
-      state: string;
-      conclusion: string;
-      details_url: string;
-    }>>("gh_pr_checks", { cwd, number });
-    return raw.map((c) => ({
-      name: c.name,
-      state: c.state,
-      conclusion: c.conclusion,
-      detailsUrl: c.details_url,
-    }));
+    const raw = await tauriInvoke<CICheckRaw[]>("gh_pr_checks", { cwd, number });
+    return raw.map(mapCICheck);
   }
   const res = await devFetch(`${DEV_SERVER}/api/gh-pr-checks?cwd=${encodeURIComponent(cwd)}&number=${number}`);
   if (!res.ok) throw new Error(`gh pr checks failed: ${res.status}`);
   const raw = await res.json();
   if (raw.error) throw new Error(raw.error);
-  return raw.map((c: any) => ({
-    name: c.name, state: c.state, conclusion: c.conclusion, detailsUrl: c.details_url,
-  }));
+  return (raw as CICheckRaw[]).map(mapCICheck);
 }
 
 // ─── PR Review Comments (Phase 9.2) ────────────────────────
@@ -854,6 +879,18 @@ export interface PrReviewComment {
    *  resolved. `undefined` on forges/paths with no resolved-thread concept
    *  (GitHub review comments don't carry this field here). */
   resolved?: boolean;
+  /** Forge id of the review thread this comment belongs to, used to resolve
+   *  it. Set on GitHub (GraphQL thread node id); `undefined` elsewhere. */
+  thread_id?: string;
+}
+
+/** One PR review thread: the comment that opened it and its resolution state. */
+export interface PrReviewThread {
+  /** GraphQL node id of the thread. */
+  thread_id: string;
+  /** REST id of the thread's first comment. */
+  root_comment_id: number;
+  resolved: boolean;
 }
 
 /** Params for creating a new review comment. */
@@ -880,6 +917,30 @@ export async function ghPrComments(cwd: string, prNumber: number): Promise<PrRev
   const raw = await res.json();
   if (raw.error) throw new Error(raw.error);
   return raw as PrReviewComment[];
+}
+
+/** List a PR's review threads with their resolution state (GitHub GraphQL). */
+export async function ghPrReviewThreads(cwd: string, prNumber: number): Promise<PrReviewThread[]> {
+  if (isTauri()) return tauriInvoke<PrReviewThread[]>("gh_pr_review_threads", { cwd, number: prNumber });
+  const res = await devFetch(`${DEV_SERVER}/api/gh-pr-review-threads?cwd=${encodeURIComponent(cwd)}&number=${prNumber}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `gh pr review threads failed: ${res.status}`);
+  return data as PrReviewThread[];
+}
+
+/** Resolve (or unresolve) a PR review thread — "Resolve conversation". */
+export async function ghSetReviewThreadResolved(cwd: string, threadId: string, resolved: boolean): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gh_set_review_thread_resolved", { threadId, resolved });
+    return;
+  }
+  const resp = await devFetch(`${DEV_SERVER}/api/gh-set-review-thread-resolved`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, threadId, resolved }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) throw new Error(data.error || `gh resolve thread failed: ${resp.status}`);
 }
 
 /**
@@ -954,6 +1015,7 @@ export async function ghPrCreateComment(
   prNumber: number,
   params: CreatePrCommentParams,
 ): Promise<PrReviewComment> {
+  if (isTauri()) return tauriInvoke<PrReviewComment>("gh_pr_create_comment", { cwd, number: prNumber, params });
   const res = await devFetch(`${DEV_SERVER}/api/gh-pr-comment`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -965,12 +1027,19 @@ export async function ghPrCreateComment(
   return raw as PrReviewComment;
 }
 
-/** Edit the body of an existing review comment. */
+/** Edit the body of an existing review comment. `prNumber` locates the repo
+ *  the PR lives in (the upstream, for a fork) — required on desktop. */
 export async function ghPrUpdateComment(
   cwd: string,
   commentId: number,
   body: string,
+  prNumber?: number,
 ): Promise<void> {
+  if (isTauri()) {
+    if (prNumber == null) throw new Error("ghPrUpdateComment requires the PR number");
+    await tauriInvoke("gh_pr_update_comment", { cwd, number: prNumber, commentId, body });
+    return;
+  }
   const res = await devFetch(`${DEV_SERVER}/api/gh-pr-comment?id=${commentId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -979,8 +1048,13 @@ export async function ghPrUpdateComment(
   if (!res.ok) throw new Error(`update comment failed: ${res.status}`);
 }
 
-/** Delete a review comment. */
-export async function ghPrDeleteComment(cwd: string, commentId: number): Promise<void> {
+/** Delete a review comment. `prNumber`: same contract as `ghPrUpdateComment`. */
+export async function ghPrDeleteComment(cwd: string, commentId: number, prNumber?: number): Promise<void> {
+  if (isTauri()) {
+    if (prNumber == null) throw new Error("ghPrDeleteComment requires the PR number");
+    await tauriInvoke("gh_pr_delete_comment", { cwd, number: prNumber, commentId });
+    return;
+  }
   const res = await fetch(
     `${DEV_SERVER}/api/gh-pr-comment?cwd=${encodeURIComponent(cwd)}&id=${commentId}`,
     { method: "DELETE" },
@@ -1424,6 +1498,11 @@ export async function azPrReady(cwd: string, number: number): Promise<void> {
   throw new Error(AZURE_WEB_ONLY);
 }
 
+export async function azPrEdit(cwd: string, number: number, edit: PrEdit): Promise<void> {
+  if (isTauri()) return tauriInvoke<void>("az_pr_edit", { cwd, number, title: edit.title ?? null, body: edit.body ?? null });
+  throw new Error(AZURE_WEB_ONLY);
+}
+
 export async function azCheckoutPr(cwd: string, number: number): Promise<void> {
   if (isTauri()) return tauriInvoke<void>("az_checkout_pr", { cwd, number });
   throw new Error(AZURE_WEB_ONLY);
@@ -1441,16 +1520,8 @@ export async function azPrCreateComment(cwd: string, number: number, body: strin
 
 export async function azPrChecks(cwd: string, number: number): Promise<CICheck[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<Array<{ name: string; state: string; conclusion: string; details_url: string }>>(
-      "az_pr_checks",
-      { cwd, number },
-    );
-    return raw.map((c) => ({
-      name: c.name,
-      state: c.state,
-      conclusion: c.conclusion,
-      detailsUrl: c.details_url,
-    }));
+    const raw = await tauriInvoke<CICheckRaw[]>("az_pr_checks", { cwd, number });
+    return raw.map(mapCICheck);
   }
   throw new Error(AZURE_WEB_ONLY);
 }

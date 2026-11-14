@@ -15,7 +15,7 @@
   <div v-else-if="summary" class="preview-panel">
 
     <!-- Operation selector (merge / rebase / cherry-pick) -->
-    <div class="preview-ops" role="tablist" :aria-label="t('mergePreview.operationLabel')">
+    <div v-if="!embedded" class="preview-ops" role="tablist" :aria-label="t('mergePreview.operationLabel')">
       <button
         v-for="op in OPERATIONS"
         :key="op"
@@ -48,20 +48,20 @@
         :title="t('mergePreview.aiRiskHint')"
         @click="requestMergeRisk"
       >
-        <span v-if="isMergeRiskAssessing">… {{ t('mergePreview.aiRiskAnalyzing') }}</span>
+        <span v-if="isMergeRiskAssessing" class="ai-loading">{{ t('mergePreview.aiRiskAnalyzing') }}</span>
         <span v-else class="preview-ai-label">
           <AiSparkle :size="14" />
           {{ t('mergePreview.aiRisk') }}
         </span>
       </button>
-      <button class="preview-close" @click="$emit('close')">✕</button>
+      <button v-if="!embedded" class="preview-close" @click="$emit('close')">✕</button>
     </div>
 
     <!-- AI risk assessment panel -->
     <div v-if="riskOpen" class="preview-risk" role="status" aria-live="polite">
       <div class="preview-risk-body">
         <span v-if="mergeRiskError" class="preview-risk-error">{{ mergeRiskError }}</span>
-        <span v-else-if="isMergeRiskAssessing && !riskText">{{ t('mergePreview.aiRiskAnalyzing') }}</span>
+        <span v-else-if="isMergeRiskAssessing && !riskText" class="ai-loading">{{ t('mergePreview.aiRiskAnalyzing') }}</span>
         <span v-else>{{ riskText }}</span>
       </div>
       <button v-if="!isMergeRiskAssessing" class="preview-risk-close" @click="dismissRisk">✕</button>
@@ -176,7 +176,9 @@
     </div>
 
     <!-- ─── Apply from preview (v3.11.0) ─────────────────── -->
-    <div v-if="summary.conflictingFiles > 0" class="preview-apply">
+    <!-- In the merge-back dialog a clean preview still needs its button:
+         the dialog has no other way to run the operation. -->
+    <div v-if="summary.conflictingFiles > 0 || embedded" class="preview-apply">
       <button
         type="button"
         class="btn btn--primary preview-apply__btn"
@@ -184,12 +186,13 @@
         @click="emit('apply')"
       >
         <span v-if="props.applying">… {{ t('mergePreview.applying') }}</span>
-        <span v-else>{{ t('mergePreview.applyAndMerge') }}</span>
+        <span v-else-if="summary.conflictingFiles > 0">{{ t('mergePreview.applyAndMerge') }}</span>
+        <span v-else>{{ t('mergePreview.applyClean') }}</span>
       </button>
       <!-- "Estimated" is load-bearing: the simulation and the real operation
            use different merge algorithms and can see a different file set, so
            this number is a prediction, not a promise. -->
-      <span class="preview-apply__estimate">
+      <span v-if="summary.conflictingFiles > 0" class="preview-apply__estimate">
         {{ t('mergePreview.applyEstimate',
               String(estimatedAutoResolutions),
               String(estimatedAutoResolutions + heldByThreshold + manualHunks)) }}
@@ -204,7 +207,7 @@
     />
 
     <!-- ─── Scratch worktree (v2.20.0) ───────────────────── -->
-    <div v-if="summary.conflictingFiles > 0" class="preview-scratch">
+    <div v-if="summary.conflictingFiles > 0 && !embedded" class="preview-scratch">
       <!-- Error from the last scratch operation -->
       <div v-if="scratchError" class="preview-scratch-error" role="alert">
         {{ scratchError }}
@@ -288,6 +291,11 @@ const props = defineProps<{
   applying?: boolean;
   /** v3.11 — what the last apply did, if one has run. */
   applyOutcome?: ApplyOutcome | null;
+  /**
+   * v3.13 — inside the merge-back dialog, which fixes the operation and
+   * the checkout: no operation tabs, no scratch worktree, no close button.
+   */
+  embedded?: boolean;
 }>();
 
 const emit = defineEmits<{
