@@ -11,6 +11,8 @@ import {
   CLOSED_AUTO_MERGE,
   UNSUPPORTED_AUTO_MERGE,
   CICheck,
+  type CICheckRaw,
+  mapCICheck,
   CIAnnotation,
   CIAnnotationRaw,
   mapAnnotation,
@@ -18,6 +20,7 @@ import {
   PrReview,
   ReviewerCandidate,
   PrReaction,
+  type PrEdit,
 } from "./backend-pr";
 
 // ─── GitLab / glab CLI wrappers (§2.x Forge integrations) ──────────────────
@@ -147,15 +150,10 @@ export async function glMrDiff(cwd: string, iid: number): Promise<string> {
 /** Get CI pipeline status for a MR. */
 export async function glMrPipelines(cwd: string, iid: number): Promise<CICheck[]> {
   if (!isTauri()) return [];
-  const raw = await tauriInvoke<
-    { name: string; state: string; conclusion: string; details_url: string }[]
-  >("gl_mr_pipelines", { cwd, iid });
-  // Rust's `CICheck` has no `#[serde(rename_all = "camelCase")]`, so this is
-  // snake_case off the wire — map `details_url` -> `detailsUrl` or the CI
-  // tab's pipeline-link button (`v-if="c.detailsUrl"`) never renders (#161).
-  return raw.map((c) => ({
-    name: c.name, state: c.state, conclusion: c.conclusion, detailsUrl: c.details_url,
-  }));
+  // snake_case off the wire: without the mapping, the CI tab's pipeline-link
+  // button (`v-if="c.detailsUrl"`) never renders (#161).
+  const raw = await tauriInvoke<CICheckRaw[]>("gl_mr_pipelines", { cwd, iid });
+  return raw.map(mapCICheck);
 }
 
 /** Get codequality annotations for a MR (v2.18). Returns [] when no report exists. */
@@ -238,6 +236,12 @@ export async function glCheckoutMr(cwd: string, iid: number): Promise<void> {
 export async function glConvertDraftToReady(cwd: string, iid: number): Promise<void> {
   if (!isTauri()) throw new Error("glConvertDraftToReady requires Tauri");
   return tauriInvoke<void>("gl_convert_draft_to_ready", { cwd, iid });
+}
+
+/** Edit a MR's title and/or description; an omitted field is left unchanged. */
+export async function glMrEdit(cwd: string, iid: number, edit: PrEdit): Promise<void> {
+  if (!isTauri()) throw new Error("glMrEdit requires Tauri");
+  return tauriInvoke<void>("gl_mr_edit", { cwd, iid, title: edit.title ?? null, body: edit.body ?? null });
 }
 
 /**

@@ -11,7 +11,8 @@
  */
 
 import { isTauri, tauriInvoke, DEV_SERVER } from "./backend-core";
-import type { PullRequest, PullRequestDetail, CICheck, PrReviewComment, PrReview, ReviewerCandidate } from "./backend-pr";
+import type { PullRequest, PullRequestDetail, CICheck, CICheckRaw, PrReviewComment, PrReview, ReviewerCandidate, PrEdit } from "./backend-pr";
+import { mapCICheck } from "./backend-pr";
 import type { Issue } from "./backend";
 
 async function devGet<T>(route: string, params: Record<string, string>): Promise<T> {
@@ -62,8 +63,10 @@ export async function giteaPrDiff(cwd: string, index: number): Promise<string> {
 }
 
 export async function giteaPrStatus(cwd: string, index: number): Promise<CICheck[]> {
-  if (isTauri()) return tauriInvoke<CICheck[]>("gitea_pr_status", { cwd, index });
-  return devGet<CICheck[]>("gitea-pr-status", { cwd, index: String(index) });
+  const raw = isTauri()
+    ? await tauriInvoke<CICheckRaw[]>("gitea_pr_status", { cwd, index })
+    : await devGet<CICheckRaw[]>("gitea-pr-status", { cwd, index: String(index) });
+  return raw.map(mapCICheck);
 }
 
 export async function giteaPrComments(cwd: string, index: number): Promise<PrReviewComment[]> {
@@ -143,6 +146,12 @@ export async function giteaCheckoutPr(cwd: string, index: number): Promise<void>
 export async function giteaConvertDraftToReady(cwd: string, index: number): Promise<void> {
   if (!isTauri()) throw new Error("giteaConvertDraftToReady requires Tauri");
   return tauriInvoke<void>("gitea_convert_draft_to_ready", { cwd, index });
+}
+
+/** Edit a PR's title and/or description; an omitted field is left unchanged. */
+export async function giteaPrEdit(cwd: string, index: number, edit: PrEdit): Promise<void> {
+  if (!isTauri()) throw new Error("giteaPrEdit requires Tauri");
+  return tauriInvoke<void>("gitea_pr_edit", { cwd, index, title: edit.title ?? null, body: edit.body ?? null });
 }
 
 export async function giteaCreateComment(

@@ -1223,6 +1223,19 @@ fn rest_pr_ready(cwd: &str, number: i64) -> Result<(), String> {
     Ok(())
 }
 
+fn rest_pr_edit(
+    cwd: &str,
+    number: i64,
+    title: &Option<String>,
+    body: &Option<String>,
+) -> Result<(), String> {
+    let payload = super::pr_edit::edit_payload(title, body, "description")?;
+    let r = azure_repo(cwd)?;
+    let url = with_api_version(&format!("{}/pullrequests/{}", r.api_base(), number));
+    az_json("PATCH", &url, Some(&payload.to_string()))?;
+    Ok(())
+}
+
 fn rest_checkout_pr(cwd: &str, number: i64) -> Result<(), String> {
     let (_r, pr) = get_pr_json(cwd, number)?;
     let source = short_ref(&js(&pr, "sourceRefName"));
@@ -1367,6 +1380,20 @@ fn rest_pr_create_comment(cwd: &str, number: i64, body: &str) -> Result<serde_js
 
 /// Map an Azure policy-evaluation `status` to (state, conclusion) in the
 /// vocabulary the frontend merge-readiness logic understands.
+/// A pending policy is "queued" only when a build will move it by itself (a
+/// build validation policy with automatic queueing). Any other one (reviewers,
+/// comment resolution, work item linking, a status an external service has not
+/// posted, a build someone must queue by hand) waits on a person or on someone
+/// else: "waiting", which the CI tab shows as pending but does not poll
+/// (utils/ciChecks.ts).
+fn pending_policy_state(automatic_build: bool, state: &'static str) -> &'static str {
+    if state == "queued" && !automatic_build {
+        "waiting"
+    } else {
+        state
+    }
+}
+
 fn map_policy_status(status: &str) -> (&'static str, &'static str) {
     match status {
         "approved" => ("completed", "SUCCESS"),
@@ -1381,16 +1408,17 @@ fn map_policy_status(status: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Resolve a build's real outcome to `(state, conclusion)`. Build-validation
-/// policy evaluations can report `queued` while the build itself has already
-/// completed — possibly failed — so the build result is the source of truth.
-/// Best-effort: returns `None` on any error so the caller keeps the policy
-/// status. A still-running build maps to pending (yellow).
+/// Resolve a build's real outcome to `(state, conclusion, commit)`.
+/// Build-validation policy evaluations can report `queued` while the build
+/// itself has already completed — possibly failed — so the build result is the
+/// source of truth. Best-effort: returns `None` on any error so the caller keeps
+/// the policy status. A still-running build maps to pending (yellow). `commit`
+/// is the PR head the build ran for (see `az_build_pr_source_sha`).
 fn azure_build_outcome(
     org: &str,
     project: &str,
     build_id: i64,
-) -> Option<(&'static str, &'static str)> {
+) -> Option<(&'static str, &'static str, String)> {
     let url = format!(
         "https://dev.azure.com/{}/{}/_apis/build/builds/{}?api-version=7.1",
         urlenc(org),
@@ -1398,16 +1426,30 @@ fn azure_build_outcome(
         build_id,
     );
     let v = az_json("GET", &url, None).ok()?;
+    let sha = az_build_pr_source_sha(&v);
     // `status`: notStarted / inProgress / completed / cancelling / postponed.
     if js(&v, "status") != "completed" {
-        return Some(("in_progress", ""));
+        return Some(("in_progress", "", sha));
     }
     // `result`: succeeded / partiallySucceeded / failed / canceled.
-    Some(match js(&v, "result").as_str() {
+    let (state, conclusion) = match js(&v, "result").as_str() {
         "succeeded" => ("completed", "SUCCESS"),
         "failed" | "partiallySucceeded" | "canceled" => ("completed", "FAILURE"),
         _ => ("completed", ""),
-    })
+    };
+    Some((state, conclusion, sha))
+}
+
+/// The PR head commit a build ran for: `triggerInfo["pr.sourceSha"]`. Not the
+/// build's `sourceVersion`, which for a PR build is the merge commit Azure
+/// made, never the PR's head. "" when the build was not triggered by a PR.
+fn az_build_pr_source_sha(build: &serde_json::Value) -> String {
+    build
+        .get("triggerInfo")
+        .and_then(|t| t.get("pr.sourceSha"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Rank a check's `conclusion` by how "resolved & positive" it is, so duplicate
@@ -1471,6 +1513,16 @@ fn rollup_from_checks(checks: &[CICheck]) -> String {
     }
 }
 
+/// True when the policy-evaluations API is simply not available for this repo
+/// or user: 400 (preview API refused), 403 (no permission on policies) or 404
+/// (none configured). Other errors (429 rate limiting, 5xx, network) are a
+/// failed fetch. Matches the error `finalize_json` builds.
+fn az_policies_unavailable(err: &str) -> bool {
+    ["400", "403", "404"]
+        .iter()
+        .any(|code| err.starts_with(&format!("Azure DevOps API error ({})", code)))
+}
+
 fn rest_pr_checks(cwd: &str, number: i64) -> Result<Vec<CICheck>, String> {
     let (r, pr) = get_pr_json(cwd, number)?;
     let project_id = pr
@@ -1492,10 +1544,13 @@ fn rest_pr_checks(cwd: &str, number: i64) -> Result<Vec<CICheck>, String> {
         urlenc(project_id),
         urlenc(&artifact),
     );
-    // Policies may be disabled on the repo — treat any failure as "no checks".
+    // Policies unavailable (see az_policies_unavailable): no evaluations, and
+    // the reviewer fallback below still applies. Anything else is a failed
+    // fetch and stays an error, so the CI tab keeps a running list on screen.
     let v = match az_json("GET", &url, None) {
         Ok(v) => v,
-        Err(_) => return Ok(Vec::new()),
+        Err(e) if az_policies_unavailable(&e) => serde_json::Value::Null,
+        Err(e) => return Err(e),
     };
     let evals = v
         .get("value")
@@ -1560,6 +1615,13 @@ fn rest_pr_checks(cwd: &str, number: i64) -> Result<Vec<CICheck>, String> {
                 None => name.clone(),
             };
             let (mut state, mut conclusion) = map_policy_status(&js(e, "status"));
+            // A build policy set to manual queueing waits on a person too.
+            let manual_build = settings
+                .and_then(|s| s.get("manualQueueOnly"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            state = pending_policy_state(build_def_id.is_some() && !manual_build, state);
+            let mut commit_sha = String::new();
             let is_expired = e
                 .get("context")
                 .and_then(|c| c.get("isExpired"))
@@ -1581,9 +1643,10 @@ fn rest_pr_checks(cwd: &str, number: i64) -> Result<Vec<CICheck>, String> {
                 // shows "1 required check failed" while the policy re-evaluation
                 // is still queued). The build result is authoritative, so resolve
                 // it when a `buildId` is present and override the policy status.
-                if let Some((s, c)) = azure_build_outcome(&r.org, project_id, bid) {
+                if let Some((s, c, sha)) = azure_build_outcome(&r.org, project_id, bid) {
                     state = s;
                     conclusion = c;
+                    commit_sha = sha;
                 }
             }
             Some((
@@ -1593,6 +1656,7 @@ fn rest_pr_checks(cwd: &str, number: i64) -> Result<Vec<CICheck>, String> {
                     state: state.to_string(),
                     conclusion: conclusion.to_string(),
                     details_url: String::new(),
+                    commit_sha,
                 },
             ))
         })
@@ -1632,9 +1696,12 @@ fn pending_reviewer_check(pr: &serde_json::Value) -> Option<CICheck> {
         } else {
             "Waiting for reviewer approval".to_string()
         },
-        state: "queued".to_string(),
+        // Waits on a person: pending, not polled (see the policy loop).
+        state: "waiting".to_string(),
         conclusion: if any_rejected { "FAILURE" } else { "" }.to_string(),
         details_url: String::new(),
+        // A reviewer requirement is the PR's, not a commit's.
+        commit_sha: String::new(),
     })
 }
 
@@ -1880,6 +1947,21 @@ pub(crate) async fn az_disable_auto_merge(cwd: String, number: i64) -> Result<()
 #[tauri::command]
 pub(crate) async fn az_pr_ready(cwd: String, number: i64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || rest_pr_ready(&cwd, number))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Edit a PR's title and/or description (a `None` field is left unchanged).
+/// Azure caps descriptions at 4000 characters and rejects longer ones; its
+/// error message is surfaced as-is.
+#[tauri::command]
+pub(crate) async fn az_pr_edit(
+    cwd: String,
+    number: i64,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || rest_pr_edit(&cwd, number, &title, &body))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -2171,6 +2253,7 @@ mod tests {
             state: state.to_string(),
             conclusion: conclusion.to_string(),
             details_url: String::new(),
+            commit_sha: String::new(),
         }
     }
 
@@ -2454,5 +2537,54 @@ mod az_auto_complete_body_tests {
     fn an_unknown_method_falls_back_to_no_fast_forward() {
         let b = az_auto_complete_body(Some("id"), "nonsense");
         assert_eq!(b["completionOptions"]["mergeStrategy"], "noFastForward");
+    }
+}
+
+#[cfg(test)]
+mod az_client_error_tests {
+    use super::{az_policies_unavailable, finalize_json};
+
+    #[test]
+    fn policies_unavailable_on_400_403_404() {
+        for code in [400, 403, 404] {
+            let e = finalize_json(code, r#"{"message":"nope"}"#).unwrap_err();
+            assert!(az_policies_unavailable(&e), "{}", code);
+        }
+    }
+
+    #[test]
+    fn rate_limiting_server_errors_and_network_failures_are_failed_fetches() {
+        for code in [429, 401, 500, 503] {
+            let e = finalize_json(code, "").unwrap_err();
+            assert!(!az_policies_unavailable(&e), "{}", code);
+        }
+        assert!(!az_policies_unavailable("curl: (6) Could not resolve host"));
+    }
+}
+
+#[cfg(test)]
+mod pending_policy_state_tests {
+    use super::{az_build_pr_source_sha, pending_policy_state};
+
+    #[test]
+    fn only_build_policies_stay_queued() {
+        assert_eq!(pending_policy_state(true, "queued"), "queued");
+        assert_eq!(pending_policy_state(false, "queued"), "waiting");
+        assert_eq!(pending_policy_state(false, "in_progress"), "in_progress");
+        assert_eq!(pending_policy_state(false, "completed"), "completed");
+    }
+
+    #[test]
+    fn a_pr_build_reports_the_pr_head_it_ran_for() {
+        let build = serde_json::json!({
+            "sourceVersion": "merge-commit",
+            "triggerInfo": {"pr.number": "7", "pr.sourceSha": "head-sha"}
+        });
+        // Not sourceVersion: that is the merge commit, never the PR's head.
+        assert_eq!(az_build_pr_source_sha(&build), "head-sha");
+        assert_eq!(
+            az_build_pr_source_sha(&serde_json::json!({"sourceVersion": "x"})),
+            ""
+        );
     }
 }

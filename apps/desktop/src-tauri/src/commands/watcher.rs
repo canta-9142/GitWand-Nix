@@ -41,7 +41,9 @@ pub(crate) fn classify_path(rel: &str) -> Option<&'static str> {
         if inner == "index" {
             return Some("index");
         }
-        if inner == "config" {
+        // `info/exclude` is repo-local ignore rules; reported as "config" so
+        // the tracked-but-ignored check can re-run without a new kind.
+        if inner == "config" || inner == "info/exclude" {
             return Some("config");
         }
         if inner.starts_with("refs/") || inner == "packed-refs" {
@@ -247,6 +249,17 @@ fn broadcast(root: &PathBuf, event: &RepoChangeEvent) {
     }
 }
 
+/// True for an event that only reports a file being read: an open, a read, or
+/// a close without writing. Those never change the repository.
+fn is_read_only(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => false,
+        notify::EventKind::Access(_) => true,
+        _ => false,
+    }
+}
+
 /// Drive the debounce/coalesce state machine for one repo's raw `notify`
 /// event stream, calling `emit` for each flushed batch. Extracted from
 /// `ensure_watch` so it is testable with a plain `mpsc` channel and closure,
@@ -304,6 +317,15 @@ fn spawn_coalescer<F>(
 
             match rx.recv_timeout(wait) {
                 Ok(Ok(event)) => {
+                    // A read is not a change (#287). On Linux, notify also
+                    // reports opens and read-only closes (inotify `OPEN`,
+                    // `CLOSE_NOWRITE`): GitWand's own `git log --all` opens
+                    // every ref, and counting that as a `refs` change forced a
+                    // log reload that read the refs again, forever. A finished
+                    // write (`Close(Write)`) is still a change.
+                    if is_read_only(&event.kind) {
+                        continue;
+                    }
                     for p in event.paths {
                         // Classify at push time so noise (object churn,
                         // ignored build dirs) is never stored, not just
@@ -517,6 +539,10 @@ mod tests {
         assert_eq!(classify_path(".git/HEAD"), Some("head"));
         assert_eq!(classify_path(".git/index"), Some("index"));
         assert_eq!(classify_path(".git/config"), Some("config"));
+        // `.git/info/exclude` is an ignore file: the tracked-but-ignored check
+        // listens for it. Its siblings stay noise.
+        assert_eq!(classify_path(".git/info/exclude"), Some("config"));
+        assert_eq!(classify_path(".git/info/refs"), None);
         assert_eq!(classify_path(".git/refs/heads/main"), Some("refs"));
         assert_eq!(classify_path(".git/packed-refs"), Some("refs"));
         assert_eq!(classify_path(".git/MERGE_HEAD"), Some("mergeState"));
@@ -664,6 +690,70 @@ mod tests {
         assert_eq!(ev.paths.len(), EVENT_PATH_CAP);
         assert!(ev.truncated);
         assert_eq!(ev.kinds, vec!["worktree".to_string()]);
+    }
+
+    /// #287, end to end with the real OS watcher: `git log --all` and
+    /// `git status` only read the repository, so they must produce no event.
+    /// On Linux, inotify reports those opens; without the read filter this
+    /// test sees `refs`/`head`/`index` events. (macOS never reports reads.)
+    #[test]
+    fn reading_a_real_repo_produces_no_event() {
+        use std::process::Command;
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!("gw-watch-reads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+        };
+        run(&dir, &["init", "-q"]);
+        run(&dir, &["config", "user.email", "t@example.com"]);
+        run(&dir, &["config", "user.name", "T"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        run(&dir, &["add", "."]);
+        run(&dir, &["commit", "-qm", "init"]);
+        run(&dir, &["branch", "other"]);
+        let root = std::fs::canonicalize(&dir).unwrap();
+
+        let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = raw_tx.send(res);
+        })
+        .unwrap();
+        watcher
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .unwrap();
+        // Let the setup's own writes drain before the coalescer starts.
+        std::thread::sleep(Duration::from_millis(300));
+        while raw_rx.try_recv().is_ok() {}
+
+        let (evt_tx, evt_rx) = mpsc::channel::<RepoChangeEvent>();
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_coalescer(root.clone(), Vec::new(), raw_rx, stop.clone(), move |ev| {
+            let _ = evt_tx.send(ev);
+        });
+
+        run(&root, &["log", "--all", "-n5", "--format=%H %D"]);
+        run(
+            &root,
+            &["--no-optional-locks", "status", "--porcelain", "--branch"],
+        );
+        let _ = std::fs::read_to_string(root.join(".git/HEAD")).unwrap();
+
+        let got = evt_rx.recv_timeout(Duration::from_millis(1000));
+        stop.store(true, Ordering::Relaxed);
+        drop(watcher);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            got.is_err(),
+            "reading the repo produced: {:?}",
+            got.map(|e| (e.kinds, e.paths))
+        );
     }
 
     /// End-to-end over a real temp git repo: writing a file must produce a
@@ -912,6 +1002,76 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
     }
 
+    /// #287: on Linux, notify also reports file *opens* and read-only closes
+    /// (inotify `OPEN` / `CLOSE_NOWRITE`). GitWand's own `git log --all` opens
+    /// every ref; treating those reads as `refs`/`head` changes forced a log
+    /// reload, which read the refs again — a self-sustaining loop. A read is
+    /// not a change and must never produce an event.
+    #[test]
+    fn reads_are_not_changes() {
+        use notify::event::{AccessKind, AccessMode};
+        use std::sync::mpsc;
+
+        let root = PathBuf::from("/fake/repo/for/reads/test");
+        let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let (evt_tx, evt_rx) = mpsc::channel::<RepoChangeEvent>();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        spawn_coalescer(root.clone(), Vec::new(), raw_rx, stop.clone(), move |ev| {
+            let _ = evt_tx.send(ev);
+        });
+
+        for rel in [
+            ".git/HEAD",
+            ".git/refs/heads/main",
+            ".git/index",
+            "src/a.ts",
+        ] {
+            for kind in [
+                notify::EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                notify::EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                notify::EventKind::Access(AccessKind::Read),
+            ] {
+                let _ = raw_tx.send(Ok(notify::Event::new(kind).add_path(root.join(rel))));
+            }
+        }
+
+        let got = evt_rx.recv_timeout(Duration::from_millis(800));
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            got.is_err(),
+            "reads produced a change event: {:?}",
+            got.map(|e| e.kinds)
+        );
+    }
+
+    /// The read filter must keep real writes: inotify reports a finished write
+    /// as `CLOSE_WRITE`, which notify maps to `Access(Close(Write))`.
+    #[test]
+    fn a_close_after_write_is_still_a_change() {
+        use notify::event::{AccessKind, AccessMode};
+        use std::sync::mpsc;
+
+        let root = PathBuf::from("/fake/repo/for/close-write/test");
+        let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let (evt_tx, evt_rx) = mpsc::channel::<RepoChangeEvent>();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        spawn_coalescer(root.clone(), Vec::new(), raw_rx, stop.clone(), move |ev| {
+            let _ = evt_tx.send(ev);
+        });
+
+        let _ = raw_tx.send(Ok(notify::Event::new(notify::EventKind::Access(
+            AccessKind::Close(AccessMode::Write),
+        ))
+        .add_path(root.join(".git/refs/heads/main"))));
+
+        let got = evt_rx.recv_timeout(Duration::from_millis(800));
+        stop.store(true, Ordering::Relaxed);
+        let ev = got.expect("a close after write must produce an event");
+        assert_eq!(ev.kinds, vec!["refs".to_string()]);
+    }
+
     /// Regression test for Finding 1's raw-batch cap: an event storm that
     /// never reaches the max-wait deadline must still flush once the
     /// pre-coalesce staging batch hits `MAX_RAW_BATCH`, and must report the
@@ -1149,12 +1309,17 @@ mod tests {
         let root = temp_watch_root("reload");
         // Two subscriptions from the document that is about to be replaced,
         // plus one from a second window on the same repo.
-        let stale_a = register_subscription(&root, "main", Channel::new(|_| Ok(())));
-        let stale_b = register_subscription(&root, "main", Channel::new(|_| Ok(())));
-        let other = register_subscription(&root, "second", Channel::new(|_| Ok(())));
+        //
+        // The labels are this test's own. The subscriber registry is
+        // process-wide and tests run in parallel, so reaping a label another
+        // test also uses ("main") would drop that test's subscriptions too:
+        // `broadcast_keeps_a_live_subscriber` failed about 1 run in 40 that way.
+        let stale_a = register_subscription(&root, "reload-test-main", Channel::new(|_| Ok(())));
+        let stale_b = register_subscription(&root, "reload-test-main", Channel::new(|_| Ok(())));
+        let other = register_subscription(&root, "reload-test-second", Channel::new(|_| Ok(())));
         assert_eq!(lock_watches().get(&root).unwrap().subscriber_count, 3);
 
-        stop_all_for_webview("main");
+        stop_all_for_webview("reload-test-main");
 
         assert!(!lock_subscribers().contains_key(&stale_a));
         assert!(!lock_subscribers().contains_key(&stale_b));

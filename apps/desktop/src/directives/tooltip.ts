@@ -4,6 +4,7 @@
  * Usage:
  *   <button v-tooltip="'Push to remote'">…</button>
  *   <button v-tooltip="{ text: 'Push', position: 'left' }">…</button>
+ *   <button v-tooltip="{ text: 'Push', when: (el) => isCompact(el) }">…</button>
  *
  * Positions: "top" (default) | "bottom" | "left" | "right"
  *
@@ -18,16 +19,32 @@ type TooltipPosition = "top" | "bottom" | "left" | "right";
 interface TooltipOptions {
   text: string;
   position?: TooltipPosition;
+  /**
+   * Evaluated on hover/focus, on resize and on update with the anchor element;
+   * the tooltip is skipped (or hidden) while it returns false.
+   */
+  when?: (el: HTMLElement) => boolean;
 }
 
 interface TooltipEl extends HTMLElement {
   _tooltip?: {
     tip: HTMLElement;
     abort: AbortController;
+    reposition: () => void;
+    opts: TooltipOptions;
+    /** The anchor's own aria-describedby, restored on hide (null: none). */
+    describedBy?: string | null;
   };
+  /** Current binding value — refreshed by `updated`, read at show time. */
+  _tooltipOpts?: TooltipOptions | null;
+  /** Scopes the trigger listeners so they are bound once and removed on unmount. */
+  _tooltipListeners?: AbortController;
+  /** True when the directive set aria-label itself (icon-only anchor). */
+  _tooltipOwnsLabel?: boolean;
 }
 
 const GAP = 7; // px gap between anchor and tooltip
+let tipSeq = 0;
 
 function getOptions(value: unknown): TooltipOptions | null {
   if (!value) return null;
@@ -76,11 +93,13 @@ function place(tip: HTMLElement, anchor: HTMLElement, position: TooltipPosition)
 
 function show(el: TooltipEl, opts: TooltipOptions) {
   hide(el); // ensure clean state
+  if (opts.when && !opts.when(el)) return;
 
   const tip = document.createElement("div");
   tip.className = "gw-tooltip";
   tip.textContent = opts.text;
   tip.setAttribute("role", "tooltip");
+  tip.id = `gw-tooltip-${++tipSeq}`;
   document.body.appendChild(tip);
 
   // Auto-position: below when anchor is in the top half of the viewport,
@@ -91,8 +110,10 @@ function show(el: TooltipEl, opts: TooltipOptions) {
   };
   const pos: TooltipPosition = opts.position ?? autoPos();
 
-  // Position after paint so t.width/height are available
+  // Position after paint so t.width/height are available. A tip hidden
+  // before this frame is already fading out: don't bring it back.
   requestAnimationFrame(() => {
+    if (el._tooltip?.tip !== tip) return;
     place(tip, el, pos);
     tip.classList.add("gw-tooltip--visible");
   });
@@ -103,47 +124,126 @@ function show(el: TooltipEl, opts: TooltipOptions) {
   // Keep position fresh on scroll / resize
   const reposition = () => place(tip, el, pos);
   window.addEventListener("scroll", reposition, { signal, passive: true, capture: true });
-  window.addEventListener("resize", reposition, { signal, passive: true });
+  // A resize can also flip `when` (e.g. a breakpoint brings the label back).
+  const onResize = () => {
+    const when = (el._tooltipOpts ?? opts).when;
+    if (when && !when(el)) hide(el);
+    else reposition();
+  };
+  window.addEventListener("resize", onResize, { signal, passive: true });
 
-  el._tooltip = { tip, abort };
+  el._tooltip = { tip, abort, reposition, opts };
+  describe(el, tip, opts.text);
 }
 
+/**
+ * While shown, link the tooltip as the anchor's description, so a screen
+ * reader announces it on focus — what a native `title` used to provide.
+ * Skipped when the text already is the anchor's accessible name (icon-only
+ * anchor, identical aria-label or visible text): it would be read twice.
+ */
+function describe(el: TooltipEl, tip: HTMLElement, text: string) {
+  const visible = el._tooltip;
+  if (!visible) return;
+  const name = el.getAttribute("aria-label") ?? el.textContent?.trim() ?? "";
+  if (el._tooltipOwnsLabel || name === text.trim()) return;
+  const own = el.getAttribute("aria-describedby");
+  visible.describedBy = own;
+  el.setAttribute("aria-describedby", own ? `${own} ${tip.id}` : tip.id);
+}
+
+/** Matches the `.gw-tooltip--leaving` opacity transition in main.css. */
+const FADE_OUT_MS = 500;
+
+/**
+ * Detach the anchor's tooltip and fade it out; the element is removed once the
+ * fade is over. A timer rather than `transitionend`, which never fires when
+ * reduced motion turns the transition off.
+ */
 function hide(el: TooltipEl) {
   if (!el._tooltip) return;
-  const { tip, abort } = el._tooltip;
+  const { tip, abort, describedBy } = el._tooltip;
   abort.abort();
-  tip.remove();
   delete el._tooltip;
+  if (describedBy !== undefined) {
+    if (describedBy) el.setAttribute("aria-describedby", describedBy);
+    else el.removeAttribute("aria-describedby");
+  }
+  tip.classList.remove("gw-tooltip--visible");
+  tip.classList.add("gw-tooltip--leaving");
+  setTimeout(() => tip.remove(), FADE_OUT_MS);
+}
+
+/**
+ * Icon-only anchors have no text, so without a native `title` they would have
+ * no accessible name: mirror the tooltip text into aria-label for them. An
+ * anchor with visible text, or an explicit aria-label, is left alone.
+ * Re-evaluated on every update: an anchor that gains text later (an avatar
+ * falling back to initials) gets its own name back.
+ */
+function syncAriaLabel(el: TooltipEl) {
+  const text = el._tooltipOpts?.text;
+  const iconOnly = !el.textContent?.trim();
+  if (el._tooltipOwnsLabel) {
+    if (text && iconOnly) {
+      el.setAttribute("aria-label", text);
+    } else {
+      el.removeAttribute("aria-label");
+      el._tooltipOwnsLabel = false;
+    }
+    return;
+  }
+  if (text && iconOnly && !el.hasAttribute("aria-label")) {
+    el.setAttribute("aria-label", text);
+    el._tooltipOwnsLabel = true;
+  }
 }
 
 export const vTooltip = {
   mounted(el: TooltipEl, { value }: { value: unknown }) {
-    const opts = getOptions(value);
-    if (!opts) return;
+    el._tooltipOpts = getOptions(value);
+    syncAriaLabel(el);
 
-    el.addEventListener("mouseenter", () => show(el, opts));
-    el.addEventListener("mouseleave", () => hide(el));
-    el.addEventListener("focus",      () => show(el, opts));
-    el.addEventListener("blur",       () => hide(el));
-    el.addEventListener("click",      () => hide(el));
+    // Bound once; handlers read el._tooltipOpts so `updated` never re-binds.
+    const listeners = new AbortController();
+    const { signal } = listeners;
+    const onShow = () => {
+      if (el._tooltipOpts) show(el, el._tooltipOpts);
+    };
+    const onHide = () => hide(el);
+    el.addEventListener("mouseenter", onShow, { signal });
+    el.addEventListener("mouseleave", onHide, { signal });
+    el.addEventListener("focus",      onShow, { signal });
+    el.addEventListener("blur",       onHide, { signal });
+    el.addEventListener("click",      onHide, { signal });
+    el._tooltipListeners = listeners;
   },
 
   updated(el: TooltipEl, { value }: { value: unknown }) {
-    // If the tooltip text changed while visible, re-show with new text
-    hide(el);
     const opts = getOptions(value);
-    if (!opts) return;
+    el._tooltipOpts = opts;
+    syncAriaLabel(el);
 
-    // Re-bind with fresh closure — easiest to just remove and re-add
-    // listeners by replacing the element's handler through a stored ref.
-    // Directives don't give us a clean way to do that without storing refs,
-    // so we use the unmounted + re-mounted pattern here by delegating to a
-    // shared handler set on the element.
-    el.addEventListener("mouseenter", () => show(el, opts));
-    el.addEventListener("mouseleave", () => hide(el));
+    // Parent re-renders fire this constantly (often with an identical value):
+    // leave a visible tooltip alone unless its content actually changed.
+    const visible = el._tooltip;
+    if (!visible) return;
+    if (!opts || (opts.when && !opts.when(el))) {
+      hide(el);
+    } else if (visible.opts.position !== opts.position) {
+      show(el, opts);
+    } else if (visible.tip.textContent !== opts.text) {
+      visible.tip.textContent = opts.text;
+      visible.reposition();
+    }
   },
 
   beforeUnmount(el: TooltipEl) {
     hide(el);
+    el._tooltipListeners?.abort();
+    delete el._tooltipListeners;
+    delete el._tooltipOpts;
+    if (el._tooltipOwnsLabel) el.removeAttribute("aria-label");
+    delete el._tooltipOwnsLabel;
   },
 };

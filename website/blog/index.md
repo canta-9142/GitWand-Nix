@@ -6,6 +6,42 @@ description: Technical articles on Git workflows, AI-powered conflict resolution
 # Blog
 
 <div class="blog-list">
+  <a href="/blog/lockfile-conflicts-by-ecosystem" class="blog-card">
+    <div class="blog-meta">November 12, 2026 · 11 min read</div>
+    <h2 class="blog-title">Lockfile conflicts: package-lock, pnpm-lock, yarn.lock, composer.lock, Cargo.lock — the right move for each</h2>
+    <p class="blog-excerpt">Five package managers, five different answers. npm, pnpm and Yarn Berry merge a conflicted lockfile themselves once the manifest is fixed; Composer wants you to take one branch and <code>composer require</code> the other; Cargo's FAQ says to keep the other branch's lock and run any cargo command. The command, the traps for each (an immutable install in CI, <strong>a "fix" that upgrades every dependency</strong>), and what GitWand's regeneration plan actually runs, including the places where it does less than the package manager's own documentation.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/ai-agent-conflict-rules" class="blog-card">
+    <div class="blog-meta">November 10, 2026 · 10 min read</div>
+    <h2 class="blog-title">Letting an AI agent resolve Git conflicts without risk: what it must do, and what it must never do</h2>
+    <p class="blog-excerpt">Any agent that can edit files can delete conflict markers; the risk is the operation around them. Nine rules, each mapped to a real tool of the GitWand MCP server: read the state, preview before applying, let a <strong>deterministic resolver that explains itself</strong> go first, set <code>min_confidence_score</code> explicitly, write through the tool that validates, <strong>never continue past a residual, never abort for the human</strong>, and stop with the context a person needs. Plus a block to paste into <code>AGENTS.md</code>, and four gaps we found in our own server while writing it.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/worktrees-step-by-step" class="blog-card">
+    <div class="blog-meta">November 9, 2026 · 10 min read</div>
+    <h2 class="blog-title">Git worktrees in GitWand, step by step</h2>
+    <p class="blog-excerpt">A worktree is a second checkout of the same repository; <code>git worktree add</code> gives you the folder, not the <code>.env</code>, the containers or the URL that make it runnable. A walkthrough of GitWand 3.13's worktree lifecycle in the order you meet it: describe your environment once in <code>.gitwandrc</code>, trust its commands knowingly, create from a freshly fetched base, watch <code>setup</code>, let an agent work while <code>main</code> moves, <strong>merge back as a merge, rebase or squash</strong> through the usual preview, remove with a teardown that has to succeed, and restore from the Time Machine if you needed it after all.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/rebase-vs-merge-conflicts" class="blog-card">
+    <div class="blog-meta">November 3, 2026 · 11 min read</div>
+    <h2 class="blog-title">Rebase or merge: which one gives you fewer conflicts?</h2>
+    <p class="blog-excerpt">A merge asks one three-way question about two end states; a rebase asks one per replayed commit, against a base that already contains your previous answers. That is why a rebase repeats a conflict exactly when <strong>your resolution differs from what the next commit expected</strong>, and why it can also skip one a merge cannot avoid. Three small reproducible scenarios with the stops counted, what <code>git rerere</code> removes (decisions, not pauses), and how GitWand drives a paused rebase: Continue, Skip, Abort, and an Auto-resolve loop that stops where you are needed.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/trivial-conflicts-taxonomy" class="blog-card">
+    <div class="blog-meta">November 2, 2026 · 10 min read</div>
+    <h2 class="blog-title">The conflicts you resolve by hand that were never decisions: a taxonomy</h2>
+    <p class="blog-excerpt">Git gave up on the hunk; that does not mean there was a choice to make. A field guide to the shapes that only look like work, taken from the patterns GitWand's engine actually implements: same change, one side changed, deletion against an untouched block, non-overlapping edits, whitespace, reordering, pure insertions, volatile values, imports and lockfiles. One example hunk per type, the one-sentence check that makes each resolution safe, and <strong>where GitWand stops</strong>, including one gap we found while writing it.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
+  <a href="/blog/reading-git-conflict-markers" class="blog-card">
+    <div class="blog-meta">October 13, 2026 · 8 min read</div>
+    <h2 class="blog-title">Reading a Git conflict marker: ours, theirs, base, diff3 and zdiff3</h2>
+    <p class="blog-excerpt">A reference for the few lines of text every merge tool is really reading. What sits between <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>, <code>|||||||</code>, <code>=======</code> and <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code>, why ours and theirs swap during a rebase, and why the <strong>base</strong> section Git hides by default changes which question a hunk is asking. One real conflict shown in all three styles, the one config line to set (<code>merge.conflictStyle zdiff3</code>), and how GitWand's engine uses the base: the same hunk is <code>complex</code> without it and resolved with it.</p>
+    <span class="blog-read">Read article →</span>
+  </a>
   <a href="/blog/v3-11-three-outcomes-not-two" class="blog-card">
     <div class="blog-meta">September 21, 2026 · 9 min read</div>
     <h2 class="blog-title">Three outcomes, not two: what went into GitWand v3.11</h2>

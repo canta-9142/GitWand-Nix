@@ -351,6 +351,12 @@ export default defineConfig({
           text: 'Blog',
           items: [
             { text: 'All articles', link: '/blog/' },
+            { text: 'Lockfile conflicts, per ecosystem', link: '/blog/lockfile-conflicts-by-ecosystem' },
+            { text: 'AI agents and conflicts: the rules', link: '/blog/ai-agent-conflict-rules' },
+            { text: 'Git worktrees, step by step (v3.13)', link: '/blog/worktrees-step-by-step' },
+            { text: 'Rebase or merge: fewer conflicts?', link: '/blog/rebase-vs-merge-conflicts' },
+            { text: 'Trivial conflicts: a taxonomy', link: '/blog/trivial-conflicts-taxonomy' },
+            { text: 'Reading a Git conflict marker', link: '/blog/reading-git-conflict-markers' },
             { text: 'Three outcomes, not two (v3.11)', link: '/blog/v3-11-three-outcomes-not-two' },
             { text: 'What WebMCP is, and the first Git tool on it', link: '/blog/webmcp-gitwand-merge-room' },
             { text: 'Best Git GUI clients in 2026', link: '/blog/best-git-gui-clients-2026' },
