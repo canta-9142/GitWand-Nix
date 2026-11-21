@@ -9,14 +9,18 @@
  * gitwand_resolve_hunk          → ask the connected agent to propose a resolution
  *                                 (inversion of `--llm-fallback`: the agent IS the LLM)
  * gitwand_resolve_hunk_llm      → validate + apply an LLM-proposed resolution
+ * gitwand_create_issue          → preview (default) or file a GitHub issue on
+ *                                 origin or its fork parent, after a secrets scan
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { execSync, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
-import { resolve, summarizeTiers, type MergeResult, type ConflictType } from "@gitwand/core";
+import { resolve, summarizeTiers, validateMergedContent, type MergeResult, type ConflictType, type GitWandOptions } from "@gitwand/core";
 import { resolveHunkToolDefinition, handleResolveHunk } from "./resolve_hunk.js";
+import { createIssueToolDefinition, handleCreateIssue, type ToolContext } from "./create_issue.js";
 import { detectMergeContext } from "../merge-context.js";
+import { conflictedFiles, gitBlob, gitEnv, gitOutput } from "../repo-config.js";
 import {
   buildRegenerationReport,
   loadGitwandrcResolveGeneratedFiles,
@@ -158,7 +162,7 @@ export function registerTools() {
     {
       name: "gitwand_apply_resolution",
       description:
-        "Apply a custom resolution (provided by the LLM or user) to a specific conflict hunk. Replaces the conflict markers at the given line range with the provided content. Use this for 'complex' hunks that GitWand couldn't auto-resolve.",
+        "Apply a custom resolution (provided by the LLM or user) to a specific conflict hunk. Replaces the conflict markers at the given line range with the provided content. Writes WITHOUT validating the result (no marker or syntax check): for an agent's own resolution prefer gitwand_resolve_hunk_llm, which validates before writing.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -176,7 +180,7 @@ export function registerTools() {
           },
           content: {
             type: "string",
-            description: "The resolved content to replace the conflict block with.",
+            description: "The resolved content to replace the conflict block with. An empty string removes the block entirely.",
           },
         },
         required: ["file", "line", "content"],
@@ -192,7 +196,7 @@ export function registerTools() {
       description:
         "Validate and apply an LLM-proposed resolution for a specific conflict hunk. " +
         "Reads the hunk at the given file+line, replaces it with the proposed resolution, " +
-        "validates the result (no residual markers, syntax check for JSON/YAML), and writes " +
+        "validates the result (no residual markers; for JSON, YAML and TOML, a whole-file parse once no other hunk remains), and writes " +
         "the file if the validation score meets the threshold. Returns the full audit trail " +
         "(validation score, accepted/rejected, reason). " +
         "Workflow: (1) call gitwand_status or gitwand_explain_hunk to see pending complex hunks, " +
@@ -214,7 +218,7 @@ export function registerTools() {
           },
           resolution: {
             type: "string",
-            description: "LLM-proposed resolution content — the lines that replace the conflict block.",
+            description: "LLM-proposed resolution content — the lines that replace the conflict block. An empty string removes the block entirely.",
           },
           min_score: {
             type: "number",
@@ -228,24 +232,15 @@ export function registerTools() {
         required: ["file", "line", "resolution"],
       },
     },
+    // #301 — file a GitHub issue (preview by default)
+    createIssueToolDefinition,
   ];
 }
 
 // ─── Helpers ───────────────────────────────────────────────
 
 function getConflictedFiles(cwd: string): string[] {
-  try {
-    const output = execSync("git diff --name-only --diff-filter=U", {
-      cwd,
-      encoding: "utf-8",
-    });
-    return output
-      .trim()
-      .split("\n")
-      .filter((f) => f.length > 0);
-  } catch {
-    return [];
-  }
+  return conflictedFiles(cwd);
 }
 
 // ─── Conflict Predictor helpers (rebase / cherry-pick) ─────
@@ -262,21 +257,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 
-/** Run git, returning trimmed stdout, or null on non-zero exit / spawn error. */
-function gitTry(cwd: string, args: string[]): string | null {
-  try {
-    // execFileSync passes args as a discrete array — no shell interpolation.
-    const out = execFileSync("git", args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-    return out.trim();
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Run `git merge-file` and return the merged content INCLUDING conflict markers.
  *
- * Unlike gitTry, this must NOT discard output on a non-zero exit: `git merge-file`
+ * Unlike gitOutput, this must NOT discard output on a non-zero exit: `git merge-file`
  * exits with a code equal to the number of conflicts (>0 means there ARE
  * conflicts — exactly the case the predictor cares about), and the conflict-marked
  * content is still written to stdout. Returns the content as-is (no trim, to
@@ -287,8 +271,11 @@ function gitMergeFile(cwd: string, args: string[]): string | null {
   try {
     const out = execFileSync("git", ["merge-file", ...args], {
       cwd,
+      env: gitEnv(),
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024,
     });
     return out; // clean merge, exit 0
   } catch (e: unknown) {
@@ -304,19 +291,19 @@ function gitMergeFile(cwd: string, args: string[]): string | null {
 
 /** Resolve a ref to a commit SHA, or null if unknown/invalid. */
 function revParse(cwd: string, rev: string): string | null {
-  return gitTry(cwd, ["rev-parse", "--verify", "--quiet", `${rev}^{commit}`]);
+  return gitOutput(cwd, ["rev-parse", "--verify", "--quiet", `${rev}^{commit}`]);
 }
 
 /** Files changed between two revs (name-only). */
 function changedFiles(cwd: string, base: string, rev: string): string[] {
-  const out = gitTry(cwd, ["diff", "--name-only", base, rev]);
+  const out = gitOutput(cwd, ["diff", "--name-only", base, rev]);
   if (!out) return [];
   return out.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
 /** Read a file's blob at a given rev, or null if absent at that rev. */
 function showBlob(cwd: string, rev: string, file: string): string | null {
-  return gitTry(cwd, ["show", `${rev}:${file}`]);
+  return gitBlob(cwd, rev, file);
 }
 
 interface SimulatedFile {
@@ -365,8 +352,8 @@ function simulate3way(cwd: string, ancestor: string, ours: string, theirs: strin
       writeFileSync(pTheirs, theirsBlob, "utf-8");
 
       // git merge-file -p --diff3 <ours> <base> <theirs> → markered content on stdout.
-      // Must use gitMergeFile, not gitTry: merge-file exits non-zero on conflict
-      // (the very case we want), and gitTry would discard the conflict content.
+      // Must use gitMergeFile, not gitOutput: merge-file exits non-zero on conflict
+      // (the very case we want), and gitOutput would discard the conflict content.
       const merged = gitMergeFile(cwd, ["-p", "--diff3", pOurs, pBase, pTheirs]);
       out.push({ file, content: merged ?? "", addDelete: false });
     }
@@ -473,6 +460,7 @@ export async function handleToolCall(
   name: string,
   args: Record<string, unknown>,
   defaultCwd: string,
+  ctx: ToolContext = {},
 ) {
   const cwd = (args.cwd as string) || defaultCwd;
 
@@ -491,6 +479,8 @@ export async function handleToolCall(
       return handleResolveHunk(args);
     case "gitwand_resolve_hunk_llm":
       return toolResolvHunkLlm(cwd, args);
+    case "gitwand_create_issue":
+      return handleCreateIssue(cwd, args, ctx);
     default:
       return { content: [{ type: "text" as const, text: `Unknown tool: ${name}` }], isError: true };
   }
@@ -780,8 +770,8 @@ function previewResponse(
   previews: Array<Record<string, unknown>>,
   addDeleteCount = 0,
   // accuracy lot D (task 3, § 4) — only ever populated by the merge branch of
-  // `toolPreview` (the sole "real resolve() site" among the 3 preview
-  // operations, per the brief's scope ruling); `undefined` for rebase/cherry-pick.
+  // `toolPreview`; `undefined` for rebase/cherry-pick, whose simulated files
+  // are not in the working tree.
   regenerationPlans?: RegenerationReportEntry[],
 ) {
   const totalConflicts = previews.reduce((s: number, r) => s + ((r.totalConflicts as number) ?? 0), 0);
@@ -831,8 +821,36 @@ function previewResponse(
   };
 }
 
+/**
+ * Resolution options for a simulated rebase or cherry-pick: the same repo
+ * settings and confidence bar as the merge preview, with a merge context that
+ * names the simulated operation. In both simulations "ours" is the side being
+ * applied onto (`onto` for a rebase, HEAD for a cherry-pick).
+ */
+function simulationResolveOptions(
+  cwd: string,
+  args: Record<string, unknown>,
+  operation: "rebase" | "cherry-pick",
+  oursRef: string,
+  theirsRef: string,
+): GitWandOptions {
+  const minConfidenceScore =
+    typeof args.min_confidence_score === "number" &&
+    Number.isFinite(args.min_confidence_score) &&
+    args.min_confidence_score >= 0 &&
+    args.min_confidence_score <= 100
+      ? args.min_confidence_score
+      : loadGitwandrcMinConfidenceScore(cwd);
+  return {
+    mergeContext: { operation, targetSide: "ours", oursRef, theirsRef },
+    conventions: loadPersistedConventions(cwd),
+    resolveGeneratedFiles: loadGitwandrcResolveGeneratedFiles(cwd),
+    minConfidenceScore,
+  };
+}
+
 /** Build per-file `resolve()` previews from the simulated 3-way conflict set. */
-function previewsFromSimulation(sims: SimulatedFile[]) {
+function previewsFromSimulation(sims: SimulatedFile[], options: GitWandOptions) {
   let addDeleteCount = 0;
   const previews = sims.map((sim) => {
     if (sim.addDelete) {
@@ -851,7 +869,10 @@ function previewsFromSimulation(sims: SimulatedFile[]) {
       return { path: sim.file, totalConflicts: 0, autoResolved: 0, remaining: 0 } as Record<string, unknown>;
     }
     try {
-      const result = resolve(sim.content, sim.file, { explainOnly: true });
+      // Run the real resolution, not `explainOnly` (which classifies without
+      // resolving, so every hunk would count as remaining). Nothing is written:
+      // the content is the in-memory simulation.
+      const result = resolve(sim.content, sim.file, options);
       return serializeResult(sim.file, result) as Record<string, unknown>;
     } catch (err: any) {
       return { path: sim.file, error: err.message } as Record<string, unknown>;
@@ -875,14 +896,14 @@ async function toolPreviewRebase(cwd: string, args: Record<string, unknown>) {
   if (!headSha) {
     return { content: [{ type: "text" as const, text: "Cannot resolve HEAD (empty repository?)." }], isError: true };
   }
-  const mergeBase = gitTry(cwd, ["merge-base", headSha, onto]);
+  const mergeBase = gitOutput(cwd, ["merge-base", headSha, onto]);
   if (!mergeBase) {
     return { content: [{ type: "text" as const, text: `No common ancestor between HEAD and ${onto}.` }], isError: true };
   }
 
   // Replay commits oldest-first: per-commit 3-way preview.
   // Orientation per commit: ours = onto (target base), theirs = commit (replayed).
-  const commitsRaw = gitTry(cwd, ["rev-list", "--reverse", `${mergeBase}..${headSha}`]);
+  const commitsRaw = gitOutput(cwd, ["rev-list", "--reverse", `${mergeBase}..${headSha}`]);
   const commits = commitsRaw ? commitsRaw.split("\n").filter((c) => c.trim()) : [];
   const allSims: SimulatedFile[] = [];
   for (const c of commits) {
@@ -907,7 +928,10 @@ async function toolPreviewRebase(cwd: string, args: Record<string, unknown>) {
   if (sims.length === 0) {
     return { content: [{ type: "text" as const, text: JSON.stringify({ operation: "rebase", message: "No overlapping changes — rebase predicted clean.", risk: "low" }, null, 2) }] };
   }
-  const { previews, addDeleteCount } = previewsFromSimulation(sims);
+  const { previews, addDeleteCount } = previewsFromSimulation(
+    sims,
+    simulationResolveOptions(cwd, args, "rebase", onto, "HEAD"),
+  );
   return previewResponse("rebase", sims.length, previews, addDeleteCount);
 }
 
@@ -933,7 +957,10 @@ async function toolPreviewCherryPick(cwd: string, args: Record<string, unknown>)
   if (sims.length === 0) {
     return { content: [{ type: "text" as const, text: JSON.stringify({ operation: "cherry-pick", message: "No overlapping changes — cherry-pick predicted clean.", risk: "low" }, null, 2) }] };
   }
-  const { previews, addDeleteCount } = previewsFromSimulation(sims);
+  const { previews, addDeleteCount } = previewsFromSimulation(
+    sims,
+    simulationResolveOptions(cwd, args, "cherry-pick", "HEAD", commit),
+  );
   return previewResponse("cherry-pick", sims.length, previews, addDeleteCount);
 }
 
@@ -1006,7 +1033,8 @@ async function toolApply(cwd: string, args: Record<string, unknown>) {
   const targetLine = args.line as number;
   const newContent = args.content as string;
 
-  if (!file || targetLine === undefined || !newContent) {
+  // An empty string is a valid resolution: it removes the whole block.
+  if (!file || targetLine === undefined || typeof newContent !== "string") {
     return { content: [{ type: "text" as const, text: "Missing required arguments: file, line, and content." }], isError: true };
   }
 
@@ -1028,7 +1056,7 @@ async function toolApply(cwd: string, args: Record<string, unknown>) {
     if (line.startsWith("<<<<<<<") && currentLine === targetLine) {
       // Found the target conflict block — replace it
       inConflict = true;
-      result.push(...newContent.split("\n"));
+      if (newContent !== "") result.push(...newContent.split("\n"));
       replaced = true;
     } else if (line.startsWith(">>>>>>>") && inConflict) {
       // End of the conflict block we're replacing
@@ -1085,7 +1113,7 @@ async function toolApply(cwd: string, args: Record<string, unknown>) {
  *
  * Validation scoring (0–100) :
  * - Residual conflict markers found → 0
- * - Syntax error (JSON/YAML) → 0
+ * - Syntax error (JSON/YAML/TOML) → 0
  * - All OK → 100
  * Default threshold: 80 (configurable via `min_score`).
  */
@@ -1096,7 +1124,8 @@ async function toolResolvHunkLlm(cwd: string, args: Record<string, unknown>) {
   const minScore = (args.min_score as number) ?? 80;
   const dryRun = (args.dry_run as boolean) ?? false;
 
-  if (!file || targetLine === undefined || !resolution) {
+  // An empty string is a valid resolution: it removes the whole block.
+  if (!file || targetLine === undefined || typeof resolution !== "string") {
     return {
       content: [{ type: "text" as const, text: "Missing required arguments: file, line, and resolution." }],
       isError: true,
@@ -1124,7 +1153,7 @@ async function toolResolvHunkLlm(cwd: string, args: Record<string, unknown>) {
   for (const line of lines) {
     if (line.startsWith("<<<<<<<") && currentLine === targetLine) {
       inConflict = true;
-      candidateLines.push(...resolution.split("\n"));
+      if (resolution !== "") candidateLines.push(...resolution.split("\n"));
       replaced = true;
     } else if (line.startsWith(">>>>>>>") && inConflict) {
       inConflict = false;
@@ -1151,19 +1180,24 @@ async function toolResolvHunkLlm(cwd: string, args: Record<string, unknown>) {
   const candidateContent = candidateLines.join("\n");
 
   // ─── Validation ────────────────────────────────────────────────────────────
-  // Check 1: residual conflict markers
+  // Check 1: residual conflict markers in the LLM's ANSWER only. The rest of
+  // the file may legitimately still contain other, unresolved hunks.
   const RESIDUAL_MARKER_RE = /^(<{7}\s|>{7}\s|\|{7}\s|={7}$)/m;
-  const hasResidualMarkers = RESIDUAL_MARKER_RE.test(candidateContent);
+  const hasResidualMarkers = RESIDUAL_MARKER_RE.test(resolution);
 
-  // Check 2: syntax for JSON/YAML
+  // Check 2: syntax for structured formats (JSON, YAML, TOML), with the same
+  // parsers the core engine uses on its own resolutions. A whole-file parse can
+  // only succeed once no markers remain anywhere in the candidate; otherwise
+  // skip it (and say so).
+  const otherHunksRemain = RESIDUAL_MARKER_RE.test(candidateContent);
+  const structuredFormat = /\.(jsonc?|ya?ml|toml)$/i.test(file);
   let syntaxError: string | null = null;
-  if (!hasResidualMarkers) {
-    if (/\.json(c)?$/i.test(file)) {
-      try { JSON.parse(candidateContent); } catch (e: any) { syntaxError = `JSON: ${e.message}`; }
-    } else if (/\.ya?ml$/i.test(file)) {
-      // Simple presence check for YAML — full parse not available without yaml dep
-      // (MCP package doesn't bundle yaml, but core does. Check basic structure.)
-      syntaxError = null; // Accept as-is; core validation handles this
+  let syntaxCheckSkipped: string | null = null;
+  if (!hasResidualMarkers && structuredFormat) {
+    if (otherHunksRemain) {
+      syntaxCheckSkipped = "Syntax check skipped: other conflict hunks (markers) remain in the file. It runs when the last hunk is resolved.";
+    } else {
+      syntaxError = validateMergedContent(candidateContent, file).syntaxError;
     }
   }
 
@@ -1207,6 +1241,7 @@ async function toolResolvHunkLlm(cwd: string, args: Record<string, unknown>) {
         minScore,
         hasResidualMarkers,
         syntaxError,
+        syntaxCheckSkipped,
         remainingConflicts: accepted ? remainingConflicts : null,
         message: accepted
           ? dryRun

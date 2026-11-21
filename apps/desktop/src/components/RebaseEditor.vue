@@ -493,6 +493,11 @@ const hasTodo = computed(
           {{ t('rebase.abort') }}
         </button>
       </div>
+      <!-- The footer (and its error line) only exists with a todo list, which a
+           rebase resumed from another flow doesn't have — surface failures here. -->
+      <div v-if="inProgress && rebase.error.value" class="rb-error-box">
+        {{ rebase.error.value }}
+      </div>
 
       <!-- Base selection -->
       <template v-if="showBasePicker && !inProgress">
@@ -552,7 +557,7 @@ const hasTodo = computed(
                 :title="t('rebase.aiSquashHint')"
                 @click="handleSquashSuggest"
               >
-                <span v-if="isSuggestingSquash" class="rb-ai-label">
+                <span v-if="isSuggestingSquash" class="rb-ai-label ai-loading">
                   <span class="rb-ai-spinner" aria-hidden="true"></span>
                   {{ t('rebase.aiSquashApplying') }}
                 </span>

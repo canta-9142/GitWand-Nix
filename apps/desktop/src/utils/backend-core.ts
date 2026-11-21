@@ -91,6 +91,21 @@ export async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>
 }
 
 /**
+ * GET a dev-server route (`/api/…`) and parse its JSON; an error answer (a
+ * failing status, or `{ error }`) throws with the server's message. The one
+ * dev GET helper, shared by every backend-*.ts module.
+ */
+export async function devGet<T>(route: string, params: Record<string, string>, what: string): Promise<T> {
+  const res = await devFetch(`${DEV_SERVER}${route}?${new URLSearchParams(params)}`, { method: "GET" });
+  // A failing status may carry no JSON; a successful one must (a truncated or
+  // non-JSON answer throws rather than reaching the caller as null).
+  const data: unknown = res.ok ? await res.json() : await res.json().catch(() => null);
+  const error = data && typeof data === "object" && "error" in data ? (data as { error?: unknown }).error : null;
+  if (!res.ok || error) throw new Error(typeof error === "string" && error ? error : `${what} failed: ${res.status}`);
+  return data as T;
+}
+
+/**
  * Timeout presets for tauriInvoke.
  */
 export const IPC_TIMEOUT = {
@@ -109,7 +124,13 @@ export const IPC_TIMEOUT = {
  */
 export async function devTerminalOpen(
   cwd: string,
-  opts: { shell?: string; agent?: string; cols: number; rows: number },
+  opts: {
+    shell?: string;
+    agent?: string;
+    cols: number;
+    rows: number;
+    onExit?: (code: number | null) => void;
+  },
   onOutput: (chunk: string) => void,
 ): Promise<number> {
   const params = new URLSearchParams({
@@ -119,17 +140,35 @@ export async function devTerminalOpen(
   });
   if (opts.shell) params.set("shell", opts.shell);
   if (opts.agent) params.set("agent", opts.agent);
+  return devPtyStream("/api/terminal-open", params, opts.onExit, onOutput);
+}
+
+/**
+ * The dev-server's PTY stream protocol, shared by `/api/terminal-open` and
+ * `/api/worktree-run-hook`: `{id}` first, then `{chunk}`s, then `{eof, code}`.
+ * An `{error}` before the id rejects (e.g. the hook's trust gate refused).
+ */
+export function devPtyStream(
+  route: string,
+  params: URLSearchParams,
+  onExit: ((code: number | null) => void) | undefined,
+  onOutput: (chunk: string) => void,
+): Promise<number> {
   return new Promise((resolve, reject) => {
-    const es = new EventSource(`${DEV_SERVER}/api/terminal-open?${params}`);
+    const es = new EventSource(`${DEV_SERVER}${route}?${params}`);
     let resolved = false;
     es.onmessage = (ev) => {
       const payload = JSON.parse(ev.data);
-      if (!resolved && typeof payload?.id === "number") {
+      if (!resolved && typeof payload?.error === "string") {
+        es.close();
+        reject(new Error(payload.error));
+      } else if (!resolved && typeof payload?.id === "number") {
         resolved = true;
         resolve(payload.id);
       } else if (typeof payload?.chunk === "string") {
         onOutput(payload.chunk);
       } else if (payload?.eof) {
+        onExit?.(typeof payload.code === "number" ? payload.code : null);
         // Fix 5 — Explicitly close the EventSource when the shell exits so that
         // the browser's built-in auto-reconnect logic does not fire and spawn an
         // untracked shell process by hitting /api/terminal-open again.
@@ -151,7 +190,7 @@ export async function devTerminalOpen(
         // not yet started, etc.). Reject the Promise so the caller surfaces the
         // error instead of hanging forever with a ghost tab at sessionId=-1.
         es.close();
-        reject(new Error("dev server unreachable: terminal-open SSE connection failed"));
+        reject(new Error(`dev server unreachable: ${route} SSE connection failed`));
       }
     };
   });
@@ -263,7 +302,7 @@ export async function devGitClone(
 export async function devGitFetch(
   cwd: string,
   onProgress?: (p: DevCloneProgress) => void,
-): Promise<{ success: boolean; message: string; conflicts?: boolean }> {
+): Promise<{ success: boolean; message: string; conflicts?: boolean; refsChanged?: boolean }> {
   const params = new URLSearchParams({ cwd });
   return new Promise((resolve, reject) => {
     const es = new EventSource(`${DEV_SERVER}/api/git-fetch-stream?${params}`);

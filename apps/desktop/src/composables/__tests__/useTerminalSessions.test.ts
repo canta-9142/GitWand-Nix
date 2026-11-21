@@ -8,7 +8,7 @@ vi.mock("../../utils/backend", () => ({
 }));
 
 import { useTerminalSessions, __resetForTests, simulateChunkForTab } from "../useTerminalSessions";
-import { terminalClose } from "../../utils/backend";
+import { terminalClose, terminalOpen } from "../../utils/backend";
 
 describe("useTerminalSessions", () => {
   beforeEach(() => {
@@ -37,6 +37,43 @@ describe("useTerminalSessions", () => {
     await s.closeTab("/repo/a", tab.id);
     expect(terminalClose).toHaveBeenCalledWith(42);
     expect(s.tabsFor("/repo/a")).toHaveLength(0);
+  });
+
+  it("disposeCwd ferme les onglets ouverts dans un worktree, et seulement eux", async () => {
+    const s = useTerminalSessions();
+    vi.mocked(terminalOpen).mockResolvedValueOnce(1).mockResolvedValueOnce(2).mockResolvedValueOnce(3);
+    await s.openTab("/repo/a", "/repo/a", () => {});
+    const inWt = await s.openTab("/repo/a", "/wt/task/sub", () => {});
+    await s.openTab("/repo/a", "/wt/task2", () => {});
+    await s.disposeCwd("/wt/task");
+    expect(terminalClose).toHaveBeenCalledTimes(1);
+    expect(terminalClose).toHaveBeenCalledWith(2);
+    expect(s.tabsFor("/repo/a").map((t) => t.cwd)).toEqual(["/repo/a", "/wt/task2"]);
+    expect(s.activeTabId("/repo/a")).not.toBe(inWt.id);
+  });
+
+  it("openTab with spawn runs it instead of terminalOpen, read-only, and marks the tab dead on exit", async () => {
+    const s = useTerminalSessions();
+    let exit: ((code: number | null) => void) | null = null;
+    const codes: (number | null)[] = [];
+    const tab = await s.openTab("/repo/a", "/wt/x", () => {}, {
+      type: "setup",
+      title: "Setup · x",
+      readOnly: true,
+      onExit: (c) => codes.push(c),
+      spawn: async (_onChunk, onExit) => {
+        exit = onExit;
+        return 7;
+      },
+    });
+    expect(terminalOpen).not.toHaveBeenCalled();
+    expect(tab.sessionId).toBe(7);
+    expect(tab.title).toBe("Setup · x");
+    expect(tab.readOnly).toBe(true);
+    expect(tab.alive).toBe(true);
+    exit!(2);
+    expect(tab.alive).toBe(false);
+    expect(codes).toEqual([2]);
   });
 
   it("setTitleFromShell n'écrase pas un titre manuel", async () => {
@@ -105,6 +142,24 @@ describe("useTerminalSessions", () => {
     await s.disposeRepo("/repo/b");
     expect(s.tabsFor("/repo/b")).toHaveLength(0);
     expect(terminalClose).toHaveBeenCalled();
+  });
+
+  it("disposeRepo attend et ferme un onglet dont le PTY s'ouvre encore", async () => {
+    const s = useTerminalSessions();
+    let spawned!: (id: number) => void;
+    vi.mocked(terminalOpen).mockImplementationOnce(
+      () => new Promise<number>((resolve) => { spawned = resolve; }),
+    );
+    const opening = s.openTab("/repo/a", "/repo/a", () => {});
+    let disposed = false;
+    const disposing = s.disposeRepo("/repo/a").then(() => { disposed = true; });
+    await Promise.resolve();
+    expect(disposed).toBe(false); // still waiting for the spawn
+    spawned(7);
+    await disposing;
+    await opening;
+    expect(terminalClose).toHaveBeenCalledWith(7);
+    expect(s.tabsFor("/repo/a")).toHaveLength(0);
   });
 
   it("openTab crée un onglet de type 'shell' par défaut", async () => {
