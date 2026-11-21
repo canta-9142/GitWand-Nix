@@ -257,12 +257,7 @@ fn gl_mr_to_detail(mr: &serde_json::Value) -> PullRequestDetail {
             .get("user")
             .and_then(|u| u.get("can_merge"))
             .and_then(|b| b.as_bool()),
-        head_sha: mr
-            .get("diff_refs")
-            .and_then(|d| d.get("head_sha"))
-            .and_then(|s| s.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| js(mr, "sha")),
+        head_sha: gl_mr_head_sha(mr),
         auto_merge: gl_auto_merge_state(mr),
         // GitLab has no repository-level auto-merge gate (unlike GitHub's
         // "Allow auto-merge" repo setting): any MR can request it, subject
@@ -554,14 +549,20 @@ fn gl_diff_stats_from_files(files: &[serde_json::Value]) -> (i64, i64) {
     let mut deletions = 0i64;
     for f in files {
         let diff = f.get("diff").and_then(|d| d.as_str()).unwrap_or("");
+        // Count only inside hunk bodies, bounded by their `@@` counts: a
+        // removed `-- x` line is `--- x` there, and must not be mistaken for
+        // a file header (nor a header outside a hunk for a change).
+        let mut body = crate::git::HunkBody::default();
         for line in diff.lines() {
-            if line.starts_with("+++") || line.starts_with("---") {
-                continue;
-            }
-            if line.starts_with('+') {
-                additions += 1;
-            } else if line.starts_with('-') {
-                deletions += 1;
+            match body.classify(line) {
+                Some(crate::git::HunkLineKind::Add) => additions += 1,
+                Some(crate::git::HunkLineKind::Delete) => deletions += 1,
+                Some(crate::git::HunkLineKind::Context) => {}
+                None => {
+                    if line.starts_with("@@") {
+                        body = crate::git::HunkBody::from_header(line);
+                    }
+                }
             }
         }
     }
@@ -691,7 +692,7 @@ pub(crate) async fn gl_mr_diff(cwd: String, iid: i64) -> Result<String, String> 
 /// Get CI pipeline status for a MR using `glab api`.
 ///
 /// Returns the most-recent pipeline as a single-entry list (GitLab only has
-/// one "active" pipeline per MR at a time). Each job maps to a CICheck entry.
+/// one "active" pipeline per MR at a time); see `gl_pipeline_checks`.
 fn gl_mr_pipelines_inner(cwd: String, iid: i64) -> Result<Vec<CICheck>, String> {
     let endpoint = format!("projects/:fullpath/merge_requests/{}/pipelines", iid);
     let mut cmd = hidden_cmd("glab");
@@ -699,23 +700,85 @@ fn gl_mr_pipelines_inner(cwd: String, iid: i64) -> Result<Vec<CICheck>, String> 
     let output =
         output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api pipelines: {}", e))?;
 
+    // An MR with no CI answers 200 with `[]`. A failure is reported as one, so
+    // the CI tab can keep a running list on screen instead of emptying it.
     if !output.status.success() {
-        return Ok(Vec::new()); // Non-fatal — no CI configured is common
+        let err = format!(
+            "glab api pipelines: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        // CI/CD disabled for the project, or not visible: no checks to show.
+        if gl_pipelines_unavailable(&err) {
+            return Ok(Vec::new());
+        }
+        return Err(err);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let pipelines: serde_json::Value =
-        serde_json::from_str(stdout.trim()).unwrap_or(serde_json::Value::Array(vec![]));
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("glab api pipelines: {}", e))?;
+    let arr = pipelines
+        .as_array()
+        .ok_or_else(|| "glab api pipelines: not a list".to_string())?;
 
-    let arr = match pipelines.as_array() {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
-    };
+    let mut checks = gl_pipeline_checks(arr);
+    // A merged-results or merge-train pipeline cannot name its head by its
+    // sha: ask the MR which pipeline is the head's. Best-effort: on any error
+    // the check names no commit, as before.
+    if let (Some(check), Some(p)) = (checks.first_mut(), arr.first()) {
+        if gl_is_merge_ref(p) {
+            if let Ok(mr) = gl_api_mr(&cwd, iid) {
+                check.commit_sha = gl_merge_pipeline_commit(p, &mr);
+            }
+        }
+    }
+    Ok(checks)
+}
 
-    // Map each pipeline to a CICheck. `status` in GitLab:
-    // pending, running, success, failed, canceled, skipped, manual, scheduled.
-    Ok(arr
+/// The MR resource from the REST API (`head_pipeline`, `diff_refs`, …).
+fn gl_api_mr(cwd: &str, iid: i64) -> Result<serde_json::Value, String> {
+    let endpoint = format!("projects/:fullpath/merge_requests/{}", iid);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", &endpoint]).current_dir(cwd);
+    let output =
+        output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api mr: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "glab api mr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+        .map_err(|e| format!("glab api mr: {}", e))
+}
+
+/// The MR's head commit: `diff_refs.head_sha`, else `sha`.
+fn gl_mr_head_sha(mr: &serde_json::Value) -> String {
+    mr.get("diff_refs")
+        .and_then(|d| d.get("head_sha"))
+        .and_then(|s| s.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| js(mr, "sha"))
+}
+
+/// True when glab's error is a 403 or 404 (CI/CD disabled for the project, or
+/// pipelines not visible to this user), as opposed to a failed request.
+fn gl_pipelines_unavailable(err: &str) -> bool {
+    ["(HTTP 403)", "(HTTP 404)", "403 Forbidden", "404 Not Found"]
         .iter()
+        .any(|m| err.contains(m))
+}
+
+/// The MR's most recent pipeline as a single check. GitLab lists an MR's
+/// pipelines newest first, and only the newest says where the MR stands (the
+/// list's rollup, `gl_pipeline_rollup`, reads the same one): older pipelines
+/// would show a stale failure, or keep the CI tab polling an old `created` one.
+///
+/// `status` in GitLab: created, waiting_for_resource, preparing, pending,
+/// running, success, failed, canceled, skipped, manual, scheduled.
+fn gl_pipeline_checks(arr: &[serde_json::Value]) -> Vec<CICheck> {
+    arr.iter()
+        .take(1)
         .map(|p| {
             let status = js(p, "status");
             let conclusion = match status.as_str() {
@@ -732,9 +795,46 @@ fn gl_mr_pipelines_inner(cwd: String, iid: i64) -> Result<Vec<CICheck>, String> 
                 state: status.clone(),
                 conclusion,
                 details_url: js(p, "web_url"),
+                commit_sha: gl_pipeline_head_sha(p),
             }
         })
-        .collect())
+        .collect()
+}
+
+/// The MR head a pipeline ran on: its `sha`, which until the new head's
+/// pipeline is created is still the previous commit's. "" for a merged-results
+/// pipeline (`refs/merge-requests/<iid>/merge`) or a merge train's
+/// (`.../train`): their `sha` is a temporary merge commit, never the head.
+fn gl_pipeline_head_sha(p: &serde_json::Value) -> String {
+    if gl_is_merge_ref(p) {
+        return String::new();
+    }
+    js(p, "sha")
+}
+
+/// A merged-results (`refs/merge-requests/<iid>/merge`) or merge-train
+/// (`.../train`) pipeline, which runs on a temporary merge commit.
+fn gl_is_merge_ref(p: &serde_json::Value) -> bool {
+    let r = js(p, "ref");
+    let mr_ref = r.strip_prefix("refs/merge-requests/").unwrap_or("");
+    mr_ref.ends_with("/merge") || mr_ref.ends_with("/train")
+}
+
+/// The commit a merged-results pipeline stands for. GitLab names the head's
+/// pipeline in the MR's `head_pipeline`: that one is reported as the MR's
+/// head. An older one keeps its own (merge) sha, which is never the head, so
+/// the CI tab reads it as another commit's.
+fn gl_merge_pipeline_commit(p: &serde_json::Value, mr: &serde_json::Value) -> String {
+    let head_pipeline = mr
+        .get("head_pipeline")
+        .filter(|h| !h.is_null())
+        .map(|h| ji(h, "id"))
+        .unwrap_or(0);
+    if head_pipeline != 0 && ji(p, "id") == head_pipeline {
+        gl_mr_head_sha(mr)
+    } else {
+        js(p, "sha")
+    }
 }
 
 #[tauri::command]
@@ -1326,6 +1426,46 @@ fn gl_convert_draft_to_ready_inner(cwd: String, iid: i64) -> Result<(), String> 
 #[tauri::command]
 pub(crate) async fn gl_convert_draft_to_ready(cwd: String, iid: i64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || gl_convert_draft_to_ready_inner(cwd, iid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Edit a MR's title and/or description via `glab api` (`-f` sends each
+/// value as a raw string).
+fn gl_mr_edit_inner(
+    cwd: String,
+    iid: i64,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), String> {
+    let fields = super::pr_edit::edit_fields(&title, &body, "description")?;
+    let endpoint = format!("projects/:fullpath/merge_requests/{}", iid);
+    let mut cmd = hidden_cmd("glab");
+    cmd.args(["api", "-X", "PUT", &endpoint]);
+    for (k, v) in &fields {
+        cmd.args(["-f", &format!("{}={}", k, v)]);
+    }
+    cmd.current_dir(&cwd);
+    let output =
+        output_with_timeout(cmd, GLAB_TIMEOUT).map_err(|e| format!("glab api edit MR: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gl edit MR failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn gl_mr_edit(
+    cwd: String,
+    iid: i64,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || gl_mr_edit_inner(cwd, iid, title, body))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -2176,6 +2316,17 @@ mod gl_diff_stats_from_files_tests {
     }
 
     #[test]
+    fn counts_hunk_lines_whose_content_starts_with_dash_dash_or_plus_plus() {
+        // A removed SQL comment `-- note` is the diff line `--- note`, an added
+        // `++x` is `+++x`: inside a hunk they are changes, not file headers.
+        let files = vec![json!({
+            "new_path": "q.sql",
+            "diff": "--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,3 @@\n--- note\n+++x\n ctx\n---- y\n++++ z\n"
+        })];
+        assert_eq!(gl_diff_stats_from_files(&files), (2, 2));
+    }
+
+    #[test]
     fn empty_file_list_is_zero_zero() {
         assert_eq!(gl_diff_stats_from_files(&[]), (0, 0));
     }
@@ -2711,5 +2862,105 @@ mod gl_disable_auto_merge_args_tests {
             .any(|a| a.contains("merge_when_pipeline_succeeds=")));
         assert!(!args.iter().any(|a| a == "-f"));
         assert!(!args.iter().any(|a| a == "PUT"));
+    }
+}
+
+#[cfg(test)]
+mod gl_pipeline_checks_tests {
+    use super::{gl_is_merge_ref, gl_merge_pipeline_commit, gl_pipeline_checks};
+    use serde_json::json;
+
+    #[test]
+    fn keeps_only_the_most_recent_pipeline() {
+        // GitLab lists an MR's pipelines newest first; an old failed one must
+        // not show as a check (nor keep a "created" one polled for ever).
+        let arr = json!([
+            {"id": 30, "status": "success", "web_url": "u30", "sha": "c30"},
+            {"id": 20, "status": "failed", "web_url": "u20"},
+            {"id": 10, "status": "created", "web_url": "u10"}
+        ]);
+        let checks = gl_pipeline_checks(arr.as_array().unwrap());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "Pipeline #30");
+        assert_eq!(checks[0].conclusion, "SUCCESS");
+        assert_eq!(checks[0].details_url, "u30");
+        // The pipeline's commit, which after a push may not be the MR's head yet.
+        assert_eq!(checks[0].commit_sha, "c30");
+    }
+
+    #[test]
+    fn a_merged_results_pipeline_does_not_name_a_head() {
+        // Its sha is the temporary merge commit GitLab made, never the head.
+        for r in ["refs/merge-requests/7/merge", "refs/merge-requests/7/train"] {
+            let arr = json!([{"id": 1, "status": "success", "sha": "m", "ref": r}]);
+            assert_eq!(
+                gl_pipeline_checks(arr.as_array().unwrap())[0].commit_sha,
+                "",
+                "{}",
+                r
+            );
+        }
+        // A branch pipeline names its head, whatever the branch is called.
+        for r in ["refs/merge-requests/7/head", "fix/merge", "release/train"] {
+            let arr = json!([{"id": 1, "status": "success", "sha": "h", "ref": r}]);
+            assert_eq!(
+                gl_pipeline_checks(arr.as_array().unwrap())[0].commit_sha,
+                "h",
+                "{}",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn a_merged_results_pipeline_is_the_heads_when_gitlab_says_so() {
+        // With merged-results pipelines (the Premium default) every pipeline
+        // runs on a merge commit, so the MR's `head_pipeline` tells which one
+        // is the head's: that one is reported as the head, an older one keeps
+        // its own sha, which the CI tab reads as another commit's.
+        let p = json!({"id": 31, "sha": "m31", "ref": "refs/merge-requests/7/merge"});
+        let mr = json!({"sha": "h", "diff_refs": {"head_sha": "h"}, "head_pipeline": {"id": 31}});
+        assert_eq!(gl_merge_pipeline_commit(&p, &mr), "h");
+        let older = json!({"sha": "h", "head_pipeline": {"id": 32}});
+        assert_eq!(gl_merge_pipeline_commit(&p, &older), "m31");
+        let none = json!({"sha": "h", "head_pipeline": null});
+        assert_eq!(gl_merge_pipeline_commit(&p, &none), "m31");
+        assert!(gl_is_merge_ref(&p));
+        assert!(!gl_is_merge_ref(&json!({"ref": "fix/merge"})));
+    }
+
+    #[test]
+    fn maps_running_and_not_started_states() {
+        let running = json!([{"id": 1, "status": "running", "web_url": ""}]);
+        assert_eq!(
+            gl_pipeline_checks(running.as_array().unwrap())[0].conclusion,
+            "IN_PROGRESS"
+        );
+        let created = json!([{"id": 1, "status": "created", "web_url": ""}]);
+        let c = &gl_pipeline_checks(created.as_array().unwrap())[0];
+        assert_eq!(c.conclusion, "");
+        assert_eq!(c.state, "created");
+    }
+
+    #[test]
+    fn forbidden_or_not_found_means_no_ci() {
+        use super::gl_pipelines_unavailable;
+        assert!(gl_pipelines_unavailable(
+            "glab api pipelines: glab: 403 Forbidden (HTTP 403)"
+        ));
+        assert!(gl_pipelines_unavailable(
+            "glab api pipelines: glab: 404 Not Found (HTTP 404)"
+        ));
+        assert!(!gl_pipelines_unavailable(
+            "glab api pipelines: glab: 500 Internal Server Error (HTTP 500)"
+        ));
+        assert!(!gl_pipelines_unavailable(
+            "glab api pipelines: dial tcp: i/o timeout"
+        ));
+    }
+
+    #[test]
+    fn no_pipeline_no_check() {
+        assert!(gl_pipeline_checks(&[]).is_empty());
     }
 }

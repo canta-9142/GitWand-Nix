@@ -38,12 +38,24 @@ export {
   type RepoConventions,
 } from "./conventions/types.js";
 export { isGeneratedFile, stripVolatileValues } from "./resolver/generated-detection.js";
-export { isChangelogFile } from "./resolver/validation.js";
+export { isChangelogFile, validateMergedContent } from "./resolver/validation.js";
 
 // accuracy lot D — Regenerate tier: core emits a plan, never executes it
 export { findEcosystem, REGEN_ECOSYSTEMS, type RegenEcosystem } from "./regenerate/registry.js";
 export { buildRegenerationPlan, type RegenerationPlan } from "./regenerate/plan.js";
 export { mergeNonOverlapping, computeDiff, lcs } from "./diff.js";
+// Unified-diff hunk bodies: tell `---`/`+++` file headers from hunk lines
+// whose content starts with `--`/`++`.
+export {
+  parseHunkHeader,
+  noHunkBody,
+  hunkBodyFor,
+  hunkBodyFromHeader,
+  classifyHunkLine,
+  type HunkHeaderRange,
+  type HunkBody,
+  type HunkLineKind,
+} from "./hunk-body.js";
 
 // v2.1 — nouveaux backends diff exposés
 export {
@@ -170,7 +182,15 @@ export type { LockfileMergeResult } from "./resolvers/lockfile-npm.js";
 export type { YarnLockMergeResult } from "./resolvers/lockfile-yarn.js";
 export type { PnpmLockMergeResult } from "./resolvers/lockfile-pnpm.js";
 export type { ImportSortStrategy } from "./resolvers/imports.js";
-export type { MergePolicy, PolicyConfig, GitWandrcConfig } from "./config.js";
+export type {
+  MergePolicy,
+  PolicyConfig,
+  GitWandrcConfig,
+  WorktreeConfig,
+  WorktreeIncludeEntry,
+  WorktreeIncludeMode,
+} from "./config.js";
+export { parseWorktreeInclude, mergeWorktreeInclude } from "./config.js";
 
 // v3.4 — "Recoverable-before-model" tier metric (derived, TS-only — see stats/tiers.ts)
 export { summarizeTiers } from "./stats/tiers.js";
@@ -183,6 +203,14 @@ export type { ThresholdSummary } from "./stats/threshold.js";
 // v3.5.0 — Secrets scanner (pure, mirrored in Rust — see secrets/scanner.ts)
 export { scanSecrets, shannonEntropy, redact, isIgnored, DEFAULT_IGNORE_GLOBS } from "./secrets/scanner.js";
 export { BUILT_IN_PATTERNS } from "./secrets/patterns.js";
+// #301 — the secrets scan of an issue's text (desktop issue form, MCP tool)
+export { scanReportBody, DEFAULT_ENTROPY_THRESHOLD } from "./secrets/report.js";
+export type { ReportScan } from "./secrets/report.js";
+// #301 — where a repository's issues can go (origin, or its fork parent)
+export { issueTargetsFrom } from "./issues/targets.js";
+export type { IssueTarget, IssueTargets } from "./issues/targets.js";
+export { parseRemoteUrl } from "./issues/remote.js";
+export type { RemoteRepo } from "./issues/remote.js";
 export type {
   SecretSeverity,
   SecretPattern,

@@ -24,6 +24,11 @@
   --font-weight-semibold: 600;
   --font-weight-bold: 700;
 
+  /* Detail line under an item's name (profile / AI template lists and menus):
+     between muted and full text. Resolved per theme, since <html> carries
+     both :root and [data-theme]. */
+  --color-text-meta: color-mix(in srgb, var(--color-text) 35%, var(--color-text-muted));
+
   --line-height-tight: 1.2;
   --line-height-snug: 1.35;
   --line-height-normal: 1.5;
@@ -68,7 +73,8 @@
   /* Height of the floating AppDock pill (v2.24.0). Declared here rather than
      inside the component so anything that has to sit clear of the dock — the
      v3.8 undo toast, for one — positions itself from the same number instead
-     of hardcoding a guess that silently drifts. */
+     of hardcoding a guess that silently drifts. Also the side of the dock's
+     square Terminal / Files tiles, and the width of the vertical pill. */
   --app-dock-height: 44px;
 
   /* Code */
@@ -424,7 +430,7 @@ button:focus-visible,
   gap: var(--space-2);
   min-height: 32px;
   padding: var(--space-2) var(--space-5);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-md);
   font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-sm);
   letter-spacing: 0.01em;
@@ -485,6 +491,60 @@ button:focus-visible,
 .btn.btn--ai.btn--ai-solid:hover:not(:disabled) {
   filter: brightness(1.08);
   color: var(--color-ai-text);
+}
+
+/*
+ * AI split button — one gradient frame shared by its segments (main button,
+ * "ctx", template chevron). The frame is the wrapper's background; the 1px
+ * padding and the 1px gaps between segments draw the border. Segments keep
+ * their own .btn--ai look minus the border: drawing a gradient border per
+ * segment restarted the gradient at each seam and left the narrow middle
+ * segment looking borderless.
+ *
+ * Usage: <div class="ai-split"><button class="btn btn--ai">…</button>…</div>
+ * Hosts size every segment with one rule (`.host > :deep(.btn.btn--ai)`:
+ * height, vertical padding, font), 2px shorter than a lone button since the
+ * frame adds 1px above and below, then set each segment's horizontal padding.
+ * Never borders or radii.
+ */
+.ai-split {
+  display: inline-flex;
+  gap: 1px;
+  padding: 1px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--color-ai) 0%, #c084fc 50%, var(--color-ai) 100%);
+  box-shadow: 0 4px 12px -4px var(--color-ai-soft);
+}
+.ai-split > .btn.btn--ai {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: var(--color-bg-secondary);
+}
+.ai-split > .btn.btn--ai:first-child {
+  border-radius: calc(var(--radius-sm) - 1px) 0 0 calc(var(--radius-sm) - 1px);
+}
+.ai-split > .btn.btn--ai:last-child {
+  border-radius: 0 calc(var(--radius-sm) - 1px) calc(var(--radius-sm) - 1px) 0;
+}
+.ai-split > .btn.btn--ai:hover:not(:disabled) {
+  color: var(--color-ai-text);
+  transform: none;
+  box-shadow: none;
+  background: linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-hover) 100%);
+}
+/* The "ctx" segment (AiContextButton): narrow, icon only. */
+.ai-split > .aic-btn {
+  padding-left: 7px;
+  padding-right: 7px;
+}
+/* Dim the content, not the segment: segment opacity would let the frame's
+   gradient show through it. */
+.ai-split > .btn.btn--ai:disabled {
+  opacity: 1;
+}
+.ai-split > .btn.btn--ai:disabled > * {
+  opacity: 0.45;
 }
 
 /*
@@ -614,6 +674,20 @@ button:focus-visible,
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ─── AI loading ───────────────────────────────────────────── */
+/* Soft fade on anything showing an AI request in flight. `filter: opacity()`
+   rather than `opacity` so it stacks with a disabled button's own dimming. */
+.ai-loading {
+  animation: ai-loading-fade 1.6s ease-in-out infinite;
+}
+@keyframes ai-loading-fade {
+  0%, 100% { filter: opacity(1); }
+  50% { filter: opacity(0.6); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ai-loading { animation: none; }
+}
+
 /* ─── Word-level diff highlighting ─────────────────────────── */
 .wd-del {
   background: rgba(239, 68, 68, 0.3);
@@ -628,9 +702,64 @@ button:focus-visible,
 [data-theme="light"] .wd-del { background: rgba(239, 68, 68, 0.2); }
 [data-theme="light"] .wd-ins { background: rgba(34, 197, 94, 0.2); }
 
+/* ─── Markdown task lists (utils/markdown.ts) ──────────────── */
+/* Shared: task lists render in the README, PR bodies, comments and previews. */
+li.md-check { list-style: none; }
+.md-check-box { color: var(--color-text-muted); }
+.md-checked > .md-check-box { color: var(--color-success); }
+
+/* ─── Dropdown menu (tab bar "+" menu, terminal "+" menu) ───── */
+/* Look only: each component positions its menu and adds its own variants. */
+.gw-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+.gw-menu__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.gw-menu__item:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+.gw-menu__item svg {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+}
+.gw-menu__item:hover svg {
+  color: var(--color-accent);
+}
+.gw-menu__separator {
+  height: 1px;
+  margin: var(--space-2) 0;
+  background: var(--color-border);
+}
+
 /* ─── Tooltip (v-tooltip directive) ────────────────────────── */
 .gw-tooltip {
   position: fixed;
+  /* Measured at the viewport origin before place() moves it, so the width
+     is never squeezed by where the element happened to land. */
+  top: 0;
+  left: 0;
   z-index: 9999;
   background: var(--color-surface-inverse);
   color: var(--color-surface-inverse-text);
@@ -639,16 +768,24 @@ button:focus-visible,
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-medium);
   line-height: var(--line-height-tight);
-  white-space: nowrap;
+  /* Long text wraps onto more lines — never truncated. pre-line keeps any
+     explicit line breaks; overflow-wrap splits long paths and URLs. */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  width: max-content;
+  max-width: 280px;
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.1s var(--ease-out);
   box-shadow: var(--shadow-sm);
-  max-width: 280px;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 .gw-tooltip--visible { opacity: 1; }
+/* Appear fast, fade out slowly — directives/tooltip.ts removes the element
+   once FADE_OUT_MS (keep in sync) has elapsed. */
+.gw-tooltip--leaving { transition-duration: 0.5s; }
+@media (prefers-reduced-motion: reduce) {
+  .gw-tooltip { transition: none; }
+}
 
 /* ─── Highlight.js syntax tokens (dark theme) ──────────────── */
 .hljs-keyword,

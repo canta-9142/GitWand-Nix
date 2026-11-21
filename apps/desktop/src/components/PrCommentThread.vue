@@ -7,14 +7,17 @@
  *  - Edit / delete on own comments
  *  - Code suggestion detection & "Apply" button
  */
-import { ref, computed } from "vue";
+import { ref, computed, inject } from "vue";
 import type { PrReviewComment } from "../utils/backend";
 import { renderMarkdown, onMarkdownLinkClick } from "../composables/useSafeHtml";
+import { PR_REMOTE_IMAGES_KEY } from "../composables/useRemoteImages";
+import { PR_ATTACHMENTS_KEY } from "../composables/usePrAttachments";
 import { useI18n } from "../composables/useI18n";
 import { formatRelativeAge } from "../utils/relativeTime";
 import Avatar from "./Avatar.vue";
 import { forgeAvatarUrl } from "../composables/useAvatar";
 import PrReactions from "./PrReactions.vue";
+import { commentLineRange } from "../utils/diffRange";
 
 const { t } = useI18n();
 
@@ -105,9 +108,20 @@ const suggLabel = computed(() => t("pr.comment.suggestionLabel"));
 // Render each comment's markdown once per data change. Done here rather than in
 // the `v-html` binding so the (expensive) parse + sanitize doesn't re-run on
 // every component re-render for every comment in the thread.
+// Remote images follow the "Show images" choice of the PR detail view that
+// renders this thread (withheld when there is none).
+const prImagesShown = inject(PR_REMOTE_IMAGES_KEY, null);
+// Signed URLs of GitHub attachments, from the same PR detail view (#302).
+const resolveImage = inject(PR_ATTACHMENTS_KEY, null);
 const bodyHtmlById = computed(() => {
   const m = new Map<number, string>();
-  for (const c of props.comments) m.set(c.id, renderMarkdown(c.body));
+  // A resolver is provided for GitHub PRs only.
+  const opts = {
+    allowRemoteImages: prImagesShown?.value === true,
+    githubAttachments: !!resolveImage?.value,
+    resolveImage: resolveImage?.value,
+  };
+  for (const c of props.comments) m.set(c.id, renderMarkdown(c.body, opts));
   return m;
 });
 
@@ -121,7 +135,7 @@ function timeAgo(dateStr: string): string {
   <div class="pct-thread">
     <!-- Comments -->
     <div
-      v-for="comment in comments"
+      v-for="(comment, idx) in comments"
       :key="comment.id"
       class="pct-comment"
     >
@@ -129,6 +143,8 @@ function timeAgo(dateStr: string): string {
       <div class="pct-comment-header">
         <Avatar class="pct-avatar" :name="comment.author" :url="forgeAvatarUrl(forgeName, comment.author)" />
         <span class="pct-author">{{ comment.author }}</span>
+        <!-- A multi-line comment's lines (shown on the thread's first comment). -->
+        <span v-if="idx === 0 && commentLineRange(comment)" class="pct-range">{{ t('pr.comment.lineRange', ...commentLineRange(comment)!) }}</span>
         <span class="pct-time" :title="comment.created_at">{{ timeAgo(comment.created_at) }}</span>
         <div class="pct-actions" v-if="(canEdit || canDelete) && (comment.author === currentUser || !currentUser)">
           <button
@@ -252,6 +268,12 @@ function timeAgo(dateStr: string): string {
   font-size: 11px;
 }
 
+.pct-range {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+
 .pct-time {
   color: var(--color-text-muted);
   font-size: 10px;
@@ -282,6 +304,8 @@ function timeAgo(dateStr: string): string {
   line-height: 1.5;
   word-break: break-word;
 }
+/* Breathing room between a comment's body and its reaction row. */
+.pct-body + .prt-reactions { margin-top: var(--space-7); }
 
 /* Markdown rendered content */
 .pct-body :deep(p) { margin-bottom: 12px; }
