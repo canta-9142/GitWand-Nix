@@ -1,0 +1,887 @@
+// @vitest-environment jsdom
+//
+// `useGitRepo` reaches `../../utils/backend`, which reads `window` at import
+// time (apps/desktop/src/CLAUDE.md § Tests Vitest).
+/**
+ * #266 — the Git Tree log follows ref moves that keep the top commit.
+ * #214 — the log view epoch: a filter change drops what the old view still
+ * had in flight, and a forced reload refetches down to the viewed depth.
+ *
+ * The IPC wrapper module is mocked, but `getGitLog` / `getGitRevCount` run the
+ * same `git log` / `git rev-list` the dev-server routes run, against a real
+ * temporary repository (AGENTS.md: never a mocked git layer).
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { nextTick } from "vue";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+vi.mock("../../utils/backend");
+
+import { useGitRepo } from "../useGitRepo";
+import {
+  getGitBranches,
+  getGitLog,
+  getGitRefsFingerprint,
+  getGitRevCount,
+  getGitStatus,
+  type GitLogEntry,
+} from "../../utils/backend";
+
+const GIT_TEST_TIMEOUT_MS = 60_000;
+
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_AUTHOR_NAME: "GitWand Test",
+    GIT_AUTHOR_EMAIL: "test@gitwand.test",
+    GIT_COMMITTER_NAME: "GitWand Test",
+    GIT_COMMITTER_EMAIL: "test@gitwand.test",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  };
+}
+
+function git(cwd: string, args: string[], input?: string): string {
+  return execFileSync("git", args, { cwd, env: gitEnv(), encoding: "utf-8", input });
+}
+
+/** Same format and parsing as dev-server.mjs `/api/git-log`. */
+function realGitLog(cwd: string, count = 100, all = true, offset = 0): GitLogEntry[] {
+  const format = "%h%x1f%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1f%P%x1f%D%x1e";
+  const args = ["log"];
+  if (all) args.push("--all");
+  if (offset > 0) args.push(`--skip=${offset}`);
+  args.push(`-n${count}`, `--format=${format}`);
+  const out = git(cwd, args);
+  return out
+    .split("\x1e")
+    .map((r) => r.trim())
+    .filter(Boolean)
+    .map((r) => {
+      const f = r.split("\x1f");
+      return {
+        hash: f[0],
+        hashFull: f[1],
+        author: f[2],
+        email: f[3],
+        date: f[4],
+        message: f[5],
+        body: f[6].trim(),
+        parents: f[7].trim().split(/\s+/).filter(Boolean),
+        refs: f[8].trim(),
+      };
+    });
+}
+
+/** A repo with `n` linear empty commits on main (c1 … cn, increasing dates). */
+function makeRepo(n: number): string {
+  const dir = mkdtempSync(join(tmpdir(), "gitwand-log-refs-"));
+  git(dir, ["init", "-q", "-b", "main"]);
+  let stream = "";
+  for (let i = 1; i <= n; i++) {
+    const msg = `c${i}`;
+    stream +=
+      `commit refs/heads/main\nmark :${i}\n` +
+      `committer GitWand Test <test@gitwand.test> ${1_700_000_000 + i * 60} +0000\n` +
+      `data ${msg.length}\n${msg}\n` +
+      (i > 1 ? `from :${i - 1}\n` : "") +
+      "\n";
+  }
+  git(dir, ["fast-import", "--quiet"], stream);
+  git(dir, ["reset", "-q", "--hard", "main"]);
+  return dir;
+}
+
+/** Full hash of the commit whose subject is `subject`. */
+function sha(cwd: string, subject: string): string {
+  return git(cwd, ["log", "--all", "--format=%H", `--grep=^${subject}$`]).trim();
+}
+
+/** Add a commit on top of `parent` and point `ref` at it (no checkout). */
+function commitOn(cwd: string, parent: string, ref: string, subject: string): string {
+  const tree = git(cwd, ["rev-parse", `${parent}^{tree}`]).trim();
+  const c = git(cwd, ["commit-tree", tree, "-p", parent, "-m", subject]).trim();
+  git(cwd, ["update-ref", ref, c]);
+  return c;
+}
+
+const repos: string[] = [];
+function newRepo(n: number) {
+  const dir = makeRepo(n);
+  repos.push(dir);
+  return dir;
+}
+
+/** Optional one-shot gate on the next paged (`offset > 0`) git log call. */
+let pageGate: Promise<void> | null = null;
+/** Optional one-shot gate on the next first-page (`offset === 0`) git log call. */
+let firstPageGate: Promise<void> | null = null;
+
+beforeEach(() => {
+  pageGate = null;
+  firstPageGate = null;
+  vi.mocked(getGitLog).mockImplementation(async (cwd, count, all, _author, offset) => {
+    // git runs now — against the repo as it is at call time — like the real
+    // backend; only the result's delivery can be held back.
+    const result = realGitLog(cwd, count ?? 100, all ?? true, offset ?? 0);
+    if ((offset ?? 0) > 0 && pageGate) {
+      const gate = pageGate;
+      pageGate = null;
+      await gate;
+    } else if ((offset ?? 0) === 0 && firstPageGate) {
+      const gate = firstPageGate;
+      firstPageGate = null;
+      await gate;
+    }
+    return result;
+  });
+  // Same inputs as dev-server.mjs `/api/git-refs-fingerprint` (read.rs
+  // `git_refs_fingerprint`), unhashed: only compared for equality.
+  vi.mocked(getGitRefsFingerprint).mockReset();
+  vi.mocked(getGitRefsFingerprint).mockImplementation(async (cwd) => {
+    const refs = git(cwd, ["for-each-ref", "--format=%(objectname) %(refname) %(symref)"])
+      .split("\n")
+      .filter((l) => l && !l.split(" ")[1].startsWith("refs/gitwand/snapshots/"));
+    return [
+      refs.join("\n"),
+      git(cwd, ["worktree", "list", "--porcelain"]),
+      git(cwd, ["stash", "list", "--format=%H"]),
+    ].join("\0");
+  });
+  vi.mocked(getGitRevCount).mockImplementation(async (cwd) =>
+    Number(git(cwd, ["rev-list", "--count", "--all"]).trim()),
+  );
+  vi.mocked(getGitBranches).mockReset();
+  vi.mocked(getGitBranches).mockImplementation(async (cwd) =>
+    git(cwd, ["for-each-ref", "refs/heads", "--format=%(refname:short) %(objectname)"])
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const [name, tip] = line.split(" ");
+        return {
+          name,
+          isCurrent: false,
+          isRemote: false,
+          upstream: null,
+          ahead: 0,
+          behind: 0,
+          mainCommitCount: 0,
+          lastCommit: tip,
+          lastCommitDate: "",
+        };
+      }),
+  );
+});
+
+afterEach(() => {
+  for (const dir of repos.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+async function open(repo: ReturnType<typeof useGitRepo>, dir: string) {
+  repo.folderPath.value = dir;
+  await nextTick(); // let the folderPath watcher reset the log first
+}
+
+function refsOf(repo: ReturnType<typeof useGitRepo>, hash: string): string | undefined {
+  return repo.log.value.find((e) => e.hashFull === hash)?.refs;
+}
+
+describe("loadLog follows ref moves that keep the top commit (#266)", () => {
+  it(
+    "picks up main reset onto an older commit while another branch keeps the top",
+    async () => {
+      const dir = newRepo(5);
+      git(dir, ["branch", "feature"]);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const top = sha(dir, "c5");
+      const c3 = sha(dir, "c3");
+      expect(repo.log.value[0].hashFull).toBe(top);
+      expect(refsOf(repo, top)).toBe("HEAD -> main, feature");
+
+      git(dir, ["reset", "-q", "--hard", c3]);
+      await repo.loadLog(); // not forced — the terminal-mutation path
+
+      expect(repo.log.value[0].hashFull).toBe(top); // top commit unchanged
+      expect(refsOf(repo, top)).toBe("feature");
+      expect(refsOf(repo, c3)).toBe("HEAD -> main");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "picks up a new branch created on an existing commit",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const c2 = sha(dir, "c2");
+      expect(refsOf(repo, c2)).toBe("");
+
+      git(dir, ["branch", "topic", c2]);
+      await repo.loadLog();
+
+      expect(refsOf(repo, c2)).toBe("topic");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps the held log untouched when nothing moved",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const held = repo.log.value;
+
+      await repo.loadLog();
+
+      expect(repo.log.value).toBe(held);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "does not restore the session cache with stale refs after a ref move",
+    async () => {
+      const a = newRepo(5);
+      const b = newRepo(3);
+      git(a, ["branch", "feature"]);
+      const repo = useGitRepo();
+
+      // Fully paged on open → cached for `a`.
+      await open(repo, a);
+      await repo.loadLog();
+      expect(repo.logHasMore.value).toBe(false);
+
+      // Switch away, move main in `a` behind the app's back, switch back.
+      await open(repo, b);
+      await repo.loadLog();
+      const c3 = sha(a, "c3");
+      git(a, ["reset", "-q", "--hard", c3]);
+      await open(repo, a);
+      await repo.loadLog();
+
+      expect(refsOf(repo, sha(a, "c5"))).toBe("feature");
+      expect(refsOf(repo, c3)).toBe("HEAD -> main");
+
+      // And the refreshed log is what the next switch-back restores.
+      await open(repo, b);
+      await repo.loadLog();
+      await open(repo, a);
+      await repo.loadLog();
+      expect(refsOf(repo, c3)).toBe("HEAD -> main");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "drops an in-flight page fetched against a log that loadLog replaced",
+    async () => {
+      const dir = newRepo(130);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      expect(repo.log.value).toHaveLength(100);
+      expect(repo.logHasMore.value).toBe(true);
+
+      // A scroll page goes out at --skip=100 and is held in flight.
+      let release!: () => void;
+      pageGate = new Promise<void>((r) => (release = r));
+      const page = repo.loadMoreLog();
+
+      // Meanwhile a commit lands on top and loadLog takes the fresh page.
+      commitOn(dir, sha(dir, "c130"), "refs/heads/topic", "c131");
+      await repo.loadLog();
+      expect(repo.log.value[0].message).toBe("c131");
+
+      release();
+      await page;
+
+      // No gap: the held rows are exactly git's first rows.
+      const truth = realGitLog(dir, 1000).map((e) => e.hashFull);
+      expect(repo.log.value.map((e) => e.hashFull)).toEqual(truth.slice(0, repo.log.value.length));
+
+      // The background prefetch then completes the log — still gapless.
+      await vi.waitFor(() => expect(repo.logHasMore.value).toBe(false), { timeout: 10_000 });
+      expect(repo.log.value.map((e) => e.hashFull)).toEqual(truth);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "drops an older loadLog result that lands after a newer one",
+    async () => {
+      const dir = newRepo(5);
+      git(dir, ["branch", "feature"]);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const c3 = sha(dir, "c3");
+
+      // Poller tick: its git log ran before the reset but is delivered late.
+      let release!: () => void;
+      firstPageGate = new Promise<void>((r) => (release = r));
+      const older = repo.loadLog();
+
+      // Watcher: the reset happened, a newer loadLog applies it.
+      git(dir, ["reset", "-q", "--hard", c3]);
+      await repo.loadLog();
+      expect(refsOf(repo, c3)).toBe("HEAD -> main");
+
+      release();
+      await older;
+
+      expect(refsOf(repo, c3)).toBe("HEAD -> main");
+      expect(refsOf(repo, sha(dir, "c5"))).toBe("feature");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps a forced reload's semantics when a newer non-forced one supersedes it",
+    async () => {
+      const dir = newRepo(130);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      await vi.waitFor(() => expect(repo.logHasMore.value).toBe(false), { timeout: 10_000 });
+
+      // A ref lands deep in history, below the first page.
+      const c5 = sha(dir, "c5");
+      git(dir, ["branch", "deep", c5]);
+
+      let release!: () => void;
+      firstPageGate = new Promise<void>((r) => (release = r));
+      const forced = repo.loadLog(undefined, true);
+      await repo.loadLog(); // newer, not forced: the first page alone looks unchanged
+      release();
+      await forced;
+
+      await vi.waitFor(() => expect(repo.logHasMore.value).toBe(false), { timeout: 10_000 });
+      expect(refsOf(repo, c5)).toBe("deep");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "reloads an already-loaded branch list when a decoration change is detected, not on an idle poll",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      await repo.loadBranches();
+      expect(getGitBranches).toHaveBeenCalledTimes(1);
+
+      await repo.loadLog(); // idle poll
+      expect(getGitBranches).toHaveBeenCalledTimes(1);
+
+      const c2 = sha(dir, "c2");
+      git(dir, ["branch", "topic", c2]);
+      await repo.loadLog();
+
+      await vi.waitFor(() =>
+        expect(repo.branches.value.find((b) => b.name === "topic")?.lastCommit).toBe(c2),
+      );
+      expect(getGitBranches).toHaveBeenCalledTimes(2);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "leaves a never-loaded branch list alone (lazy branches)",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      git(dir, ["branch", "topic", sha(dir, "c2")]);
+      await repo.loadLog();
+
+      expect(getGitBranches).not.toHaveBeenCalled();
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+});
+
+describe("refreshOnRefsEvent reloads only when the refs moved", () => {
+  /** First-page `git log` calls so far (the forced/plain reloads, not pages). */
+  const firstPageLoads = () =>
+    vi.mocked(getGitLog).mock.calls.filter((c) => (c[4] ?? 0) === 0).length;
+
+  it(
+    "skips an event whose refs the last forced reload already saw",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const c2 = sha(dir, "c2");
+      // An in-app action: move a ref, then force the log itself.
+      git(dir, ["branch", "topic", c2]);
+      await repo.loadLog(undefined, true);
+      expect(refsOf(repo, c2)).toBe("topic");
+      const loads = firstPageLoads();
+
+      // The watcher event for that same move arrives afterwards.
+      await repo.refreshOnRefsEvent();
+
+      expect(firstPageLoads()).toBe(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "forces the log once for a move, not again for a second event batch",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const c2 = sha(dir, "c2");
+
+      git(dir, ["tag", "v0", c2]);
+      await repo.refreshOnRefsEvent();
+      expect(refsOf(repo, c2)).toBe("tag: v0");
+      const loads = firstPageLoads();
+
+      await repo.refreshOnRefsEvent();
+      expect(firstPageLoads()).toBe(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "reloads on the first event after opening, with nothing recorded yet",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      const loads = firstPageLoads();
+
+      await repo.refreshOnRefsEvent();
+
+      expect(firstPageLoads()).toBeGreaterThan(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "ignores a Time Machine snapshot ref",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true);
+      const loads = firstPageLoads();
+
+      git(dir, ["update-ref", "refs/gitwand/snapshots/1", sha(dir, "c3")]);
+      await repo.refreshOnRefsEvent();
+
+      expect(firstPageLoads()).toBe(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "sees HEAD moving to another branch on the same commit",
+    async () => {
+      const dir = newRepo(5);
+      git(dir, ["branch", "side"]);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true);
+      const top = sha(dir, "c5");
+      expect(refsOf(repo, top)).toBe("HEAD -> main, side");
+
+      git(dir, ["checkout", "-q", "side"]);
+      await repo.refreshOnRefsEvent();
+
+      expect(refsOf(repo, top)).toBe("HEAD -> side, main");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "reads the fingerprint once before the log when an event reloads",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true);
+      git(dir, ["branch", "topic", sha(dir, "c2")]);
+      vi.mocked(getGitRefsFingerprint).mockClear();
+
+      await repo.refreshOnRefsEvent();
+
+      // The event's read is reused by the forced reload.
+      expect(getGitRefsFingerprint).toHaveBeenCalledTimes(1);
+      expect(refsOf(repo, sha(dir, "c2"))).toBe("topic");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "forgets an older record when a forced reload gets no fingerprint",
+    async () => {
+      const dir = newRepo(5);
+      git(dir, ["branch", "side"]);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true); // records the refs on main
+      const top = sha(dir, "c5");
+
+      git(dir, ["checkout", "-q", "side"]);
+      vi.mocked(getGitRefsFingerprint).mockRejectedValueOnce(new Error("boom"));
+      await repo.loadLog(undefined, true); // shows side, records nothing
+      expect(refsOf(repo, top)).toBe("HEAD -> side, main");
+
+      // Back to the refs of the first record: the event must still reload.
+      git(dir, ["checkout", "-q", "main"]);
+      await repo.refreshOnRefsEvent();
+
+      expect(refsOf(repo, top)).toBe("HEAD -> main, side");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "forgets the record when a plain reload replaces the log",
+    async () => {
+      const dir = newRepo(5);
+      git(dir, ["branch", "side"]);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true); // records the refs on main
+      const top = sha(dir, "c5");
+
+      git(dir, ["checkout", "-q", "side"]);
+      await repo.loadLog(); // the worktree handler's plain reload
+      expect(refsOf(repo, top)).toBe("HEAD -> side, main");
+
+      git(dir, ["checkout", "-q", "main"]);
+      await repo.refreshOnRefsEvent();
+
+      expect(refsOf(repo, top)).toBe("HEAD -> main, side");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "does not skip while an older log load is still running",
+    async () => {
+      const dir = newRepo(5);
+      git(dir, ["branch", "side"]);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true); // records the refs on main
+      const top = sha(dir, "c5");
+
+      // A plain load reads the log on `side`, its result held back.
+      git(dir, ["checkout", "-q", "side"]);
+      let release!: () => void;
+      firstPageGate = new Promise<void>((r) => (release = r));
+      const calls = vi.mocked(getGitLog).mock.calls.length;
+      const plain = repo.loadLog();
+      await vi.waitFor(() => expect(vi.mocked(getGitLog).mock.calls.length).toBe(calls + 1));
+
+      // Back on main before the event runs: same refs as the record.
+      git(dir, ["checkout", "-q", "main"]);
+      await repo.refreshOnRefsEvent();
+      release();
+      await plain;
+
+      expect(refsOf(repo, top)).toBe("HEAD -> main, side");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps scrolling after a forced reload finds the same rows under a page in flight",
+    async () => {
+      const dir = newRepo(150);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      repo.logBranchFilter.value = "current";
+      await repo.loadLog();
+      expect(repo.log.value).toHaveLength(100);
+
+      // A scroll page in flight, held back.
+      let release!: () => void;
+      pageGate = new Promise<void>((r) => (release = r));
+      const calls = vi.mocked(getGitLog).mock.calls.length;
+      const page = repo.loadMoreLog();
+      await vi.waitFor(() => expect(vi.mocked(getGitLog).mock.calls.length).toBe(calls + 1));
+
+      // A ref moves below the loaded rows: the forced reload finds them unchanged.
+      git(dir, ["update-ref", "refs/remotes/origin/old", sha(dir, "c1")]);
+      await repo.loadLog(undefined, true);
+      release();
+      await page;
+
+      // The dropped page is fetched again without another scroll.
+      await vi.waitFor(() => expect(repo.log.value).toHaveLength(150));
+      expect(repo.logLoadingMore.value).toBe(false);
+      expect(refsOf(repo, sha(dir, "c1"))).toBe("origin/old");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "still reloads status when it skips the log",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true);
+      vi.mocked(getGitStatus).mockClear();
+
+      await repo.refreshOnRefsEvent();
+
+      expect(getGitStatus).toHaveBeenCalledTimes(1);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "records nothing for a forced reload that failed",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      git(dir, ["branch", "topic", sha(dir, "c2")]);
+      vi.mocked(getGitLog).mockRejectedValueOnce(new Error("boom"));
+      await repo.loadLog(undefined, true);
+      expect(refsOf(repo, sha(dir, "c2"))).toBe("");
+
+      await repo.refreshOnRefsEvent();
+
+      expect(refsOf(repo, sha(dir, "c2"))).toBe("topic");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "records a forced reload in a filtered view",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      repo.logBranchFilter.value = "current";
+      await repo.loadLog(undefined, true);
+      const loads = firstPageLoads();
+
+      await repo.refreshOnRefsEvent();
+
+      expect(firstPageLoads()).toBe(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "reloads as before when the fingerprint cannot be read",
+    async () => {
+      const dir = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, dir);
+      await repo.loadLog(undefined, true);
+      const loads = firstPageLoads();
+
+      vi.mocked(getGitRefsFingerprint).mockRejectedValue(new Error("boom"));
+      await repo.refreshOnRefsEvent();
+
+      expect(firstPageLoads()).toBeGreaterThan(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "does not carry a record over to another repo",
+    async () => {
+      const a = newRepo(5);
+      const b = newRepo(5);
+      const repo = useGitRepo();
+      await open(repo, a);
+      await repo.openRepo(a);
+      await repo.loadLog(undefined, true);
+      await repo.openRepo(b);
+      await repo.loadLog();
+      await repo.openRepo(a);
+      await repo.loadLog();
+      const loads = firstPageLoads();
+
+      // `a`'s refs did not move, but its log was not reloaded with force since
+      // it was reopened: the event must still reload.
+      await repo.refreshOnRefsEvent();
+
+      expect(firstPageLoads()).toBeGreaterThan(loads);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+});
+
+describe("the log view epoch (#214)", () => {
+  /** getGitLog calls made for `dir`: a call another test left running is not counted. */
+  function logCalls(dir: string) {
+    return vi.mocked(getGitLog).mock.calls.filter((c) => c[0] === dir);
+  }
+  /** The page size of every getGitLog call for `dir` after the first `from`. */
+  function logCallSizes(dir: string, from: number): number[] {
+    return logCalls(dir).slice(from).map((c) => c[1] as number);
+  }
+
+  // A forced reload restarts the background prefetch. Close the repo before
+  // the outer afterEach deletes it, so the prefetch stops instead of retrying
+  // a deleted directory for the rest of the file.
+  let opened: ReturnType<typeof useGitRepo>[] = [];
+  function openRepo() {
+    const repo = useGitRepo();
+    opened.push(repo);
+    return repo;
+  }
+  afterEach(async () => {
+    for (const repo of opened.splice(0)) repo.folderPath.value = null;
+    await nextTick();
+  });
+
+  it(
+    "drops a scroll page fetched for the view a filter change left",
+    async () => {
+      const dir = newRepo(150);
+      const repo = openRepo();
+      await open(repo, dir);
+      repo.logBranchFilter.value = "current";
+      await repo.loadLog();
+      expect(repo.log.value).toHaveLength(100);
+
+      // A scroll page of the "current branch" view goes out and is held.
+      let release!: () => void;
+      pageGate = new Promise<void>((r) => (release = r));
+      const calls = logCalls(dir).length;
+      const page = repo.loadMoreLog();
+      await vi.waitFor(() => expect(logCalls(dir).length).toBe(calls + 1));
+
+      // The view changes meanwhile: its first page replaces the log.
+      await repo.setLogAuthorFilter("mine");
+      expect(repo.log.value).toHaveLength(100);
+
+      release();
+      await page;
+
+      // The old view's page is not appended, and its end does not clear the
+      // flag of the new view: scrolling goes on from the new view's rows.
+      expect(repo.log.value).toHaveLength(100);
+      expect(repo.logLoadingMore.value).toBe(false);
+      await repo.loadMoreLog();
+      expect(repo.log.value.map((e) => e.hashFull)).toEqual(realGitLog(dir, 1000, false).map((e) => e.hashFull));
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "drops a loadLog result read for the view a filter change left",
+    async () => {
+      const dir = newRepo(5);
+      const repo = openRepo();
+      await open(repo, dir);
+      repo.logBranchFilter.value = "current";
+      await repo.loadLog();
+
+      // A reload of the old view reads the log, then is held.
+      let release!: () => void;
+      firstPageGate = new Promise<void>((r) => (release = r));
+      const calls = logCalls(dir).length;
+      const stale = repo.loadLog();
+      await vi.waitFor(() => expect(logCalls(dir).length).toBe(calls + 1));
+
+      // A commit lands, then the view changes and reads it.
+      commitOn(dir, sha(dir, "c5"), "refs/heads/main", "c6");
+      await repo.setLogAuthorFilter("mine");
+      expect(repo.log.value[0].message).toBe("c6");
+
+      release();
+      await stale;
+
+      expect(repo.log.value[0].message).toBe("c6");
+      expect(repo.log.value).toHaveLength(6);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "a forced reload refetches down to the viewed row plus a page, not the whole log",
+    async () => {
+      const dir = newRepo(600);
+      const repo = openRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      await vi.waitFor(() => expect(repo.logHasMore.value).toBe(false), { timeout: 20_000 });
+      expect(repo.log.value).toHaveLength(600);
+
+      // The user scrolled down to row 250.
+      repo.setLogViewAnchor(repo.log.value[249].hashFull);
+      const calls = logCalls(dir).length;
+      await repo.loadLog(undefined, true);
+
+      expect(logCallSizes(dir, calls)).toEqual([350]);
+      expect(repo.log.value).toHaveLength(350);
+      expect(repo.log.value[249].message).toBe("c351");
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "a forced reload with no viewed row refetches one page",
+    async () => {
+      const dir = newRepo(600);
+      const repo = openRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      await vi.waitFor(() => expect(repo.logHasMore.value).toBe(false), { timeout: 20_000 });
+
+      const calls = logCalls(dir).length;
+      await repo.loadLog(undefined, true);
+
+      expect(logCallSizes(dir, calls)).toEqual([100]);
+      expect(repo.log.value).toHaveLength(100);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "a filter change fetches one page and forgets the old view's depth",
+    async () => {
+      const dir = newRepo(600);
+      const repo = openRepo();
+      await open(repo, dir);
+      await repo.loadLog();
+      await vi.waitFor(() => expect(repo.logHasMore.value).toBe(false), { timeout: 20_000 });
+      repo.setLogViewAnchor(repo.log.value[499].hashFull);
+
+      let calls = logCalls(dir).length;
+      await repo.setLogBranchFilter("current");
+      expect(logCallSizes(dir, calls)).toEqual([100]);
+      expect(repo.log.value).toHaveLength(100);
+
+      // Back on the full view (restored from the session cache), the anchor
+      // of before is forgotten: a forced reload refetches one page, not the
+      // 600 rows down to it.
+      await repo.setLogBranchFilter("all");
+      expect(repo.log.value).toHaveLength(600);
+      calls = logCalls(dir).length;
+      await repo.loadLog(undefined, true);
+      expect(logCallSizes(dir, calls)).toEqual([100]);
+    },
+    GIT_TEST_TIMEOUT_MS,
+  );
+});

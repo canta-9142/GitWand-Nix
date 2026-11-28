@@ -10,6 +10,7 @@ import {
   getGitDiff,
   getGitLog,
   getGitRevCount,
+  getGitRefsFingerprint,
   getGitUser,
   gitStage,
   gitUnstage,
@@ -53,13 +54,21 @@ import {
   type WorktreeEntry,
   gitAddToGitignore,
 } from "../utils/backend";
+import { shouldForceLogAfterFetch } from "../utils/fetchRefresh";
 import { requireOnline } from "../utils/networkGuard";
-import { clearUpdatePromptSkip } from "./useBranchUpdatePrompt";
+import {
+  clearUpdatePromptSkip,
+  evaluateAutoForcePush,
+  isForcePushRemoteMoved,
+  forcePushRejectionLine,
+} from "./useBranchUpdatePrompt";
 import { t } from "./useI18n";
 import { resolveConflictOperation } from "../utils/conflictOperation";
 import { useWorkspaceScope } from "./useWorkspaceScope";
 import { useSettings } from "./useSettings";
 import { useUndoToast } from "./useUndoToast";
+import { commitIdentityFor } from "./useIdentity";
+import { COMMIT_SIGNATURE } from "../utils/commitSignature";
 
 export type ViewMode =
   | "dashboard"
@@ -93,6 +102,8 @@ export interface RepoFileEntry {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";
   section: "staged" | "unstaged" | "untracked" | "conflicted";
+  /** Path before a rename — set only when `status` is "renamed". */
+  oldPath?: string;
 }
 
 /**
@@ -120,6 +131,22 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   const successMessage = ref<string | null>(null);
   const viewMode = ref<ViewMode>("dashboard");
   const forcePushPreferred = ref(false);
+  /**
+   * Set only while `forcePushPreferred` was switched on by the divergence probe
+   * (not by a reset / rebase the user ran): the `@{upstream}` sha it judged
+   * safe to overwrite. Drives re-validation and the explicit push lease.
+   */
+  const autoForcePushSha = ref<string | null>(null);
+  let settingAutoForcePush = false;
+  // Any other way of changing the preference makes it the user's own choice
+  // (or turns it off): the auto record no longer applies.
+  watch(
+    forcePushPreferred,
+    () => {
+      if (!settingAutoForcePush) autoForcePushSha.value = null;
+    },
+    { flush: "sync" },
+  );
 
   // ── Monorepo scope (v2.21.0) ────────────────────────────────────────────
   const { activeScope } = useWorkspaceScope();
@@ -182,10 +209,12 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   }
 
   // Persist forcePushPreferred to localStorage so it survives app reloads.
-  watch(forcePushPreferred, (val) => {
+  // An auto-detected preference is stored as `auto:<sha>` so a restart keeps
+  // the lease it was judged against; an explicit one stays "1".
+  watch([forcePushPreferred, autoForcePushSha], ([val, sha]) => {
     const key = forcePushKey();
     if (!key) return;
-    if (val) localStorage.setItem(key, "1");
+    if (val) localStorage.setItem(key, sha ? `auto:${sha}` : "1");
     else localStorage.removeItem(key);
   });
 
@@ -195,14 +224,77 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     (branch) => {
       if (!branch) return;
       const key = forcePushKey();
-      forcePushPreferred.value = key
-        ? localStorage.getItem(key) === "1"
-        : false;
+      const stored = key ? localStorage.getItem(key) : null;
+      const autoSha = stored?.startsWith("auto:") ? stored.slice(5) : null;
+      settingAutoForcePush = true;
+      try {
+        forcePushPreferred.value = stored === "1" || !!autoSha;
+        autoForcePushSha.value = autoSha || null;
+      } finally {
+        settingAutoForcePush = false;
+      }
     },
   );
 
+  // Diverged because local history was rewritten (a rebase from the CLI, a
+  // flow that doesn't flag it…): prefer force push without relying on every
+  // rewriting entry point to set the flag. The verdict is re-evaluated on every
+  // status refresh — origin/<branch> can move under us (auto-fetch) and a
+  // verdict about the old tip says nothing about the new one — and an
+  // auto-detected preference is dropped as soon as the probe turns negative or
+  // `@{upstream}` is no longer the sha it was judged against. Explicit
+  // preferences (reset, rebase run in-app) are never revoked here.
+  let forcePushProbeSeq = 0;
+  watch(status, async (s) => {
+    const seq = ++forcePushProbeSeq;
+    const path = folderPath.value;
+    if (!s || !path || !s.branch) return;
+    const diverged = s.ahead > 0 && s.behind > 0;
+    const startPreferred = forcePushPreferred.value;
+    const startAutoSha = autoForcePushSha.value;
+    // Nothing to judge or invalidate: not diverged and no auto record.
+    if (!diverged && startAutoSha === null) return;
+    const verdict = await evaluateAutoForcePush(path, s.branch, {
+      preferred: startPreferred,
+      autoSha: startAutoSha,
+    });
+    // The answer is only good for the exact repo / branch / divergence it was
+    // asked about, and only if nothing newer or the user changed the state.
+    const cur = status.value;
+    if (
+      seq !== forcePushProbeSeq ||
+      folderPath.value !== path ||
+      !cur ||
+      cur.branch !== s.branch ||
+      cur.ahead !== s.ahead ||
+      cur.behind !== s.behind ||
+      forcePushPreferred.value !== startPreferred ||
+      autoForcePushSha.value !== startAutoSha
+    ) {
+      return;
+    }
+    settingAutoForcePush = true;
+    try {
+      if (verdict.action === "set") {
+        if (diverged) {
+          forcePushPreferred.value = true;
+          autoForcePushSha.value = verdict.upstream;
+        } else if (verdict.upstream !== startAutoSha) {
+          // Not diverged: a "set" here would flip every plain ahead-only branch.
+          // The only thing to do is drop a record for an upstream that moved.
+          forcePushPreferred.value = false;
+          autoForcePushSha.value = null;
+        }
+      } else if (verdict.action === "clear") {
+        forcePushPreferred.value = false;
+        autoForcePushSha.value = null;
+      }
+    } finally {
+      settingAutoForcePush = false;
+    }
+  });
+
   // Commit editor state
-  const COMMIT_SIGNATURE = "\u{1FA84} Commit via GitWand";
   const commitSummary = ref("");
 
   function getCommitSignatureDefault(): string {
@@ -243,6 +335,16 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   // Commit diff state (for history view)
   const selectedCommitHash = ref<string | null>(null);
   const commitDiffs = ref<GitDiff[]>([]);
+  /** The commit `commitDiffs` belong to: while a newly selected commit
+   *  loads, the previous one's are still shown (#301 files lines by it). */
+  const commitDiffsHash = ref<string | null>(null);
+  /** The one way to set the commit diffs: the diffs and the commit they
+   *  belong to move together, and only for the commit still selected. */
+  function setCommitDiffs(hash: string | null, diffs: GitDiff[]) {
+    if (hash !== null && selectedCommitHash.value !== hash) return;
+    commitDiffs.value = diffs;
+    commitDiffsHash.value = hash;
+  }
 
   /**
    * Search-palette invalidation on active-repo change.
@@ -261,6 +363,12 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   watch(folderPath, () => {
     branches.value = [];
     log.value = [];
+    _logViewAnchor = null;
+    // A page in flight for the previous repo must not land in this one, nor
+    // its pending force carry over.
+    _logGen++;
+    _logForcePending = false;
+    logLoadingMore.value = false;
   });
 
   /**
@@ -273,7 +381,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   watch(activeScope, () => {
     if (!folderPath.value) return;
     void loadStatus(folderPath.value);
-    void loadLog();
+    void reloadLogForViewChange();
     void loadRevCounts();
   });
 
@@ -327,10 +435,10 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       result.push({ path: f, status: "modified", section: "conflicted" });
     }
     for (const f of s.staged) {
-      result.push({ path: f.path, status: f.status, section: "staged" });
+      result.push({ path: f.path, status: f.status, section: "staged", oldPath: f.oldPath });
     }
     for (const f of s.unstaged) {
-      result.push({ path: f.path, status: f.status, section: "unstaged" });
+      result.push({ path: f.path, status: f.status, section: "unstaged", oldPath: f.oldPath });
     }
     for (const f of s.untracked) {
       result.push({ path: f, status: "added", section: "untracked" });
@@ -472,7 +580,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     isFetching.value = true;
     fetchPercent.value = 0;
     try {
-      await gitFetch(
+      const fetched = await gitFetch(
         folderPath.value,
         // Clamp monotonically: parse_clone_progress's catch-all "info" branch
         // (remote summary lines, ref-update lines) reports percent 0, which
@@ -484,9 +592,12 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       await loadStatus(folderPath.value);
       // v2.14 — Refresh log so clicking "Up to date" or periodic fetch
       // updates the Git Tree / History view with new remote commits.
-      // Force: a fetch moves remote-tracking refs without moving local HEAD,
-      // so the canonical fast path would otherwise keep stale origin/* labels.
-      await loadLog(undefined, true);
+      // Force when the fetch moved a ref: it moves remote-tracking refs
+      // without moving local HEAD, so the canonical fast path would otherwise
+      // keep stale origin/* labels. Not when it moved nothing — a forced
+      // reload cuts the Git Tree back to the viewed depth and refills it,
+      // which every 30 s made the scrollbar jump (#287).
+      await loadLog(undefined, shouldForceLogAfterFetch(fetched, full));
       // Manual sync: refresh the rest of the cached view so a deleted/renamed
       // remote branch, a pruned ref, or a new tag surfaces without a reopen.
       if (full) {
@@ -507,10 +618,11 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     loading.value = true;
     error.value = null;
     folderPath.value = path;
+    _refsSeen = null;
 
     // Reset previous repo state
     selectedCommitHash.value = null;
-    commitDiffs.value = [];
+    setCommitDiffs(null, []);
     log.value = [];
     branches.value = []; // ← reset so the palette doesn't show stale branches from the previous repo
     selectedFilePath.value = null;
@@ -539,13 +651,14 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    */
   function closeRepo() {
     folderPath.value = null;
+    _refsSeen = null;
     status.value = null;
     selectedFilePath.value = null;
     selectedFileStaged.value = false;
     diff.value = null;
     log.value = [];
     selectedCommitHash.value = null;
-    commitDiffs.value = [];
+    setCommitDiffs(null, []);
     branches.value = [];
     worktrees.value = [];
     error.value = null;
@@ -561,12 +674,60 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    * views stay in sync with the repository state.
    */
   async function refresh(forceLog = false) {
+    await refreshWith(forceLog, null);
+  }
+
+  /** `refresh`, with a refs fingerprint already read before it (see `loadLog`). */
+  async function refreshWith(forceLog: boolean, refsFp: string | null) {
     if (!folderPath.value) return;
-    await Promise.all([loadStatus(folderPath.value), loadLog(undefined, forceLog)]);
+    await Promise.all([
+      loadStatus(folderPath.value),
+      loadLog(undefined, forceLog, false, refsFp),
+    ]);
     // Also refresh diff if a file is selected
     if (selectedFilePath.value) {
       await loadDiff(selectedFilePath.value, selectedFileStaged.value);
     }
+  }
+
+  /**
+   * Refresh after a watcher `head`/`refs` event. Such an event usually means
+   * decorations changed, possibly below the first page a plain refresh
+   * compares, so it forces the log (#266) — unless the refs fingerprint is
+   * the one the last forced reload saw: then the log cannot have changed (a
+   * second event batch for one `git branch`, an in-app action that already
+   * reloaded it, a Time Machine snapshot ref), and a forced reload would only
+   * restart the full-history prefetch for nothing. Status is still reloaded:
+   * an action that forced only the log (deleting a remote branch) leaves the
+   * upstream and ahead/behind to this event.
+   */
+  async function refreshOnRefsEvent() {
+    const repo = folderPath.value;
+    if (!repo) return;
+    // Pages started after this point read refs at least as new as `fp`.
+    const pagesBeforeRead = _pageSeq;
+    let fp: string | null = null;
+    try {
+      fp = await getGitRefsFingerprint(repo);
+    } catch {
+      // Unknown: reload, as before.
+    }
+    if (folderPath.value !== repo) return;
+    if (
+      fp !== null &&
+      _logLoadsInFlight === 0 &&
+      _refsSeen?.repo === repo &&
+      _refsSeen.fp === fp
+    ) {
+      // A scroll or prefetch page still in flight may have been read with
+      // refs that have moved and come back since: fetch it again.
+      refetchPageInFlight(pagesBeforeRead);
+      await loadStatus(repo);
+      if (selectedFilePath.value) await loadDiff(selectedFilePath.value, selectedFileStaged.value);
+      return;
+    }
+    // Read before the log that follows: loadLog can use it as its own.
+    await refreshWith(true, fp);
   }
 
   /**
@@ -615,6 +776,111 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   // scroll pagination continues past the ceiling.
   const PREFETCH_CEILING = 5000;
   let _prefetchToken = 0;
+  // Bumped whenever the log *view* changes (branch/author filter, monorepo
+  // scope). An in-flight page fetched for the previous view must not land in
+  // the new one, so loadLog/loadMoreLog drop results whose epoch is stale.
+  let _logViewEpoch = 0;
+  // Bumped whenever `log.value` is replaced wholesale (view change, or a
+  // loadLog that takes fresh entries). An in-flight loadMoreLog computed its
+  // `--skip` offset against the old log: appending its page onto the new one
+  // would leave a gap that prefetchAllPages then caches (#266). It drops its
+  // page when this moved.
+  let _logGen = 0;
+  // Bumped at each loadLog entry: only the latest request may apply its result.
+  let _logRequest = 0;
+  // Set by a forced loadLog until a request applies; a superseded forced
+  // reload thus hands its force to the request that supersedes it.
+  let _logForcePending = false;
+  // Refs fingerprint (`getGitRefsFingerprint`) read before the last forced
+  // reload that replaced the log (`recordRefs`): the log shows exactly those
+  // refs. Any other replacement of the log forgets it (`replaceLog`), and a
+  // superseded or failed forced reload records nothing. A watcher
+  // refs/head event that finds the same fingerprint has nothing to reload
+  // (`refreshOnRefsEvent`).
+  let _refsSeen: { repo: string; fp: string } | null = null;
+  // loadLog calls running. One started before an event may apply rows read
+  // with refs the event's fingerprint no longer shows (a checkout and back):
+  // an event never skips while one runs (`refreshOnRefsEvent`).
+  let _logLoadsInFlight = 0;
+  // Scroll/prefetch pages started so far, and the latest one's number and
+  // size: `refetchPageInFlight` refetches it at the same size, and only when
+  // it started before the fingerprint it is judged against was read.
+  let _pageSeq = 0;
+  let _pageInFlight = { seq: 0, size: LOG_PAGE };
+
+  /**
+   * The log just took changed rows: a ref may have moved, and the Git Tree
+   * resolves its labels against `branches` too. Reload them — only when they
+   * were already loaded (the list is lazy) — so the poller path, which never
+   * calls loadBranches itself, doesn't leave stale labels (#266).
+   */
+  function refreshLoadedBranches() {
+    if (branches.value.length > 0) void loadBranches();
+  }
+
+  /**
+   * A forced reload replaced the log with rows read after `fp` was; `null`
+   * (no fingerprint) leaves nothing recorded, never an older one.
+   */
+  function recordRefs(repo: string, fp: string | null) {
+    _refsSeen = fp === null ? null : { repo, fp };
+  }
+
+  /**
+   * Drop a scroll or prefetch page still in flight (read with refs that may
+   * no longer hold) and fetch it again at the same offset. Without the new
+   * request, the list components, which ask for a page only when the log's
+   * length changes, would never ask again in a filtered view or past the
+   * prefetch ceiling.
+   */
+  function refetchPageInFlight(startedBy = Infinity) {
+    if (!logLoadingMore.value || _pageInFlight.seq > startedBy) return;
+    _logGen++; // the dropped page's `finally` no longer owns the flag
+    logLoadingMore.value = false;
+    void loadMoreLog(_pageInFlight.size);
+  }
+
+  /**
+   * Replace the whole log and invalidate in-flight pagination against the old
+   * one. Forgets the recorded refs: the new rows may show other refs than the
+   * record (a forced reload records its own right after).
+   */
+  function replaceLog(entries: GitLogEntry[]) {
+    _refsSeen = null;
+    _logGen++;
+    _prefetchToken++;
+    logLoadingMore.value = false;
+    log.value = entries;
+  }
+
+  /**
+   * True when `held` starts with exactly the rows of `fresh`: same hash and
+   * same decoration (`%D`) at every position of the fresh page. O(page).
+   */
+  function samePageDecorations(held: GitLogEntry[], fresh: GitLogEntry[]): boolean {
+    if (held.length < fresh.length) return false;
+    for (let i = 0; i < fresh.length; i++) {
+      if (held[i].hashFull !== fresh[i].hashFull || held[i].refs !== fresh[i].refs) return false;
+    }
+    return true;
+  }
+  // Hash of the deepest row the graph currently shows (reported on scroll).
+  // A forced reload keeps the log at least this deep so it doesn't shrink
+  // under a user who scrolled far down; otherwise it fetches the first page
+  // only and lets the background prefetch refill the rest.
+  let _logViewAnchor: string | null = null;
+
+  function setLogViewAnchor(hash: string | null) {
+    _logViewAnchor = hash;
+  }
+
+  /** Rows a forced reload must refetch up front: the viewed depth plus a page of margin. */
+  function forcedReloadDepth(): number {
+    const viewed = _logViewAnchor
+      ? log.value.findIndex((e) => e.hashFull === _logViewAnchor) + 1
+      : 0;
+    return Math.max(LOG_PAGE, Math.min(log.value.length, viewed + LOG_PAGE));
+  }
 
   function isCanonicalLogView(): boolean {
     return (
@@ -652,16 +918,57 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   }
 
   /**
-   * @param force When true, bypass the canonical fast-paths that trust an
-   *   unchanged top-commit hash (the in-memory `haveSameHead` keep and the
-   *   `LOG_CACHE` restore) and refetch fresh. Ref/decoration-only mutations
-   *   (push moving origin/HEAD, branch/tag/stash deletion, fetch) leave the top
-   *   commit untouched, so without this they'd serve a stale log. Refetches at
-   *   the current depth so a paginated view doesn't collapse back to page 1.
+   * @param force When true, bypass the canonical fast-paths (the in-memory
+   *   keep and the `LOG_CACHE` restore) and refetch fresh. Those fast paths
+   *   already compare the fresh first page by hash and decoration, so a ref
+   *   moving within that page is caught without `force` (#266); `force` still
+   *   matters for changes they can't see from one page (a ref moving deeper in
+   *   history). Refetches only down to what the user is viewing (see
+   *   `forcedReloadDepth`) — not the whole prefetched history — and the
+   *   background prefetch refills the rest.
+   * @param viewChanged True when the filter/scope just changed: fetch only the
+   *   first page (the current depth belongs to the old view — up to the whole
+   *   prefetched history) and never keep the old view's entries.
+   * @param refsFpBefore A refs fingerprint the caller read just before this
+   *   call, used instead of reading one again (`refreshOnRefsEvent`).
    */
-  async function loadLog(count?: number, force = false) {
+  async function loadLog(
+    count?: number,
+    force = false,
+    viewChanged = false,
+    refsFpBefore: string | null = null,
+  ) {
     if (!folderPath.value) return;
+    const epoch = _logViewEpoch;
+    // Captured before the awaits: a repo switch while this fetch is in flight
+    // must not apply (or invalidate the cache of) the new repo with this result.
+    const repo = folderPath.value;
+    // Concurrent loadLog calls (poller + watcher) carry no ordering: an older
+    // result landing after a newer one would reinstate stale decorations.
+    const req = ++_logRequest;
+    if (force) _logForcePending = true;
+    const current = () =>
+      req === _logRequest && epoch === _logViewEpoch && folderPath.value === repo;
+    _logLoadsInFlight++;
     try {
+      // A forced reload (or one inheriting a force) records the refs it saw,
+      // read BEFORE the log so the log is at least as new as the fingerprint.
+      // Known gap: a ref that moves and comes back between that read and the
+      // log's (two checkouts within milliseconds) leaves the log showing the
+      // intermediate state with the original fingerprint recorded, so the
+      // events for both moves are skipped. Reading again after the log cannot
+      // see it either; the next real ref move or manual refresh corrects it.
+      let refsFp: string | null = null;
+      if (_logForcePending) {
+        refsFp = refsFpBefore;
+        if (refsFp === null) {
+          try {
+            refsFp = await getGitRefsFingerprint(repo);
+          } catch {
+            // No fingerprint: the next refs event reloads, as before.
+          }
+        }
+      }
       const authorEmail =
         logAuthorFilter.value === "mine"
           ? (currentGitUser.value?.email ?? "")
@@ -672,13 +979,15 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // only needs a cheap first-page probe to detect HEAD movement. Filtered
       // views reload at least what's visible so polling doesn't collapse a
       // paginated log back to page 1.
-      const pageSize = isCanon
+      const pageSize = viewChanged
+        ? LOG_PAGE
+        : isCanon
         ? force
-          ? Math.max(LOG_PAGE, log.value.length)
+          ? forcedReloadDepth()
           : LOG_PAGE
         : (count ?? Math.max(LOG_PAGE, log.value.length));
       const entries = await getGitLog(
-        folderPath.value,
+        repo,
         pageSize,
         !isCurrentBranchOnly, // all refs (false when branch-only)
         authorEmail,
@@ -688,39 +997,77 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       );
       // Refresh the hidden-commit badge counts alongside the scoped log.
       await loadRevCounts();
+      // A newer view change, a repo switch or a newer loadLog superseded this
+      // fetch — its result is stale.
+      if (!current()) return;
+      // A superseded forced reload hands its force to whichever request
+      // applies, so concurrent calls never lose it.
+      const forced = force || _logForcePending;
+      _logForcePending = false;
 
-      const head = entries[0]?.hashFull;
       if (isCanon) {
-        const cached = LOG_CACHE.get(folderPath.value);
-        const haveSameHead =
-          !force &&
-          log.value.length >= entries.length &&
-          log.value[0]?.hashFull === head;
-        if (haveSameHead) {
+        const cached = LOG_CACHE.get(repo);
+        // The fast paths compare the fresh first page against what they would
+        // keep, hashes AND decorations (#266): a ref moving without the top
+        // commit changing (reset main onto origin/main, a new branch on an
+        // existing commit, checkout of a previous branch) must not be kept.
+        const haveSamePage =
+          !forced &&
+          !viewChanged &&
+          samePageDecorations(log.value, entries);
+        if (haveSamePage) {
           // Poll while we already hold this page (or the full log / an in-flight
-          // prefetch) and HEAD hasn't moved — keep it, don't collapse. Resume
+          // prefetch) and nothing in it moved — keep it, don't collapse. Resume
           // the prefetch if it was interrupted.
           if (logHasMore.value) void prefetchAllPages();
         } else if (
-          !force &&
+          !forced &&
           cached &&
-          cached.length > 0 &&
-          cached[0]?.hashFull === head
+          samePageDecorations(cached, entries)
         ) {
-          // HEAD unchanged since we cached the full history — restore instantly.
-          log.value = cached;
+          // Nothing moved since we cached the full history — restore instantly.
+          replaceLog(cached);
           logHasMore.value = false;
         } else {
-          // Fresh repo, HEAD moved, or a forced reload after a ref/decoration
-          // change: drop the stale cache and show fresh entries. The background
-          // prefetch below re-caches the full history with current decorations.
-          if (force) LOG_CACHE.delete(folderPath.value);
-          log.value = entries;
+          // Fresh repo, HEAD moved, or a ref/decoration change: drop the stale
+          // cache and show fresh entries. The background prefetch below
+          // re-caches the full history with current decorations.
+          LOG_CACHE.delete(repo);
+          let fresh = entries;
+          // A non-forced reload only probed one page. If the user scrolled
+          // deeper, refetch down to what they're viewing — as a forced reload
+          // would — so the graph doesn't shrink under them. Only on an actual
+          // change, never on an idle poll.
+          const depth = forcedReloadDepth();
+          if (!viewChanged && depth > pageSize) {
+            fresh = await getGitLog(repo, depth, true, undefined, 0);
+            if (!current()) {
+              // Superseded meanwhile: the newer request decides, keeping the force.
+              if (forced) _logForcePending = true;
+              return;
+            }
+          }
+          replaceLog(fresh);
+          if (forced) recordRefs(repo, refsFp);
           logHasMore.value = log.value.length < effectiveTotalCount();
           void prefetchAllPages();
+          if (!viewChanged) refreshLoadedBranches();
         }
       } else {
-        log.value = entries;
+        // A forced reload consumed in a filtered view still means refs may
+        // have moved anywhere: the canonical view's cached history is stale.
+        if (forced) LOG_CACHE.delete(repo);
+        // Same rows as held (an idle poll): keep the array so an in-flight
+        // scroll page, fetched at a still-valid offset, isn't dropped.
+        const unchanged =
+          !viewChanged &&
+          log.value.length === entries.length &&
+          samePageDecorations(log.value, entries);
+        if (!unchanged) {
+          replaceLog(entries);
+          if (!viewChanged) refreshLoadedBranches();
+        }
+        if (forced) recordRefs(repo, refsFp);
         // hasMore: in branch-only mode a full page is exactly `pageSize`. In
         // all-refs mode the backend appends stash start-points and filters the
         // `index on`/`untracked files on` pseudo-commits, so a full page returns
@@ -729,16 +1076,19 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
         logHasMore.value = isCurrentBranchOnly
           ? entries.length >= pageSize
           : log.value.length < effectiveTotalCount();
+        // Same rows, recorded as showing the current refs: a scroll page still
+        // in flight was read with older ones and is fetched again.
+        if (unchanged && forced) refetchPageInFlight();
       }
       // If a commit was selected but its diffs were lost, reload them
       if (selectedCommitHash.value && commitDiffs.value.length === 0) {
-        commitDiffs.value = await getGitShow(
-          folderPath.value,
-          selectedCommitHash.value,
-        );
+        const hash = selectedCommitHash.value;
+        setCommitDiffs(hash, await getGitShow(folderPath.value, hash));
       }
     } catch (err: any) {
       error.value = `git log: ${err?.message ?? err}`;
+    } finally {
+      _logLoadsInFlight--;
     }
   }
 
@@ -749,6 +1099,9 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   async function loadMoreLog(pageSize: number = LOG_PAGE) {
     if (!folderPath.value || !logHasMore.value || logLoadingMore.value) return;
     logLoadingMore.value = true;
+    _pageInFlight = { seq: ++_pageSeq, size: pageSize };
+    const epoch = _logViewEpoch;
+    const gen = _logGen;
     try {
       const authorEmail =
         logAuthorFilter.value === "mine"
@@ -765,6 +1118,11 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
         isCurrentBranchOnly ? (status.value?.branch ?? undefined) : undefined,
         activeScope.value ?? undefined,
       );
+      // The view changed while this page was in flight — it belongs to the
+      // old filter/scope, don't append it to the new log. Same when the log was
+      // replaced meanwhile: the page was fetched at the old log's `--skip`
+      // offset, so appending it would leave a gap (#266).
+      if (epoch !== _logViewEpoch || gen !== _logGen) return;
       // Dedupe: in all-refs mode the `--skip` offset counts filtered-out stash
       // pseudo-commits, so consecutive pages can overlap by a few commits.
       // Drop any hash we already have before appending.
@@ -784,14 +1142,31 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     } catch (err: any) {
       error.value = `git log (page): ${err?.message ?? err}`;
     } finally {
-      logLoadingMore.value = false;
+      // A view change or log replacement already reset the flag; don't clear
+      // a newer page's.
+      if (epoch === _logViewEpoch && gen === _logGen) logLoadingMore.value = false;
     }
   }
 
   async function setLogBranchFilter(filter: "all" | "current") {
     if (logBranchFilter.value === filter) return;
     logBranchFilter.value = filter;
-    await loadLog();
+    await reloadLogForViewChange();
+  }
+
+  /**
+   * Reload the log after the filter/scope changed. Cancels the canonical
+   * background prefetch and invalidates in-flight pages, then fetches the
+   * first page of the new view (or restores the cached full log when back on
+   * the canonical view).
+   */
+  async function reloadLogForViewChange() {
+    _logViewEpoch++;
+    _logGen++;
+    _prefetchToken++;
+    _logViewAnchor = null;
+    logLoadingMore.value = false;
+    await loadLog(undefined, false, true);
   }
 
   /**
@@ -804,7 +1179,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       currentGitUser.value = await getGitUser(folderPath.value);
     }
     logAuthorFilter.value = filter;
-    await loadLog();
+    await reloadLogForViewChange();
   }
 
   /**
@@ -814,9 +1189,21 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     if (!folderPath.value) return;
     selectedCommitHash.value = hash;
     try {
-      commitDiffs.value = await getGitShow(folderPath.value, hash);
+      const diffs = await getGitShow(folderPath.value, hash);
+      // Stashes are pushed with --include-untracked: those files live in the
+      // stash commit's 3rd parent, which `git show --first-parent` never sees.
+      if (stashes.value.some((s) => s.hash === hash)) {
+        try {
+          diffs.push(...(await getGitShow(folderPath.value, `${hash}^3`)));
+        } catch {
+          // No untracked part in this stash.
+        }
+      }
+      setCommitDiffs(hash, diffs);
     } catch (err: any) {
-      commitDiffs.value = [];
+      // A commit the user has since left must not wipe the one shown now.
+      if (selectedCommitHash.value !== hash) return;
+      setCommitDiffs(hash, []);
       error.value = `git show: ${err?.message ?? err}`;
     }
   }
@@ -915,7 +1302,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // git trailer convention: one blank line before the trailer block.
       const trailerBlock = trailers.trim();
       if (trailerBlock) fullMessage += `\n\n${trailerBlock}`;
-      const hash = await gitCommit(folderPath.value, fullMessage);
+      const hash = await gitCommit(folderPath.value, fullMessage, commitIdentityFor(folderPath.value));
       lastCommitHash.value = hash;
       commitSummary.value = "";
       commitDescription.value = getCommitSignatureDefault();
@@ -947,7 +1334,8 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       selectedFilePath.value = null;
       selectedFileStaged.value = false;
       diff.value = null;
-      await refresh();
+      // Force: amending rewrites HEAD, which may not be the log's top commit.
+      await refresh(true);
     } catch (err: any) {
       error.value = `amend: ${err?.message ?? err}`;
     }
@@ -955,7 +1343,33 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
 
   // ─── Push / Pull ────────────────────────────────────────
 
-  async function push(force: boolean = false) {
+  /**
+   * True when a push failed because the remote rejected a *create* for a ref
+   * that already exists there — the "cannot lock ref …: reference already
+   * exists" case that happens on a --set-upstream push with no local tracking
+   * ref. Matches git's English rejection text, which is stable across versions.
+   */
+  /** An error a push reported (raw, or one of its localized refusals). */
+  function isPushError(message: string | null): boolean {
+    if (!message) return false;
+    return (
+      message.startsWith("push: ") ||
+      message.startsWith(t("header.forcePushRemoteMoved")) ||
+      message.startsWith(t("header.forcePushUnmapped"))
+    );
+  }
+
+  function isRefAlreadyExistsError(message: string): boolean {
+    return /reference already exists/i.test(message);
+  }
+
+  /**
+   * `decidedLeaseSha`: for a force push, the remote tip the user was shown
+   * when they chose to force push (`forcePushTarget`), or `null` when that
+   * decision found none to lease. It wins over the auto-detected one, which
+   * only applies when it is `undefined` (no decision made).
+   */
+  async function push(force: boolean = false, decidedLeaseSha?: string | null) {
     if (!folderPath.value) return;
     if (!(await requireOnline("push"))) return;
     isPushing.value = true;
@@ -964,12 +1378,46 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // this covers both a genuine first publish and a branch that exists on
       // the remote but lost its tracking config.
       const publish = needsUpstream.value;
-      const result = await gitPush(folderPath.value, publish, force);
+      // A force push leases the remote tip it was judged against (by the user,
+      // or by the divergence probe), so it is refused if the remote moved since.
+      // `undefined`: no decision was made, the auto-detected lease applies
+      // (never on a publish, which pushes to `origin HEAD`, not `@{push}`).
+      // `null`: decided, with no lease (the backend falls back).
+      const leaseSha = !force
+        ? null
+        : decidedLeaseSha !== undefined
+          ? decidedLeaseSha
+          : publish
+            ? null
+            : autoForcePushSha.value;
+      const leaseBranch = status.value?.branch;
+      const lease = leaseSha && leaseBranch ? { branch: leaseBranch, sha: leaseSha } : undefined;
+      let result = await gitPush(folderPath.value, publish, force, lease);
+      // A --set-upstream push with no local remote-tracking ref sends a *create*
+      // command (old-oid 0000…). If the branch actually exists on the remote
+      // (pushed from another machine, tracking ref pruned, `gh pr checkout`…),
+      // the remote rejects it: "cannot lock ref …: reference already exists".
+      // `remoteBranchExists` only sees local refs, so we can't predict this.
+      // Recover: fetch to populate the tracking ref, then retry once — git now
+      // computes the real old-oid and sends an *update* (still fast-forward-
+      // guarded, so a diverged branch is safely rejected, never clobbered).
+      if (!result.success && publish && isRefAlreadyExistsError(result.message)) {
+        await gitFetch(folderPath.value);
+        result = await gitPush(folderPath.value, true, force, lease);
+      }
       if (!result.success) {
-        error.value = `push: ${result.message}`;
+        // The plain-words reason, plus git's own rejection line, which says
+        // which ref moved (or that it is gone).
+        error.value =
+          force && isForcePushRemoteMoved(result.message)
+            ? `${t("header.forcePushRemoteMoved")} (${forcePushRejectionLine(result.message)})`
+            : `push: ${result.message}`;
       } else {
         successMessage.value = "push-done";
         forcePushPreferred.value = false;
+        // A previous push's refusal no longer holds: drop its banner (and
+        // only that kind of error, not an unrelated one).
+        if (isPushError(error.value)) error.value = null;
       }
       // Force: push advances origin/<branch> but not local HEAD, so the log's
       // remote label must be re-pulled to move off the pre-push commit.
@@ -978,7 +1426,11 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
       // (e.g. the PR-create publish guard) see the new tracking state.
       await loadBranches();
     } catch (err: any) {
-      error.value = `push: ${err?.message ?? err}`;
+      const message = String(err?.message ?? err);
+      // The backend's UNMAPPED_PUSH_DEST refusal (ops.rs), in the user's language.
+      error.value = message.includes("the remote branch this push updates cannot be read")
+        ? t("header.forcePushUnmapped")
+        : `push: ${message}`;
     } finally {
       isPushing.value = false;
     }
@@ -1052,12 +1504,16 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
   }
 
   /**
-   * Post-checkout "Update branch": stash-if-dirty → pull --ff-only → pop.
+   * Post-checkout "Update branch": stash-if-dirty → pull → pop.
    *
-   * Used by the dedicated prompt shown when checking out a behind-only branch
-   * (behind > 0, ahead == 0). `--ff-only` fetches and fast-forwards atomically
-   * and refuses anything non-fast-forward, so a stale ahead/behind status
-   * (race since the last fetch) degrades into a clean error, never a merge.
+   * - `"ff-only"` — the prompt for a behind-only branch (behind > 0, ahead == 0).
+   *   `--ff-only` fetches and fast-forwards atomically and refuses anything
+   *   non-fast-forward, so a stale ahead/behind status (race since the last
+   *   fetch) degrades into a clean error, never a merge.
+   * - `"rebase"` — the prompt for a branch whose upstream was rewritten and
+   *   that has no commits of its own (`isUpstreamRewriteOnly`, #223).
+   *   `pull --rebase` uses the fork-point, so it drops the old upstream commits
+   *   and lands exactly on the rewritten branch; a merge would conflict.
    *
    * Returns:
    * - "ok"           — branch updated (WIP restored if it was stashed)
@@ -1067,7 +1523,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    *                    `message` carries the raw git error for the caller
    *                    to surface
    */
-  async function updateBranchFastForward(): Promise<{
+  async function updateBranchToUpstream(mode: "ff-only" | "rebase" = "ff-only"): Promise<{
     status: "ok" | "pop-conflict" | "failed";
     message?: string;
   }> {
@@ -1078,7 +1534,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     const dirty = !isClean.value;
     try {
       if (dirty) await gitStash(folderPath.value, "GitWand: update branch");
-      const result = await gitPull(folderPath.value, "ff-only");
+      const result = await gitPull(folderPath.value, mode);
       if (!result.success) {
         // The tree hasn't moved — the pop applies cleanly, restoring the WIP.
         if (dirty) await gitStashPop(folderPath.value).catch(() => {});
@@ -1209,11 +1665,12 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
    * `isCherryPicking` ref could not survive a reload or a repo opened while
    * already mid-cherry-pick, which is what #201 had to work around.
    */
-  async function cherryPick(hashes: string[]) {
+  async function cherryPick(hashes: string[], opts: { noCommit?: boolean } = {}) {
     if (!folderPath.value || hashes.length === 0) return;
     try {
-      const result = await gitCherryPick(folderPath.value, hashes);
-      await refresh();
+      const result = await gitCherryPick(folderPath.value, hashes, opts.noCommit ?? false);
+      // Force: in the all-refs log the new commit may not land on top.
+      await refresh(true);
 
       const hasConflictedFiles =
         status.value && status.value.conflicted.length > 0;
@@ -1235,6 +1692,11 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
         }
       } else if (!result.success) {
         error.value = `cherry-pick: ${result.message || "unknown error"}`;
+      } else if (opts.noCommit) {
+        // WIP pick: nothing was committed — show the picked files so the user
+        // can manage them before committing.
+        viewMode.value = "changes";
+        successMessage.value = "cherry-pick-wip-done";
       } else {
         successMessage.value = "cherry-pick-done";
       }
@@ -1264,7 +1726,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     if (!folderPath.value) return;
     try {
       await gitStashApply(folderPath.value, index);
-      await refresh();
+      await refresh(true);
     } catch (err: any) {
       error.value = `stash apply: ${err?.message ?? err}`;
     }
@@ -1275,10 +1737,9 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     try {
       await gitStashApply(folderPath.value, index);
       await gitStashDrop(folderPath.value, index);
-      await refresh();
-      await loadStashes();
       // Force: popping drops the stash ref, which the all-refs log renders.
-      await loadLog(undefined, true);
+      await refresh(true);
+      await loadStashes();
     } catch (err: any) {
       error.value = `stash pop: ${err?.message ?? err}`;
     }
@@ -1303,9 +1764,13 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
 
   async function loadBranches() {
     if (!folderPath.value) return;
+    const repo = folderPath.value;
     branchesLoading.value = true;
     try {
-      branches.value = await getGitBranches(folderPath.value, settings.value.defaultBranch);
+      const list = await getGitBranches(repo, settings.value.defaultBranch);
+      // A repo switch while this was in flight: don't show A's branches in B.
+      if (folderPath.value !== repo) return;
+      branches.value = list;
     } catch (err: any) {
       error.value = `branches: ${err?.message ?? err}`;
     } finally {
@@ -1324,6 +1789,8 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
 
   async function createBranch(name: string): Promise<boolean> {
     if (!folderPath.value) return false;
+    // Same busy flag as switchBranch: creating checks the new branch out.
+    isSwitchingBranch.value = true;
     try {
       await gitCreateBranch(folderPath.value, name, true);
       // Force: the new branch ref sits on the current HEAD, so the log's
@@ -1334,6 +1801,8 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     } catch (err: any) {
       error.value = `create branch: ${err?.message ?? err}`;
       return false;
+    } finally {
+      isSwitchingBranch.value = false;
     }
   }
 
@@ -1549,6 +2018,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     worktreeBranches,
     selectedCommitHash,
     commitDiffs,
+    commitDiffsHash,
     // Computed
     hasRepo,
     branchDisplay,
@@ -1579,11 +2049,13 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     openRepo,
     closeRepo,
     refresh,
+    refreshOnRefsEvent,
     selectFile,
     loadLog,
     loadMoreLog,
     setLogAuthorFilter,
     setLogBranchFilter,
+    setLogViewAnchor,
     stageFiles,
     stageAll,
     unstageFiles,
@@ -1594,7 +2066,7 @@ export function useGitRepo(opts: { confirm?: ConfirmFn } = {}) {
     amendCommit,
     push,
     pull,
-    updateBranchFastForward,
+    updateBranchToUpstream,
     fetch: fetchRemote,
     mergeBranch,
     discardFiles,

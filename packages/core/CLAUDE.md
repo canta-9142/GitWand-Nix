@@ -101,7 +101,8 @@ interface PatternPlugin {
   requires: "diff3" | "diff2" | "both"; // diff3 = base requise, diff2 = sans base
   detect(h: ClassifyInput): boolean;     // retourne true si le pattern s'applique
   confidence(h: ClassifyInput): ConfidenceScore;
-  explanation(h: ClassifyInput): string; // texte lisible pour l'UI
+  explanation(h: ClassifyInput): string; // texte lisible pour l'UI (anglais)
+  explanationRef?(h: ClassifyInput): ExplanationRef; // même texte en clé + paramètres, pour la traduction
   passReason(h: ClassifyInput): string;  // trace debug — pourquoi ça a matché
   failReason(h: ClassifyInput): string;  // trace debug — pourquoi ça n'a pas matché
 }
@@ -127,12 +128,16 @@ interface PatternPlugin {
        return makeScore(/* score 0–100 */, 0, scopeImpact(h.oursLines.length), ["raison"], []);
      },
      explanation(_h) { return "Description lisible pour l'UI."; },
+     explanationRef(_h) { return { key: "monPattern" }; }, // la même branche que explanation()
      passReason(_h) { return "Raison technique du match."; },
      failReason(_h) { return "Raison technique du non-match."; },
    };
    export default monPattern;
    ```
 2. Ajouter `"mon_pattern"` à l'union `ConflictType` dans `src/types.ts`.
+   Ajouter sa clé d'explication (et son nombre de paramètres) à `EXPLANATION_PARAMS`
+   dans `src/explanation-keys.ts`, puis sa traduction dans chaque
+   `apps/desktop/src/locales/explain/<code>.ts` (ils ne compilent pas sans).
 3. Importer et enregistrer dans `src/classifier.ts` dans le tableau `PATTERNS`
    (avec un commentaire `// priority XX`).
 4. Ajouter les tests dans `__tests__/patterns/mon-pattern.test.ts`
@@ -193,6 +198,8 @@ const isContextLine = (line: string) => !line.startsWith('\\')
 ```
 
 Voir aussi la note globale dans `AGENTS.md` / mémoire projet sur ce sujet.
+
+Les parseurs de diff unifié doivent passer par `src/hunk-body.ts` (`classifyHunkLine`, `hunkBodyFromHeader`) : le hunk est borné par les comptes de son en-tête `@@`, ce qui distingue un `--- x` de contenu d'un en-tête de fichier, et rend sûr de traiter `''` comme contexte tant qu'il reste des lignes des deux côtés (`diff.suppressBlankEmpty`). Jumeau Rust : `HunkBody` dans `apps/desktop/src-tauri/src/git/parse.rs`.
 
 ---
 

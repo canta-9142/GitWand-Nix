@@ -28,6 +28,7 @@ const hunk = (over: Partial<PreviewHunk>): PreviewHunk => ({
   confidenceScore: 83,
   confidenceLabel: "high",
   reason: "version bump resolved to the highest semver",
+  explanation: "Same structure with 1 differing volatile value.",
   ...over,
 });
 
@@ -127,13 +128,22 @@ describe("MergePreviewPanel — confidence bar", () => {
     expect(bars[2].className).toContain("ph-confidence--medium");
   });
 
-  it("puts the score and the reason in the tooltip of every row", async () => {
+  it("puts the score and core's reason in the tooltip of every row (English UI)", async () => {
     mountPanel(base(0));
     await expandFile();
     const row = container.querySelector<HTMLElement>(".preview-hunk")!;
     expect(row.title).toContain("83%");
     expect(row.title).toContain("high");
     expect(row.title).toContain("version bump");
+    // In English the explanation would say it twice: not added.
+    expect(row.title).not.toContain("differing volatile value");
+  });
+
+  it("adds core's reason to the tooltip of a hunk left to the user", async () => {
+    mountPanel(base(0));
+    await expandFile();
+    const rows = Array.from(container.querySelectorAll<HTMLElement>(".preview-hunk"));
+    expect(rows.some((r) => r.title.includes("no automatic heuristic applies"))).toBe(true);
   });
 
   it("shows no number at a bar of 0: it would not be actionable", async () => {
@@ -182,5 +192,51 @@ describe("MergePreviewPanel — confidence bar", () => {
     // 1 auto-resolvable, 1 held back, 1 manual.
     expect(line).toMatch(/\b1\b/);
     expect(line.match(/\b1\b/g)?.length).toBe(3);
+  });
+});
+
+describe("MergePreviewPanel — embedded apply (v3.13 merge-back)", () => {
+  const clean = (): MergePreviewSummary => ({
+    sourceBranch: "task/feat-a",
+    files: [],
+    conflictingFiles: 0,
+    autoResolvableFiles: 0,
+    manualFiles: 0,
+    cleanFiles: 3,
+    fullyAutoMergeable: true,
+  });
+
+  it("offers an apply button on a clean preview inside the merge-back dialog", async () => {
+    const state = reactive({ applies: 0 });
+    const Wrapper = defineComponent({
+      setup() {
+        return () =>
+          h(MergePreviewPanel, {
+            loading: false,
+            error: null,
+            summary: clean(),
+            conflictingFiles: [],
+            embedded: true,
+            onApply: () => {
+              state.applies++;
+            },
+          } as never);
+      },
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    app = createApp(Wrapper);
+    app.mount(container);
+    await nextTick();
+    const btn = container.querySelector<HTMLButtonElement>(".preview-apply__btn");
+    expect(btn, "a clean merge-back must still be applicable").not.toBeNull();
+    btn!.click();
+    expect(state.applies).toBe(1);
+  });
+
+  it("shows no apply button on a clean preview outside the dialog", async () => {
+    mountPanel({ summary: clean(), conflictingFiles: [] });
+    await nextTick();
+    expect(container.querySelector(".preview-apply__btn")).toBeNull();
   });
 });

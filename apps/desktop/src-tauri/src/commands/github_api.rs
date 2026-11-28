@@ -36,8 +36,10 @@
 //! harden via `curl --config -` stdin piping in a follow-up). The token is
 //! never logged or included in error messages.
 
-use super::curl_util::{bearer_config, curl_with_headers, curl_with_status};
-use crate::git::{git_cmd, hidden_cmd};
+use super::curl_util::{
+    bearer_config, curl_with_headers, curl_with_status, curl_with_status_bounded, RequestOpts,
+};
+use crate::git::{git_cmd, hidden_cmd, PATCH_CONFIG, PATCH_FLAGS};
 use crate::types::*;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -96,49 +98,297 @@ pub(crate) fn settings_github_token() -> Option<String> {
     }
 }
 
+// ─── Organizations that restrict OAuth apps ────────────────────────────────
+//
+// An organization can enable "OAuth App access restrictions": every OAuth app
+// it has not approved gets a 403 on its data, even with a valid token. The
+// GitWand sign-in is such an app, while the `gh` CLI (its own OAuth app) is
+// often approved. So when the GitWand token is refused that way for a
+// repository and `gh` is signed in, that repository uses the `gh` path for the
+// rest of the session; other repositories keep the GitWand token.
+
+/// Repositories (by working directory) whose organization refused the
+/// GitWand token. Process-lifetime: a restart tries the GitWand token again.
+static OAUTH_RESTRICTED_REPOS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn repo_key(cwd: &str) -> String {
+    cwd.trim_end_matches(['/', '\\']).to_string()
+}
+
+fn restricted_repos() -> &'static Mutex<std::collections::HashSet<String>> {
+    OAUTH_RESTRICTED_REPOS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn is_marked_restricted(cwd: &str) -> bool {
+    restricted_repos()
+        .lock()
+        .map(|set| set.contains(&repo_key(cwd)))
+        .unwrap_or(false)
+}
+
+fn mark_restricted(cwd: &str) {
+    if let Ok(mut set) = restricted_repos().lock() {
+        set.insert(repo_key(cwd));
+    }
+}
+
+/// True when a checks request was refused for good rather than failed: a 403
+/// or 404 (a fine-grained token without "Checks: read", checks not visible),
+/// in the REST error format (`GitHub API error (403): …`) or gh's (`… (HTTP
+/// 403)`). Not a rate limit (GitHub answers those with 403 too) and not an
+/// organization's OAuth app restriction, which `with_rest` retries through gh.
+pub(crate) fn checks_unavailable(err: &str) -> bool {
+    let code = [403, 404].iter().any(|&c| api_error_has_status(err, c));
+    code && !err.to_lowercase().contains("rate limit") && !is_oauth_restricted(err)
+}
+
+/// Whether a GitHub error carries HTTP status `code`, in the REST format
+/// (`GitHub API error (404): …`) or gh's (`… (HTTP 404)`); anchored on the
+/// status, so a path echoed in the message (`crash (404).md`) does not count.
+pub(crate) fn api_error_has_status(err: &str, code: u16) -> bool {
+    err.starts_with(&format!("GitHub API error ({code})"))
+        || err.contains(&format!("(HTTP {code})"))
+}
+
+/// True for GitHub's 403 "organization has enabled OAuth App access
+/// restrictions" error, as `map_api_error` formats it.
+pub(crate) fn is_oauth_restricted(err: &str) -> bool {
+    err.contains("OAuth App access restrictions")
+}
+
+/// The error to show when the GitWand token is refused by an organization and
+/// there is no `gh` CLI to fall back to: what happened and the two ways out.
+pub(crate) fn oauth_restricted_message(err: &str) -> String {
+    let org = err
+        .split_once("the `")
+        .and_then(|(_, rest)| rest.split_once("` organization"))
+        .map(|(name, _)| name.to_string());
+    let who = match &org {
+        Some(name) => format!("The {} organization", name),
+        None => "This repository's organization".to_string(),
+    };
+    format!(
+        "{} restricts access by third-party OAuth apps and has not approved GitWand, \
+         so the GitHub account signed in under Settings > Accounts cannot read it. \
+         Either sign in to the GitHub CLI (`gh auth login`), which GitWand then uses \
+         for this repository, or ask an organization owner to approve GitWand \
+         (github.com/settings/applications > GitWand > Organization access).",
+        who
+    )
+}
+
+/// The GitWand token to use for `cwd`, unless its organization refused it.
+fn token_for_repo(cwd: &str, settings_token: Option<String>) -> Option<String> {
+    // Checked only when there is a token: an `origin` on a GitHub Enterprise
+    // host goes to `gh`, which is signed in there — the Settings sign-in only
+    // covers github.com.
+    if settings_token.is_none() || is_marked_restricted(cwd) || super::gh::origin_is_enterprise(cwd)
+    {
+        None
+    } else {
+        settings_token
+    }
+}
+
+/// Testable core of [`with_rest`]: `token` is the Settings token and
+/// `gh_signed_in` says whether the `gh` CLI can take over. A refusal is
+/// remembered under `key`: `cwd` itself for its `origin`, another key for a
+/// call about another repository (a fork's parent), whose organization says
+/// nothing about the checkout's own.
+fn rest_attempt<T>(
+    cwd: &str,
+    key: &str,
+    token: Option<String>,
+    gh_signed_in: impl FnOnce() -> bool,
+    call: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    if key != cwd && is_marked_restricted(key) {
+        return None;
+    }
+    let tok = token_for_repo(cwd, token)?;
+    match call(&tok) {
+        Err(e) if is_oauth_restricted(&e) => {
+            if gh_signed_in() {
+                mark_restricted(key);
+                None
+            } else {
+                Some(Err(oauth_restricted_message(&e)))
+            }
+        }
+        other => Some(other),
+    }
+}
+
+/// Run `call` with the Settings token when there is one for `cwd`.
+///
+/// `None` tells the caller to take its `gh` path: there is no Settings token,
+/// or the organization refused it (OAuth App access restrictions) and `gh` is
+/// signed in, in which case the repository is remembered so later commands go
+/// straight to `gh`. Without `gh`, the refusal comes back as an error that
+/// explains it.
+pub(crate) fn with_rest<T>(
+    cwd: &str,
+    call: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    with_rest_using(cwd, settings_github_token().as_deref(), call)
+}
+
+/// [`with_rest`] with a Settings token read once by the caller, for commands
+/// that loop over many repositories.
+pub(crate) fn with_rest_using<T>(
+    cwd: &str,
+    token: Option<&str>,
+    call: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    rest_attempt(
+        cwd,
+        cwd,
+        token.map(String::from),
+        || super::gh::gh_auth_token().is_some(),
+        call,
+    )
+}
+
+/// [`with_rest_using`] for a call about `nwo`, another repository than `cwd`'s
+/// `origin` (a fork's parent): an OAuth App refusal from its organization is
+/// remembered for `nwo` (later calls about it go straight to `gh`) without
+/// marking `cwd` restricted.
+pub(crate) fn with_rest_other_repo_using<T>(
+    cwd: &str,
+    nwo: &str,
+    token: Option<&str>,
+    call: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    rest_attempt(
+        cwd,
+        &format!("repo:{}", nwo),
+        token.map(String::from),
+        || super::gh::gh_auth_token().is_some(),
+        call,
+    )
+}
+
+/// [`with_rest`] for a call about one of the base repo's pull requests. On a
+/// fork, an OAuth App refusal comes from the parent's organization: it is
+/// remembered for the parent ([`with_rest_other_repo_using`]), and the
+/// user's own fork keeps its REST calls. Not a fork (or no token): as
+/// [`with_rest`].
+pub(crate) fn with_rest_pr<T>(
+    cwd: &str,
+    call: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    with_rest_pr_using(cwd, settings_github_token().as_deref(), call)
+}
+
+/// [`with_rest_pr`] with a Settings token read once by the caller, for
+/// commands that loop over many repositories (the Launchpad).
+pub(crate) fn with_rest_pr_using<T>(
+    cwd: &str,
+    token: Option<&str>,
+    call: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    if cached_fork_parent(cwd).is_none() && !fork_info_cached(cwd) {
+        // Not known yet: look the fork up first — a request to `origin`
+        // itself, so through the origin-keyed wrapper — and stop on its
+        // error. Going on without it would let the call's own lookup succeed
+        // and its parent's refusal be remembered for `cwd`.
+        match with_rest_using(cwd, token, |tok| rest_fork_info(cwd, tok)) {
+            None => return None,
+            Some(Err(e)) => return Some(Err(e)),
+            Some(Ok(_)) => {}
+        }
+    }
+    match cached_fork_parent(cwd) {
+        Some(parent) => with_rest_other_repo_using(cwd, &parent, token, call),
+        None => with_rest_using(cwd, token, call),
+    }
+}
+
+/// Whether `cwd`'s fork lookup is in `FORK_INFO_CACHE`.
+fn fork_info_cached(cwd: &str) -> bool {
+    let Ok((owner, repo)) = owner_repo(cwd) else {
+        return false;
+    };
+    let cache = FORK_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cache
+        .lock()
+        .unwrap()
+        .contains_key(&format!("{}/{}", owner, repo));
+    cached
+}
+
+/// `cwd`'s fork parent from `FORK_INFO_CACHE`, without a request: `None` when
+/// the fork has not been looked up yet, or `origin` is not a fork.
+fn cached_fork_parent(cwd: &str) -> Option<String> {
+    let (owner, repo) = owner_repo(cwd).ok()?;
+    let cache = FORK_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let fi = cache
+        .lock()
+        .unwrap()
+        .get(&format!("{}/{}", owner, repo))?
+        .clone();
+    (fi.is_fork && !fi.parent.is_empty()).then_some(fi.parent)
+}
+
 // ─── Owner/repo resolution ──────────────────────────────────────────────────
 
 /// Parse `(owner, repo)` from `git remote get-url origin` in `cwd`.
 ///
-/// Handles HTTPS and SSH GitHub remote URL formats.
+/// Same parser as the `gh` path (`gh::gh_repo_from_remote_url`), so both
+/// read `origin` alike (HTTPS, SSH with any user, SSH aliases, ports). This
+/// REST path only talks to api.github.com: an `origin` on another host is an
+/// error, not a call to github.com for a same-named repo.
 fn owner_repo(cwd: &str) -> Result<(String, String), String> {
-    let output = hidden_cmd("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("git remote get-url: {}", e))?;
-    if !output.status.success() {
-        return Err("No 'origin' remote found in this repo.".to_string());
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    let path = if url.starts_with("git@") || url.contains("@github.com:") {
-        // git@github.com:owner/repo.git → owner/repo
-        url.split_once(':')
-            .map(|x| x.1)
-            .unwrap_or("")
-            .trim_end_matches(".git")
-            .to_string()
-    } else {
-        // https://github.com/owner/repo.git → owner/repo
-        url.trim_end_matches('/')
-            .trim_end_matches(".git")
-            .split_once("github.com/")
-            .map(|x| x.1)
-            .unwrap_or("")
-            .to_string()
+    // Cached with `token_for_repo`'s own lookup (`gh_origin_repo`).
+    let repo = match super::gh::gh_origin_repo(cwd) {
+        Some(r) => r,
+        None => {
+            let output = hidden_cmd("git")
+                .args(["remote", "get-url", "origin"])
+                .current_dir(cwd)
+                .output()
+                .map_err(|e| format!("git remote get-url: {}", e))?;
+            if !output.status.success() {
+                return Err("No 'origin' remote found in this repo.".to_string());
+            }
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Err(format!(
+                "Could not parse GitHub owner/repo from remote URL: {}",
+                redact_url_userinfo(&url)
+            ));
+        }
     };
-
-    let mut parts = path.splitn(2, '/');
-    let owner = parts.next().unwrap_or("").to_string();
-    let repo = parts.next().unwrap_or("").to_string();
-    if owner.is_empty() || repo.is_empty() {
+    // `with_rest` sends Enterprise origins to `gh` (`token_for_repo`), but the
+    // review-comment commands, which only speak REST, still get here with the
+    // `gh` token (`with_review_token`).
+    if let Some(host) = repo.enterprise_host() {
         return Err(format!(
-            "Could not parse GitHub owner/repo from remote URL: {}",
-            url
+            "origin is on {}: GitWand's GitHub REST requests only reach github.com",
+            host
         ));
     }
-    Ok((owner, repo))
+    let (owner, name) = repo
+        .nwo
+        .split_once('/')
+        .ok_or_else(|| "Could not parse GitHub owner/repo from origin".to_string())?;
+    Ok((owner.to_string(), name.to_string()))
+}
+
+/// `url` without the `user[:password]@` of a `scheme://` URL, which can carry
+/// a token (`https://oauth2:glpat-…@host/…`): safe to show in an error.
+fn redact_url_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            if path.is_empty() && !rest.contains('/') {
+                format!("{}://{}", scheme, host)
+            } else {
+                format!("{}://{}/{}", scheme, host, path)
+            }
+        }
+        None => url.to_string(),
+    }
 }
 
 /// Current branch name (`git rev-parse --abbrev-ref HEAD`).
@@ -179,12 +429,43 @@ fn curl_raw(
 
 /// Map an HTTP ≥ 400 response to a user-facing error, preferring GitHub's
 /// `message` field over the bare status code.
-fn map_api_error(status: i32, body: &str) -> String {
-    let msg = serde_json::from_str::<serde_json::Value>(body.trim())
-        .ok()
+pub(crate) fn map_api_error(status: i32, body: &str) -> String {
+    let v = serde_json::from_str::<serde_json::Value>(body.trim()).ok();
+    let msg = v
+        .as_ref()
         .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
         .unwrap_or_else(|| format!("HTTP {}", status));
-    format!("GitHub API error ({}): {}", status, msg)
+    // A 422 says which field it refused in `errors[]` ("Validation Failed"
+    // alone does not tell an invalid assignee from an unknown milestone).
+    let details: Vec<String> = v
+        .as_ref()
+        .and_then(|v| v.get("errors"))
+        .and_then(|e| e.as_array())
+        .map(|errs| {
+            errs.iter()
+                .filter_map(|e| {
+                    let s = |k: &str| e.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty());
+                    s("message")
+                        .map(String::from)
+                        .or_else(|| match (s("field"), s("code")) {
+                            (Some(f), Some(c)) => Some(format!("{}: {}", f, c)),
+                            (None, Some(c)) => Some(c.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if details.is_empty() {
+        format!("GitHub API error ({}): {}", status, msg)
+    } else {
+        format!(
+            "GitHub API error ({}): {} ({})",
+            status,
+            msg,
+            details.join("; ")
+        )
+    }
 }
 
 /// Parse a (possibly empty) JSON response body. An empty body maps to `Null` so
@@ -223,19 +504,141 @@ fn api_json(
 /// GitHub does **not** count `304 Not Modified` responses against the REST rate
 /// limit, so re-fetching an unchanged resource via `If-None-Match` is free. The
 /// PR list poller hits the same per-PR detail / check-run URLs every few minutes;
-/// once cached, unchanged PRs cost zero quota. Unbounded but bounded in practice
-/// by the set of PR/commit URLs visited in a session (same lifetime model as
-/// `GIT_DIR_CACHE`).
-static ETAG_CACHE: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+/// once cached, unchanged PRs cost zero quota. It holds full PR bodies
+/// (get_pr_json) too, so it is bounded: least recently used entries go first,
+/// and the live CI tab's few entries, used every poll, stay.
+static ETAG_CACHE: OnceLock<Mutex<EtagCache>> = OnceLock::new();
+const ETAG_CACHE_MAX: usize = 512;
+
+/// A small LRU of `(etag, body)` by key. Eviction scans for the least recently
+/// used entry: O(n) on insert into a full cache, fine at this size.
+struct EtagCache {
+    map: HashMap<String, (String, String, u64)>,
+    clock: u64,
+    max: usize,
+}
+
+impl EtagCache {
+    fn new(max: usize) -> Self {
+        EtagCache {
+            map: HashMap::new(),
+            clock: 0,
+            max,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<(String, String)> {
+        self.clock += 1;
+        let now = self.clock;
+        self.map.get_mut(key).map(|e| {
+            e.2 = now;
+            (e.0.clone(), e.1.clone())
+        })
+    }
+
+    fn insert(&mut self, key: String, etag: String, body: String) {
+        self.clock += 1;
+        if self.map.len() >= self.max && !self.map.contains_key(&key) {
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.2)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(key, (etag, body, self.clock));
+    }
+}
+
+/// ETAG_CACHE key: the URL and a fingerprint of the token, so a body fetched
+/// with one account is never served on a 304 to another. The token itself is
+/// not kept.
+fn etag_key(url: &str, token: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    format!("{:016x} {}", h.finish(), url)
+}
+
+/// `method {API_BASE}/{path}` with `token`, for callers outside this module
+/// (`path` without a leading slash, e.g. `repos/o/r/labels`).
+pub(crate) fn rest_api_json(
+    method: &str,
+    path: &str,
+    token: &str,
+    body_json: Option<&str>,
+    max_time_secs: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}/{}", API_BASE, path);
+    let (status, body) = curl_with_status_bounded(
+        method,
+        &url,
+        Some(&bearer_config(token)),
+        body_json,
+        &["User-Agent: GitWand", "X-GitHub-Api-Version: 2022-11-28"],
+        "application/vnd.github+json",
+        RequestOpts {
+            max_time_secs,
+            // A renamed or transferred repository answers a read with a 301
+            // to its new name, which the `gh` path follows too. A write is
+            // never re-sent to another address.
+            follow_redirects: method == "GET",
+            ..RequestOpts::default()
+        },
+    )?;
+    if status >= 400 {
+        return Err(map_api_error(status, &body));
+    }
+    parse_json_body(&body)
+}
+
+/// [`api_json_cached`] for callers outside this module (`path` without a
+/// leading slash).
+pub(crate) fn rest_api_json_cached(path: &str, token: &str) -> Result<serde_json::Value, String> {
+    api_json_cached(&format!("{}/{}", API_BASE, path), token, None)
+}
+
+/// `rest_api_json_cached` bounded at `secs` (curl `--max-time`): a read the
+/// form waits on must not hang on a stalled transfer.
+pub(crate) fn rest_api_json_cached_within(
+    path: &str,
+    token: &str,
+    secs: u32,
+) -> Result<serde_json::Value, String> {
+    api_json_cached(&format!("{}/{}", API_BASE, path), token, Some(secs))
+}
 
 /// GET a GitHub JSON endpoint with ETag-based conditional requests.
 ///
 /// Sends `If-None-Match` when a cached ETag exists; a `304` serves the cached
 /// body without spending rate-limit quota. A `200` refreshes the cache from the
 /// response `ETag`. Falls back to a plain fetch when no ETag is returned.
-fn api_json_cached(url: &str, token: &str) -> Result<serde_json::Value, String> {
-    let cache = ETAG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cached = cache.lock().unwrap().get(url).cloned();
+fn api_json_cached(
+    url: &str,
+    token: &str,
+    max_time_secs: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let (status, body) = get_cached_raw(url, token, max_time_secs)?;
+    if status >= 400 {
+        return Err(map_api_error(status, &body));
+    }
+    parse_json_body(&body)
+}
+
+/// A conditional GET (`If-None-Match` from ETAG_CACHE): a 304 costs nothing
+/// against the rate limit and answers `(200, cached body)`. Other answers come
+/// back as they are; a 2xx with an ETag is cached. The live CI tab polls
+/// through this, so a long matrix doesn't drain the hourly budget.
+fn get_cached_raw(
+    url: &str,
+    token: &str,
+    max_time_secs: Option<u32>,
+) -> Result<(i32, String), String> {
+    let cache = ETAG_CACHE.get_or_init(|| Mutex::new(EtagCache::new(ETAG_CACHE_MAX)));
+    let key = etag_key(url, token);
+    let cached = cache.lock().unwrap().get(&key);
 
     let auth = bearer_config(token);
     let inm = cached
@@ -253,6 +656,7 @@ fn api_json_cached(url: &str, token: &str) -> Result<serde_json::Value, String> 
         None,
         &headers,
         "application/vnd.github+json",
+        max_time_secs,
     )?;
 
     if status == 304 {
@@ -260,24 +664,23 @@ fn api_json_cached(url: &str, token: &str) -> Result<serde_json::Value, String> 
         // cache entry exists, so `cached` is Some here; if it's somehow not,
         // fail loudly rather than silently parsing an empty body as data.
         return match cached {
-            Some((_, cached_body)) => parse_json_body(&cached_body),
+            Some((_, cached_body)) => Ok((200, cached_body)),
             None => Err(format!(
                 "304 Not Modified received for {url} with no cached body"
             )),
         };
     }
-    if status >= 400 {
-        return Err(map_api_error(status, &body));
-    }
-    if let Some(etag) = resp_headers.get("etag") {
-        if !etag.is_empty() {
-            cache
-                .lock()
-                .unwrap()
-                .insert(url.to_string(), (etag.clone(), body.clone()));
+    if status < 400 {
+        if let Some(etag) = resp_headers.get("etag") {
+            if !etag.is_empty() {
+                cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, etag.clone(), body.clone());
+            }
         }
     }
-    parse_json_body(&body)
+    Ok((status, body))
 }
 
 // ─── JSON field helpers ─────────────────────────────────────────────────────
@@ -468,6 +871,78 @@ pub(crate) fn rest_current_user(token: &str) -> Result<String, String> {
     Ok(login)
 }
 
+/// Merged pull requests of `repo`, most recently updated first, from
+/// search-API pages of `per_page` starting at `first_page`: `count` of them
+/// after skipping `skip`, each read as a pull-request object. Past the search
+/// API's 1 000-result window the list ends there.
+fn merged_prs_page(
+    repo: &str,
+    per_page: usize,
+    first_page: usize,
+    skip: usize,
+    count: usize,
+    token: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    /// The search API serves its first 1 000 results only (422 past them).
+    const SEARCH_WINDOW: usize = 1_000;
+    let mut numbers: Vec<i64> = Vec::new();
+    for n in first_page.. {
+        if (n - 1) * per_page >= SEARCH_WINDOW {
+            break;
+        }
+        let v = api_json_cached(
+            &format!(
+                "{}/search/issues?q=repo:{}+type:pr+is:merged&sort=updated&order=desc&per_page={}&page={}",
+                API_BASE,
+                enc_nwo(repo),
+                per_page,
+                n
+            ),
+            token,
+            None,
+        )?;
+        let items = v
+            .get("items")
+            .and_then(|i| i.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let short = items.len() < per_page;
+        numbers.extend(
+            items
+                .iter()
+                .filter_map(|i| i.get("number").and_then(|x| x.as_i64())),
+        );
+        if short || numbers.len() >= skip + count {
+            break;
+        }
+    }
+    // Only the numbers the slice keeps are read as pull requests, in
+    // parallel; one that cannot be read is left out rather than failing the
+    // page.
+    let wanted: Vec<i64> = numbers.into_iter().skip(skip).take(count).collect();
+    Ok(wanted
+        .par_iter()
+        .filter_map(|num| {
+            api_json_cached(
+                &format!("{}/repos/{}/pulls/{}", API_BASE, repo, num),
+                token,
+                None,
+            )
+            .ok()
+        })
+        .collect())
+}
+
+/// How `rest_list_prs` pages through `offset + limit` PRs: `(per_page,
+/// first_page, PRs on the pages skipped before it)`. Up to 100, one page of
+/// exactly that size (as before); past 100, pages of 100, starting at the
+/// page holding `offset` (the search API pages merged PRs the same way).
+fn list_page_plan(offset: usize, limit: usize) -> (usize, usize, usize) {
+    let per_page = (offset + limit).clamp(1, 100);
+    let first_page = offset / per_page + 1;
+    (per_page, first_page, (first_page - 1) * per_page)
+}
+
 pub(crate) fn rest_list_prs(
     cwd: &str,
     state: &str,
@@ -475,14 +950,14 @@ pub(crate) fn rest_list_prs(
     offset: i64,
     token: &str,
 ) -> Result<Vec<PullRequest>, String> {
-    let (owner, repo) = owner_repo(cwd)?;
-    let origin = format!("{}/{}", owner, repo);
-    let base = base_owner_repo(cwd, token).unwrap_or_else(|_| origin.clone());
+    /// Pages read at most for one list call.
+    const LIST_PRS_MAX_PAGES: usize = 10;
+    // The base repo, or the fork lookup's error: a list built from origin
+    // would show numbers every PR action then resolves in the parent (#262).
+    let base = base_owner_repo(cwd, token)?;
 
     let page = limit.max(1);
     let off = offset.max(0);
-    // Naïve pagination identical to gh_list_prs: fetch offset+limit, then slice.
-    let per_page = (page + off).clamp(1, 100);
     // "merged" is not a native GitHub pulls state — fetch closed and filter.
     let api_state = match state {
         "closed" => "closed",
@@ -490,34 +965,67 @@ pub(crate) fn rest_list_prs(
         "all" => "all",
         _ => "open",
     };
+    let keep = |pr: &serde_json::Value| {
+        state != "merged" || pr.get("merged_at").map(|m| !m.is_null()).unwrap_or(false)
+    };
 
-    // Fetch PRs from the base repository (matches `gh pr list` behavior).
-    let raw: Vec<serde_json::Value> = api_json_cached(
-        &format!(
-            "{}/repos/{}/pulls?state={}&per_page={}&page=1&sort=updated&direction=desc",
-            API_BASE, base, api_state, per_page
-        ),
-        token,
-    )?
-    .as_array()
-    .cloned()
-    .unwrap_or_default();
-
-    let mut prs: Vec<PullRequest> = raw
-        .iter()
-        .filter(|pr| {
-            if state == "merged" {
-                pr.get("merged_at").map(|m| !m.is_null()).unwrap_or(false)
-            } else {
-                true
-            }
-        })
-        .map(json_to_pr)
-        .collect();
-    if off > 0 {
-        let skip = (off as usize).min(prs.len());
-        prs.drain(..skip);
+    // Fetch PRs from the base repository (matches `gh pr list` behavior):
+    // `offset + limit` kept PRs, then the slice. Up to 100 that is one page of
+    // exactly that size (as before); past 100, pages of 100 until enough are
+    // kept or the list ends — a single page capped at 100 returned nothing at
+    // offset 100 and stopped "load more" there.
+    let want = (page + off) as usize;
+    let merged = state == "merged";
+    let (per_page, first_page, skip_in_pages) = list_page_plan(off as usize, page as usize);
+    let mut raw: Vec<serde_json::Value> = Vec::new();
+    if merged {
+        // Merged PRs come from the search API (`is:merged`, like the count),
+        // which pages them directly: closed pages filtered client-side hit a
+        // page cap, then an empty page that ended "load more". Each number is
+        // then read as a pull request (the enrichment below reads the same
+        // URL, so the ETag cache answers it).
+        let local_skip = off as usize - skip_in_pages;
+        raw = merged_prs_page(
+            &base,
+            per_page,
+            first_page,
+            local_skip,
+            page as usize,
+            token,
+        )?;
     }
+    for n in first_page..first_page + LIST_PRS_MAX_PAGES {
+        if merged {
+            break;
+        }
+        let chunk: Vec<serde_json::Value> = api_json_cached(
+            &format!(
+                "{}/repos/{}/pulls?state={}&per_page={}&page={}&sort=updated&direction=desc",
+                API_BASE, base, api_state, per_page, n
+            ),
+            token,
+            None,
+        )?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+        let short = chunk.len() < per_page;
+        raw.extend(chunk);
+        if short {
+            break;
+        }
+        if skip_in_pages + raw.iter().filter(|pr| keep(pr)).count() >= want {
+            break;
+        }
+    }
+    let mut prs: Vec<PullRequest> = raw.iter().filter(|pr| keep(pr)).map(json_to_pr).collect();
+    // `merged` already read only its window.
+    let skip = if merged {
+        0
+    } else {
+        (off as usize).saturating_sub(skip_in_pages).min(prs.len())
+    };
+    prs.drain(..skip);
     prs.truncate(page as usize);
 
     // The list endpoint omits additions/deletions and returns a null/unknown
@@ -603,16 +1111,15 @@ pub(crate) fn rest_pr_freshness_signal(
     cwd: &str,
     token: &str,
 ) -> Result<Option<PrFreshnessSignal>, String> {
-    let base = base_owner_repo(cwd, token).unwrap_or_else(|_| {
-        let (o, r) = owner_repo(cwd).unwrap_or_default();
-        format!("{}/{}", o, r)
-    });
+    // Same repo, and same failure, as the list.
+    let base = base_owner_repo(cwd, token)?;
     let raw: Vec<serde_json::Value> = api_json_cached(
         &format!(
             "{}/repos/{}/pulls?state=open&per_page=1&page=1&sort=updated&direction=desc",
             API_BASE, base
         ),
         token,
+        None,
     )?
     .as_array()
     .cloned()
@@ -640,8 +1147,13 @@ fn rest_rollup_for_sha(repo: &str, sha: &str, token: &str) -> String {
     if sha.is_empty() {
         return String::new();
     }
-    let url = format!("{}/repos/{}/commits/{}/check-runs", API_BASE, repo, sha);
-    let v = match api_json_cached(&url, token) {
+    // per_page=100 like the CI tab's own fetch: a big matrix must not look
+    // finished on its first 30 runs.
+    let url = format!(
+        "{}/repos/{}/commits/{}/check-runs?per_page=100",
+        API_BASE, repo, sha
+    );
+    let v = match api_json_cached(&url, token, None) {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
@@ -664,7 +1176,7 @@ fn rest_rollup_for_sha(repo: &str, sha: &str, token: &str) -> String {
 /// Best effort — returns `None` on any error so the row keeps its current values.
 fn rest_pr_detail_enrich(repo: &str, number: i64, token: &str) -> Option<(i64, i64, String)> {
     let url = format!("{}/repos/{}/pulls/{}", API_BASE, repo, number);
-    let v = api_json_cached(&url, token).ok()?;
+    let v = api_json_cached(&url, token, None).ok()?;
     let state = js(&v, "mergeable_state").to_uppercase();
     let merge_state = if state.is_empty() || state == "UNKNOWN" {
         String::new()
@@ -711,7 +1223,10 @@ pub(crate) fn diff_numstat(cwd: &str, head: &str, base: &str) -> (i64, i64) {
     }
     let range = format!("origin/{}...origin/{}", base, head);
     let out = match hidden_cmd("git")
-        .args(["diff", "--numstat", &range])
+        .args(PATCH_CONFIG)
+        .args(["diff", "--numstat", "--no-textconv"])
+        .args(PATCH_FLAGS)
+        .arg(&range)
         .current_dir(cwd)
         .output()
     {
@@ -728,48 +1243,42 @@ pub(crate) fn diff_numstat(cwd: &str, head: &str, base: &str) -> (i64, i64) {
     (adds, dels)
 }
 
-/// Fetch a PR object, trying `origin` first and falling back to the upstream
-/// parent (for fork → upstream PRs that don't live in origin). Returns the
-/// `owner/repo` the PR actually lives in alongside its JSON, so callers issue
-/// follow-up requests against the right repo.
+/// Fetch PR `number` from the base repo — the fork parent for a fork, else
+/// `origin` — and return that `owner/repo` alongside its JSON, so callers
+/// issue follow-up requests against the same repo. Every PR read and
+/// comment/review write goes through here.
+///
+/// Every number the app acts on comes from the base repo: the PR list
+/// (`rest_list_prs`) and a branch's PR (`rest_branch_pr`); a PR created into
+/// the fork itself only shows its number in the success message (the list
+/// then reloads from the base repo). Asking
+/// `origin` would read, or write on, the fork's own same-numbered PR (#262),
+/// so it is not asked at all — as the `gh` commands, which name the base repo
+/// (`gh_base_repo`, #300). A failed fork lookup is an error, never a guess,
+/// and every other refusal (an OAuth App restriction included) reaches
+/// `rest_attempt` as is.
 fn get_pr_json(cwd: &str, number: i64, token: &str) -> Result<(String, serde_json::Value), String> {
-    let (owner, repo) = owner_repo(cwd)?;
-    let origin = format!("{}/{}", owner, repo);
-    let (st, body) = curl_raw(
-        "GET",
-        &format!("{}/repos/{}/pulls/{}", API_BASE, origin, number),
-        Some(token),
+    let repo = base_repo_of(&rest_fork_info(cwd, token)?);
+    // Conditional: the live CI tab reads the PR's head on every poll.
+    let (st, body) = get_cached_raw(
+        &format!("{}/repos/{}/pulls/{}", API_BASE, repo, number),
+        token,
         None,
-        "application/vnd.github+json",
     )?;
-    if st < 400 {
-        let v = serde_json::from_str(body.trim()).map_err(|e| format!("parse PR: {}", e))?;
-        return Ok((origin, v));
+    if st >= 400 {
+        return Err(format!(
+            "{} (fetching PR #{})",
+            map_api_error(st, &body),
+            number
+        ));
     }
-    if st == 404 {
-        if let Some(parent) = upstream_parent(cwd, token) {
-            let (st2, body2) = curl_raw(
-                "GET",
-                &format!("{}/repos/{}/pulls/{}", API_BASE, parent, number),
-                Some(token),
-                None,
-                "application/vnd.github+json",
-            )?;
-            if st2 < 400 {
-                let v =
-                    serde_json::from_str(body2.trim()).map_err(|e| format!("parse PR: {}", e))?;
-                return Ok((parent, v));
-            }
-        }
-    }
-    Err(format!("GitHub API error ({}) fetching PR #{}", st, number))
+    let v = serde_json::from_str(body.trim()).map_err(|e| format!("parse PR: {}", e))?;
+    Ok((repo, v))
 }
 
 pub(crate) fn rest_pr_count(cwd: &str, state: &str, token: &str) -> Result<i64, String> {
-    let base = base_owner_repo(cwd, token).unwrap_or_else(|_| {
-        let (o, r) = owner_repo(cwd).unwrap_or_default();
-        format!("{}/{}", o, r)
-    });
+    // Same repo, and same failure, as the list.
+    let base = base_owner_repo(cwd, token)?;
     let qualifier = match state.to_lowercase().as_str() {
         "closed" => "+state:closed",
         "merged" => "+is:merged",
@@ -857,10 +1366,20 @@ pub(crate) fn rest_pr_checks(cwd: &str, number: i64, token: &str) -> Result<Vec<
     if sha.is_empty() {
         return Ok(Vec::new());
     }
-    let url = format!("{}/repos/{}/commits/{}/check-runs", API_BASE, repo, sha);
-    let v = match api_json("GET", &url, token, None) {
+    // per_page=100 like the gh path and the dev-server: the default 30 would
+    // let a big matrix look finished while its later runs still go.
+    let url = format!(
+        "{}/repos/{}/commits/{}/check-runs?per_page=100",
+        API_BASE, repo, sha
+    );
+    // A commit with no checks answers 200 with an empty list; an error is a
+    // failed fetch, and the CI tab must be able to tell the two apart (it
+    // keeps a running list on screen through a failure, but not through "none").
+    // A token that may not read checks (403/404) just has none to show.
+    let v = match api_json_cached(&url, token, None) {
         Ok(v) => v,
-        Err(_) => return Ok(Vec::new()), // no checks configured — not fatal
+        Err(e) if checks_unavailable(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
     let runs = v
         .get("check_runs")
@@ -874,6 +1393,7 @@ pub(crate) fn rest_pr_checks(cwd: &str, number: i64, token: &str) -> Result<Vec<
             state: js(run, "status"),
             conclusion: js(run, "conclusion"),
             details_url: js(run, "html_url"),
+            commit_sha: sha.clone(),
         })
         .collect();
     Ok(checks)
@@ -896,54 +1416,6 @@ pub(crate) fn rest_pr_files(cwd: &str, number: i64, token: &str) -> Result<Vec<S
         })
         .unwrap_or_default();
     Ok(files)
-}
-
-/// List candidate reviewers for the repo via the REST `/assignees` endpoint,
-/// using a Settings-managed OAuth token (no `gh` CLI required).
-///
-/// Fetches up to 3 pages of 100 (same ceiling as the CLI path). The assignees
-/// list carries `login` and `avatar_url` but not the display `name` (that needs
-/// a per-user lookup), so `name` is left null — matching the CLI path.
-pub(crate) fn rest_reviewer_candidates(
-    cwd: &str,
-    token: &str,
-) -> Result<Vec<ReviewerCandidate>, String> {
-    let (owner, repo) = owner_repo(cwd)?;
-    let mut all: Vec<ReviewerCandidate> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for page in 1..=3 {
-        let url = format!(
-            "{}/repos/{}/{}/assignees?per_page=100&page={}",
-            API_BASE, owner, repo, page
-        );
-        let v = api_json("GET", &url, token, None)?;
-        let arr = match v.as_array() {
-            Some(a) if !a.is_empty() => a,
-            _ => break,
-        };
-        let count = arr.len();
-        for u in arr {
-            let login = js(u, "login");
-            if login.is_empty() || !seen.insert(login.clone()) {
-                continue;
-            }
-            let name = u.get("name").and_then(|n| n.as_str()).map(String::from);
-            let avatar_url = u
-                .get("avatar_url")
-                .and_then(|a| a.as_str())
-                .map(String::from);
-            all.push(ReviewerCandidate {
-                login,
-                name,
-                avatar_url,
-            });
-        }
-        if count < 100 {
-            break;
-        }
-    }
-    all.sort_by_key(|a| a.login.to_lowercase());
-    Ok(all)
 }
 
 /// List branch names (heads) for the repo via the REST API (tokenless path).
@@ -1044,6 +1516,75 @@ pub(crate) fn rest_pr_issue_comments(
     );
     let v = api_json("GET", &url, token, None)?;
     Ok(map_comments(&v, true))
+}
+
+/// Create an inline review comment, or a reply when `params.in_reply_to_id`
+/// is set. `params` is the frontend `CreatePrCommentParams` object; a new
+/// thread is anchored to the PR head commit, as GitHub requires.
+pub(crate) fn rest_pr_create_comment(
+    cwd: &str,
+    number: i64,
+    params: &serde_json::Value,
+    token: &str,
+) -> Result<serde_json::Value, String> {
+    let (repo, pr) = get_pr_json(cwd, number, token)?;
+    let body = js(params, "body");
+    if body.trim().is_empty() {
+        return Err("Comment body is empty".to_string());
+    }
+    // REST names the reply target `in_reply_to`, not `in_reply_to_id`.
+    let payload = match params.get("in_reply_to_id").and_then(|v| v.as_i64()) {
+        Some(reply_to) => serde_json::json!({ "body": body, "in_reply_to": reply_to }),
+        None => {
+            let mut p = serde_json::json!({
+                "body": body,
+                "commit_id": jnested(&pr, "head", "sha"),
+                "path": js(params, "path"),
+                "line": params.get("line").and_then(|v| v.as_i64()).unwrap_or(1),
+                "side": params.get("side").and_then(|v| v.as_str()).unwrap_or("RIGHT"),
+            });
+            if let Some(start) = params.get("start_line").and_then(|v| v.as_i64()) {
+                p["start_line"] = start.into();
+                p["start_side"] = params
+                    .get("start_side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("RIGHT")
+                    .into();
+            }
+            p
+        }
+    };
+    let url = format!("{}/repos/{}/pulls/{}/comments", API_BASE, repo, number);
+    let v = api_json("POST", &url, token, Some(&payload.to_string()))?;
+    Ok(map_comment(&v, false))
+}
+
+/// Edit the body of an inline review comment.
+pub(crate) fn rest_pr_update_comment(
+    cwd: &str,
+    number: i64,
+    comment_id: i64,
+    body: &str,
+    token: &str,
+) -> Result<(), String> {
+    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let url = format!("{}/repos/{}/pulls/comments/{}", API_BASE, repo, comment_id);
+    let payload = serde_json::json!({ "body": body });
+    api_json("PATCH", &url, token, Some(&payload.to_string()))?;
+    Ok(())
+}
+
+/// Delete an inline review comment.
+pub(crate) fn rest_pr_delete_comment(
+    cwd: &str,
+    number: i64,
+    comment_id: i64,
+    token: &str,
+) -> Result<(), String> {
+    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let url = format!("{}/repos/{}/pulls/comments/{}", API_BASE, repo, comment_id);
+    api_json("DELETE", &url, token, None)?;
+    Ok(())
 }
 
 // ─── Issues (REST) ───────────────────────────────────────────────────────────
@@ -1222,6 +1763,21 @@ pub(crate) fn rest_issue_add_comment(
     Ok(map_comment(&v, true))
 }
 
+/// Comment on the conversation of PR `number` (REST), in the repo the PR
+/// lives in (`get_pr_json`: the base repo). Returns the created comment.
+pub(crate) fn rest_pr_add_conversation_comment(
+    cwd: &str,
+    number: i64,
+    body: &str,
+    token: &str,
+) -> Result<serde_json::Value, String> {
+    let (repo, _) = get_pr_json(cwd, number, token)?;
+    let url = format!("{}/repos/{}/issues/{}/comments", API_BASE, repo, number);
+    let payload = serde_json::json!({ "body": body });
+    let v = api_json("POST", &url, token, Some(&payload.to_string()))?;
+    Ok(map_comment(&v, true))
+}
+
 /// Close or reopen an issue (REST). `state` is "closed" or "open".
 pub(crate) fn rest_issue_set_state(
     cwd: &str,
@@ -1276,7 +1832,7 @@ pub(crate) fn rest_pr_reviews(
 
 /// Process-lifetime cache of a repo's fork relationship, keyed by origin
 /// `owner/repo`. The fork status of a repo doesn't change during a session, yet
-/// `base_owner_repo` / `upstream_parent` resolve it on every PR-list refresh — so
+/// `base_owner_repo` resolves it on every PR-list refresh and `get_pr_json` on every PR read or write, the live CI poll included — so
 /// without this the poller spent one `GET /repos/{o}/{r}` per tick for a value
 /// that never moves (same lifetime model as `GIT_DIR_CACHE`).
 static FORK_INFO_CACHE: OnceLock<Mutex<HashMap<String, ForkInfo>>> = OnceLock::new();
@@ -1313,23 +1869,31 @@ pub(crate) fn rest_fork_info(cwd: &str, token: &str) -> Result<ForkInfo, String>
     Ok(fi)
 }
 
-/// The upstream parent `owner/repo` when the current repo is a fork, else None.
-/// Centralizes the `is_fork && !parent.is_empty()` guard shared by the PR list
-/// and the origin→upstream PR fallback.
-fn upstream_parent(cwd: &str, token: &str) -> Option<String> {
-    let fi = rest_fork_info(cwd, token).ok()?;
-    (fi.is_fork && !fi.parent.is_empty()).then_some(fi.parent)
-}
-
 /// The canonical base `owner/repo` for PRs. For a fork, this is the upstream
 /// parent. For a regular repo, it's the repo itself.
-fn base_owner_repo(cwd: &str, token: &str) -> Result<String, String> {
+pub(crate) fn base_owner_repo(cwd: &str, token: &str) -> Result<String, String> {
     let fi = rest_fork_info(cwd, token)?;
+    Ok(base_repo_of(&fi))
+}
+
+/// The base repo a `ForkInfo` points at: the upstream parent for a fork, the
+/// origin otherwise.
+fn base_repo_of(fi: &ForkInfo) -> String {
     if fi.is_fork && !fi.parent.is_empty() {
-        Ok(fi.parent)
+        fi.parent.clone()
     } else {
-        Ok(fi.origin)
+        fi.origin.clone()
     }
+}
+
+/// `get_pr_json`, for the write actions (merge, ready, auto-merge, reviewers):
+/// the base repo, or the fork lookup's error — never a guess at origin.
+fn get_base_pr_json(
+    cwd: &str,
+    number: i64,
+    token: &str,
+) -> Result<(String, serde_json::Value), String> {
+    get_pr_json(cwd, number, token)
 }
 
 // Bundling these into a params struct is a real API-shape decision (one
@@ -1424,20 +1988,45 @@ pub(crate) fn rest_merge_pr(
         "rebase" => "rebase",
         _ => "merge",
     };
-    // Resolve the repo (origin or upstream) + head branch for cleanup.
-    let (repo, pr) = get_pr_json(cwd, number, token)?;
-    let branch = jnested(&pr, "head", "ref");
+    // Resolve the base repo (where the merge happens) and the head branch.
+    let (repo, pr) = get_base_pr_json(cwd, number, token)?;
+    let cleanup = head_branch_to_delete(&pr);
 
     let payload = serde_json::json!({ "merge_method": merge_method });
     let url = format!("{}/repos/{}/pulls/{}/merge", API_BASE, repo, number);
     api_json("PUT", &url, token, Some(&payload.to_string()))?;
 
-    // Best-effort branch deletion (mirrors `gh pr merge --delete-branch`).
-    if !branch.is_empty() {
-        let ref_url = format!("{}/repos/{}/git/refs/heads/{}", API_BASE, repo, branch);
+    // Best-effort branch deletion (mirrors `gh pr merge --delete-branch`,
+    // which leaves a fork PR's branch alone).
+    if let Some((head_repo, branch)) = cleanup {
+        let ref_url = format!("{}/repos/{}/git/refs/heads/{}", API_BASE, head_repo, branch);
         let _ = api_json("DELETE", &ref_url, token, None);
     }
     Ok(())
+}
+
+/// The `(repo, branch)` whose ref a post-merge cleanup should delete.
+///
+/// Only a same-repo PR is cleaned up, like `gh pr merge --delete-branch`.
+/// A fork PR's head branch lives in the fork: deleting `head.ref` in the
+/// base repo would remove an unrelated upstream branch that shares its name,
+/// and deleting it in the fork would remove a contributor's branch whenever
+/// the token can push there. `head.repo` is null when the fork was deleted.
+fn head_branch_to_delete(pr: &serde_json::Value) -> Option<(String, String)> {
+    let full_name = |side: &str| {
+        pr.get(side)
+            .and_then(|h| h.get("repo"))
+            .and_then(|r| r.get("full_name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let branch = jnested(pr, "head", "ref");
+    let head_repo = full_name("head");
+    if branch.is_empty() || head_repo.is_empty() || head_repo != full_name("base") {
+        return None;
+    }
+    Some((head_repo.to_string(), branch))
 }
 
 /// Dismiss a submitted review (B4, v3.6.0).
@@ -1458,6 +2047,81 @@ pub(crate) fn rest_dismiss_review(
     Ok(())
 }
 
+/// List a PR's review threads (GraphQL-only: REST has no thread concept).
+/// Each entry maps the REST id of the comment that opened the thread to the
+/// thread's node id and resolution state:
+/// `{ thread_id, root_comment_id, resolved }`.
+pub(crate) fn gql_pr_review_threads(
+    cwd: &str,
+    number: i64,
+    token: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("Invalid repo slug: {}", repo))?;
+    let query = "query($owner: String!, $name: String!, $n: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $n) { reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { databaseId } } } } } } }";
+    let mut out = Vec::new();
+    let mut after = serde_json::Value::Null;
+    // 20 pages × 100 threads — far beyond any reviewable PR; bounds a runaway loop.
+    for _ in 0..20 {
+        let v = graphql(
+            token,
+            query,
+            serde_json::json!({ "owner": owner, "name": name, "n": number, "after": after }),
+        )?;
+        let threads = v
+            .pointer("/data/repository/pullRequest/reviewThreads")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        for t in threads
+            .get("nodes")
+            .and_then(|n| n.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(root) = t
+                .pointer("/comments/nodes/0/databaseId")
+                .and_then(|x| x.as_i64())
+            else {
+                continue;
+            };
+            out.push(serde_json::json!({
+                "thread_id": js(t, "id"),
+                "root_comment_id": root,
+                "resolved": t.get("isResolved").and_then(|b| b.as_bool()).unwrap_or(false),
+            }));
+        }
+        let has_next = threads
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        if !has_next {
+            break;
+        }
+        after = threads
+            .pointer("/pageInfo/endCursor")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    Ok(out)
+}
+
+/// Resolve or unresolve a PR review thread by its GraphQL node id.
+pub(crate) fn gql_set_review_thread_resolved(
+    thread_id: &str,
+    resolved: bool,
+    token: &str,
+) -> Result<(), String> {
+    let query = if resolved {
+        "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id } } }"
+    } else {
+        "mutation($id: ID!) { unresolveReviewThread(input: { threadId: $id }) { thread { id } } }"
+    };
+    graphql(token, query, serde_json::json!({ "id": thread_id }))?;
+    Ok(())
+}
+
 /// Request reviewers on an existing PR (B4, v3.6.0).
 pub(crate) fn rest_request_reviewers(
     cwd: &str,
@@ -1465,7 +2129,7 @@ pub(crate) fn rest_request_reviewers(
     logins: &[String],
     token: &str,
 ) -> Result<(), String> {
-    let (repo, _pr) = get_pr_json(cwd, number, token)?;
+    let (repo, _pr) = get_base_pr_json(cwd, number, token)?;
     let url = format!(
         "{}/repos/{}/pulls/{}/requested_reviewers",
         API_BASE, repo, number
@@ -1476,8 +2140,9 @@ pub(crate) fn rest_request_reviewers(
 }
 
 pub(crate) fn rest_pr_ready(cwd: &str, number: i64, token: &str) -> Result<(), String> {
-    // Draft→ready is GraphQL-only; resolve the PR node_id first (origin or upstream).
-    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    // Draft→ready is GraphQL-only; resolve the PR node_id first, from the base
+    // repo the PR list shows (not origin: a fork may have a same-numbered PR).
+    let (_repo, pr) = get_base_pr_json(cwd, number, token)?;
     let node_id = js(&pr, "node_id");
     if node_id.is_empty() {
         return Err("Could not resolve PR node_id for ready conversion.".to_string());
@@ -1490,11 +2155,117 @@ pub(crate) fn rest_pr_ready(cwd: &str, number: i64, token: &str) -> Result<(), S
     Ok(())
 }
 
+/// Edit a PR's title and/or body.
+///
+/// The PR number refers to the list the user is looking at, and `rest_list_prs`
+/// lists the *base* repo (the upstream for a fork). Resolve the repo the same
+/// way as every PR action (`get_pr_json`): the base repo, never origin, which
+/// would patch the fork's own PR of the same number.
+pub(crate) fn rest_pr_edit(
+    cwd: &str,
+    number: i64,
+    title: &Option<String>,
+    body: &Option<String>,
+    token: &str,
+) -> Result<(), String> {
+    let payload = super::pr_edit::edit_payload(title, body, "body")?;
+    // The number comes from the base repo's list: that repo, or the fork
+    // lookup's error.
+    let repo = base_owner_repo(cwd, token)?;
+    let url = format!("{}/repos/{}/pulls/{}", API_BASE, repo, number);
+    api_json("PATCH", &url, token, Some(&payload.to_string()))?;
+    Ok(())
+}
+
+/// Map one REST pull-request object to a [`BranchPr`] (`None` without a
+/// number). `merged_at` is `null` for an open or closed-unmerged PR.
+pub(crate) fn branch_pr_from_rest_json(v: &serde_json::Value) -> Option<crate::types::BranchPr> {
+    let number = v.get("number")?.as_i64()?;
+    let merged_at = v
+        .get("merged_at")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    // Only once merged: an open PR's `merge_commit_sha` is a test merge.
+    let merge_commit_oid = merged_at
+        .as_ref()
+        .map(|_| js(v, "merge_commit_sha"))
+        .filter(|o| !o.is_empty());
+    Some(crate::types::BranchPr {
+        number,
+        base: jnested(v, "base", "ref"),
+        head_ref_oid: jnested(v, "head", "sha"),
+        merged_at,
+        url: js(v, "html_url"),
+        merge_commit_oid,
+    })
+}
+
+/// The PR list URL for `branch` pushed by `owner`, in the base repo `repo`.
+/// A merged PR is a closed one, so `merged` lists `closed` (100 per page: the
+/// merged PR can sit behind many closed ones).
+fn branch_pr_url(repo: &str, owner: &str, branch: &str, state: &str) -> String {
+    format!(
+        "{}/repos/{}/pulls?state={}&head={}&per_page=100",
+        API_BASE,
+        repo,
+        if state == "merged" { "closed" } else { "open" },
+        enc_nwo(&format!("{}:{}", owner, branch)),
+    )
+}
+
+/// The PR of `branch` in the base repo (the fork's parent for a fork), by REST.
+/// `merged` lists closed PRs and keeps the newest merged one; `open` takes the
+/// first. The head filter names the `origin` owner: that is where the branch
+/// is pushed.
+pub(crate) fn rest_branch_pr(
+    cwd: &str,
+    branch: &str,
+    state: &str,
+    token: &str,
+) -> Result<Option<crate::types::BranchPr>, String> {
+    let merged = state == "merged";
+    let (owner, _) = owner_repo(cwd)?;
+    let repo = base_owner_repo(cwd, token)?;
+    let url = branch_pr_url(&repo, &owner, branch, state);
+    let list = api_json("GET", &url, token, None)?;
+    let prs: Vec<crate::types::BranchPr> = list
+        .as_array()
+        .map(|a| a.iter().filter_map(branch_pr_from_rest_json).collect())
+        .unwrap_or_default();
+    Ok(if merged {
+        super::gh::newest_merged(prs)
+    } else {
+        prs.into_iter().next()
+    })
+}
+
+/// The PATCH payload that retargets a PR.
+pub(crate) fn set_base_payload(base: &str) -> Result<serde_json::Value, String> {
+    super::gh::check_pr_base(base)?;
+    Ok(serde_json::json!({ "base": base }))
+}
+
+/// Retarget PR `number` of the base repo onto `base`. Same repo resolution as
+/// `rest_pr_edit`: the number comes from the base repo's list.
+pub(crate) fn rest_pr_set_base(
+    cwd: &str,
+    number: i64,
+    base: &str,
+    token: &str,
+) -> Result<(), String> {
+    let payload = set_base_payload(base)?;
+    // An automatic write: never fall back to origin when the fork lookup fails.
+    let repo = base_owner_repo(cwd, token)?;
+    let url = format!("{}/repos/{}/pulls/{}", API_BASE, repo, number);
+    api_json("PATCH", &url, token, Some(&payload.to_string()))?;
+    Ok(())
+}
+
 /// GraphQL equivalent of `gh pr merge --auto`, for the configured-token path.
 ///
 /// `enablePullRequestAutoMerge` takes the PR's node id, resolved the same way
 /// `rest_pr_ready` resolves it above: fetch the PR through the existing REST
-/// path (origin or upstream), read its `node_id`, and error out explicitly if
+/// path (`get_base_pr_json`), read its `node_id`, and error out explicitly if
 /// it is missing rather than sending an empty id to GraphQL.
 ///
 /// Known limitation, not fixed here: `gh_enable_auto_merge_inner`'s CLI path
@@ -1517,7 +2288,7 @@ pub(crate) fn rest_enable_auto_merge(
     method: &str,
     token: &str,
 ) -> Result<(), String> {
-    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let (_repo, pr) = get_base_pr_json(cwd, number, token)?;
     let node_id = js(&pr, "node_id");
     if node_id.is_empty() {
         return Err("Could not resolve PR node_id for auto-merge.".to_string());
@@ -1538,7 +2309,7 @@ pub(crate) fn rest_enable_auto_merge(
 
 /// GraphQL equivalent of `gh pr merge --disable-auto`.
 pub(crate) fn rest_disable_auto_merge(cwd: &str, number: i64, token: &str) -> Result<(), String> {
-    let (_repo, pr) = get_pr_json(cwd, number, token)?;
+    let (_repo, pr) = get_base_pr_json(cwd, number, token)?;
     let node_id = js(&pr, "node_id");
     if node_id.is_empty() {
         return Err("Could not resolve PR node_id for auto-merge.".to_string());
@@ -1548,16 +2319,17 @@ pub(crate) fn rest_disable_auto_merge(cwd: &str, number: i64, token: &str) -> Re
     Ok(())
 }
 
-pub(crate) fn rest_checkout_pr(cwd: &str, number: i64) -> Result<(), String> {
+pub(crate) fn rest_checkout_pr(cwd: &str, number: i64, token: &str) -> Result<(), String> {
     // Resolve which repo the PR actually lives in. When the local repo is a
     // fork, the listed PRs belong to the upstream *parent*, so `pull/N/head`
     // exists on the parent's refs — fetching it from `origin` (the fork) 404s.
     let (owner, repo) = owner_repo(cwd)?;
     let origin = format!("{}/{}", owner, repo);
-    let pr_repo = settings_github_token()
-        .and_then(|tok| get_pr_json(cwd, number, &tok).ok())
-        .map(|(repo, _)| repo)
-        .unwrap_or_else(|| origin.clone());
+    // The base repo (where the list's numbers come from; cached after the
+    // first lookup, no per-PR request) or the fork lookup's error: a failed
+    // lookup must not check out the fork's own same-numbered PR. An OAuth App
+    // refusal goes back through `with_rest_pr` to `gh pr checkout`.
+    let pr_repo = base_owner_repo(cwd, token)?;
 
     // Fetch the PR head ref. When the PR lives in `origin` use the configured
     // remote; otherwise fetch straight from the upstream repo URL (no remote is
@@ -1568,33 +2340,122 @@ pub(crate) fn rest_checkout_pr(cwd: &str, number: i64) -> Result<(), String> {
     } else {
         format!("https://github.com/{}.git", pr_repo)
     };
-    let local = format!("pr-{}", number);
-    let refspec = format!("pull/{}/head:{}", number, local);
-    let fetch = git_cmd()
-        .args(["fetch", &fetch_target, &refspec])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("git fetch failed: {}", e))?;
+    checkout_pr_head(cwd, &fetch_target, number)
+}
+
+/// Fetch `pull/<number>/head` from `fetch_target` and check it out as the
+/// local branch `pr-<number>`. The fetch lands in `FETCH_HEAD`, then the
+/// branch is created there or moved forward to it; it is never rewritten. A
+/// `pr-<number>` holding commits the PR does not have (the PR was
+/// force-pushed, or the branch came from another PR with that number — the
+/// fork's own, before #262) is refused with what to do, rather than a raw
+/// `non-fast-forward` from the fetch.
+fn checkout_pr_head(cwd: &str, fetch_target: &str, number: i64) -> Result<(), String> {
+    let git = |args: &[&str]| {
+        git_cmd()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| format!("git {} failed: {}", args.first().unwrap_or(&""), e))
+    };
+    let fail = |what: &str, out: &std::process::Output| {
+        format!(
+            "{} failed: {}",
+            what,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    };
+    let pull = format!("pull/{}/head", number);
+    let fetch = git(&["fetch", fetch_target, &pull])?;
     if !fetch.status.success() {
-        return Err(format!(
-            "git fetch pull/{}/head failed: {}",
-            number,
-            String::from_utf8_lossy(&fetch.stderr).trim()
-        ));
+        return Err(fail(&format!("git fetch {}", pull), &fetch));
     }
-    let checkout = git_cmd()
-        .args(["checkout", &local])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("git checkout failed: {}", e))?;
+    let local = format!("pr-{}", number);
+    let local_ref = format!("refs/heads/{}", local);
+    // `branch.pr-<n>.gitwandPrHead`: the PR head this branch was last checked
+    // out at (config, not a ref: nothing extra in the Git Tree).
+    let head_key = format!("branch.{}.gitwandPrHead", local);
+    // Pinned right after the fetch: every later step names this sha, so a
+    // fetch run meanwhile by another tool (FETCH_HEAD rewritten) cannot move
+    // `pr-<n>` to another commit.
+    let pinned = git(&["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    if !pinned.status.success() {
+        return Err(fail("git rev-parse FETCH_HEAD", &pinned));
+    }
+    let fetched = String::from_utf8_lossy(&pinned.stdout).trim().to_string();
+    // Best effort: the checkout itself has succeeded by then. A missing
+    // record only makes the next checkout read `pr-<n>` ahead as local work.
+    let record = || -> Result<(), String> {
+        match git(&["config", &head_key, &fetched]) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!("[checkout_pr_head] {}", fail("git config", &out)),
+            Err(e) => eprintln!("[checkout_pr_head] {e}"),
+        }
+        Ok(())
+    };
+    let exists = git(&["show-ref", "--verify", "--quiet", &local_ref])?
+        .status
+        .success();
+    if exists {
+        let ancestor = |a: &str, b: &str| -> Result<bool, String> {
+            Ok(git(&["merge-base", "--is-ancestor", a, b])?
+                .status
+                .success())
+        };
+        let ff = ancestor(&local_ref, &fetched)?;
+        // The PR head recorded at the last checkout. `pr-<n>` ahead of a PR
+        // that has not moved back since is local work (commits, a merge of
+        // main, commits pushed to the PR meanwhile): checked out as it is.
+        // Ahead of a PR whose head moved back is the PR rewound: treated as
+        // diverged below. No record (a checkout before this): local work.
+        let recorded = git(&["config", "--get", &head_key])?;
+        let recorded = String::from_utf8_lossy(&recorded.stdout).trim().to_string();
+        // A PR that moved forward (the recorded head is an ancestor of the
+        // fetched one) has not been rewound either.
+        let unchanged =
+            recorded.is_empty() || recorded == fetched || ancestor(&recorded, &fetched)?;
+        if !ff && unchanged && ancestor(fetched.as_str(), &local_ref)? {
+            let checkout = git(&["checkout", &local])?;
+            return if checkout.status.success() {
+                record()
+            } else {
+                Err(fail(&format!("git checkout {}", local), &checkout))
+            };
+        }
+        if !ff {
+            return Err(format!(
+                "the local branch {local} and PR #{number} have diverged (the PR was \
+                 force-pushed or rewound, or {local} was made from another PR #{number}); \
+                 {local} was left as it is: check it out to keep its commits, or rename it, \
+                 then check the PR out again"
+            ));
+        }
+        let head = git(&["symbolic-ref", "-q", "HEAD"])?;
+        let on_it = String::from_utf8_lossy(&head.stdout).trim() == local_ref;
+        if on_it {
+            let merge = git(&["merge", "--ff-only", "-q", fetched.as_str()])?;
+            return if merge.status.success() {
+                record()
+            } else {
+                Err(fail("git merge --ff-only", &merge))
+            };
+        }
+        let mv = git(&["branch", "-f", &local, fetched.as_str()])?;
+        if !mv.status.success() {
+            return Err(fail(&format!("git branch -f {}", local), &mv));
+        }
+        let checkout = git(&["checkout", &local])?;
+        return if checkout.status.success() {
+            record()
+        } else {
+            Err(fail(&format!("git checkout {}", local), &checkout))
+        };
+    }
+    let checkout = git(&["checkout", "-b", &local, fetched.as_str()])?;
     if !checkout.status.success() {
-        return Err(format!(
-            "git checkout {} failed: {}",
-            local,
-            String::from_utf8_lossy(&checkout.stderr).trim()
-        ));
+        return Err(fail(&format!("git checkout -b {}", local), &checkout));
     }
-    Ok(())
+    record()
 }
 
 // ─── Reactions ──────────────────────────────────────────────────────────────
@@ -1974,10 +2835,463 @@ pub(crate) async fn github_token_present() -> Result<bool, String> {
     Ok(settings_github_token().is_some())
 }
 
+// ─── Signed URLs of uploaded attachments (#302) ─────────────────────────────
+
+/// Media type that makes GitHub add a rendered `body_html` to the issue,
+/// comment and review objects it returns.
+pub(crate) const HTML_ACCEPT: &str = "application/vnd.github.html+json";
+
+/// Where `body_html` points the files uploaded through GitHub's editor
+/// (`github.com/user-attachments/assets/<uuid>` in the markdown): short-lived
+/// URLs signed with a `jwt` query parameter, which load without credentials —
+/// the only way to show an attachment of a private repository, whose
+/// markdown URL answers 404 to anyone but a signed-in browser.
+const SIGNED_ATTACHMENT_PREFIX: &str = "https://private-user-images.githubusercontent.com/";
+
+/// The API paths whose `body_html` covers every markdown body of PR `number`
+/// in `nwo`: its description, conversation comments, inline review comments
+/// and review summaries. Same page size as the comment lists GitWand shows.
+pub(crate) fn pr_attachment_html_paths(nwo: &str, number: i64) -> [String; 4] {
+    [
+        format!("repos/{}/issues/{}", nwo, number),
+        format!("repos/{}/issues/{}/comments?per_page=100", nwo, number),
+        format!("repos/{}/pulls/{}/comments?per_page=100", nwo, number),
+        format!("repos/{}/pulls/{}/reviews?per_page=100", nwo, number),
+    ]
+}
+
+/// The `body_html` of `v` — one object, or each element of an array.
+pub(crate) fn body_htmls(v: &serde_json::Value) -> Vec<String> {
+    let one = |x: &serde_json::Value| {
+        x.get("body_html")
+            .and_then(|h| h.as_str())
+            .map(String::from)
+    };
+    match v {
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        other => one(other).into_iter().collect(),
+    }
+}
+
+/// Decode the character references an attribute value may hold: `&amp;`,
+/// `&quot;`, `&#39;`, `&lt;`, `&gt;` and numeric ones (`&#61;`, `&#x3D;`).
+/// Anything else is kept as written.
+fn decode_html_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let Some(end) = rest.find(';').filter(|&e| e <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let name = &rest[1..end];
+        let ch = match name {
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            _ => name
+                .strip_prefix("#x")
+                .or_else(|| name.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match ch {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The signed attachment URLs in the `src` attributes of `htmls`, entity-decoded
+/// and deduplicated, in order of appearance.
+pub(crate) fn signed_attachment_urls<'a>(htmls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for html in htmls {
+        let mut rest = html;
+        while let Some(i) = rest.find("src=\"") {
+            // The attribute itself, not `data-canonical-src="`: preceded by whitespace.
+            let attr = rest[..i].ends_with(|c: char| c.is_ascii_whitespace());
+            rest = &rest[i + 5..];
+            let Some(end) = rest.find('"') else { break };
+            let raw = &rest[..end];
+            rest = &rest[end..];
+            if !attr || !raw.starts_with(SIGNED_ATTACHMENT_PREFIX) {
+                continue;
+            }
+            let url = decode_html_entities(raw);
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    }
+    out
+}
+
+/// The signed URLs in the `body_html` lists fetched from
+/// [`pr_attachment_html_paths`]. Best effort: an endpoint that failed (a
+/// token not allowed to read reviews, a transient error) does not cost the
+/// URLs the others returned; only when every one failed is the first error
+/// returned. The flag says whether every one succeeded.
+pub(crate) fn signed_urls_from_fetches(
+    fetches: Vec<Result<Vec<String>, String>>,
+) -> Result<(Vec<String>, bool), String> {
+    let mut first_err = None;
+    let mut htmls = Vec::new();
+    let mut any_ok = false;
+    for f in fetches {
+        match f {
+            Ok(h) => {
+                any_ok = true;
+                htmls.extend(h);
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) if !any_ok => Err(e),
+        _ => Ok((
+            signed_attachment_urls(htmls.iter().map(String::as_str)),
+            first_err.is_none(),
+        )),
+    }
+}
+
+/// What [`gh_pr_attachment_urls`](super::gh::gh_pr_attachment_urls) returns.
+#[derive(serde::Serialize, Debug, PartialEq)]
+pub(crate) struct PrAttachmentUrls {
+    /// Whether the PR's repository is private: only then does the webview
+    /// need the signed URLs (a public repository serves the originals, which
+    /// never expire, though GitHub signs its attachments in `body_html` too).
+    /// `None` when it could not be read: the URLs are still returned.
+    pub private: Option<bool>,
+    pub urls: Vec<String>,
+    /// Every body list was read. When not, an attachment missing from `urls`
+    /// may just be in a list that failed — not one GitHub did not sign.
+    pub complete: bool,
+}
+
+impl PrAttachmentUrls {
+    pub(crate) fn from_fetches(
+        private: Option<bool>,
+        fetches: Vec<Result<Vec<String>, String>>,
+    ) -> Result<Self, String> {
+        let (urls, complete) = signed_urls_from_fetches(fetches)?;
+        Ok(PrAttachmentUrls {
+            private,
+            urls,
+            complete,
+        })
+    }
+}
+
+/// Signed URLs of the attachments in PR `number`'s bodies (REST).
+pub(crate) fn rest_pr_attachment_urls(
+    cwd: &str,
+    number: i64,
+    token: &str,
+) -> Result<PrAttachmentUrls, String> {
+    let (repo, pr) = get_pr_json(cwd, number, token)?;
+    let private = pr.pointer("/base/repo/private").and_then(|v| v.as_bool());
+    let fetches = pr_attachment_html_paths(&repo, number)
+        .par_iter()
+        .map(|path| {
+            let url = format!("{}/{}", API_BASE, path);
+            let (status, body) = curl_raw("GET", &url, Some(token), None, HTML_ACCEPT)?;
+            if status >= 400 {
+                return Err(map_api_error(status, &body));
+            }
+            Ok(body_htmls(&parse_json_body(&body)?))
+        })
+        .collect();
+    PrAttachmentUrls::from_fetches(private, fetches)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rest_json_maps_head_sha_and_base_ref() {
+        let v = json!({"number":812,"base":{"ref":"step-1"},"head":{"sha":"bbb","ref":"step-2"},"merged_at":null,"html_url":"u"});
+        let pr = branch_pr_from_rest_json(&v).unwrap();
+        assert_eq!((pr.base.as_str(), pr.merged_at), ("step-1", None));
+        assert_eq!((pr.head_ref_oid.as_str(), pr.url.as_str()), ("bbb", "u"));
+    }
+
+    /// I-2: `merge_commit_sha` counts only once merged (an open PR's is a
+    /// test merge).
+    #[test]
+    fn rest_json_keeps_the_merge_commit_of_a_merged_pr_only() {
+        let merged = json!({"number":812,"base":{"ref":"main"},"head":{"sha":"h"},"merged_at":"2026-11-20T00:00:00Z","merge_commit_sha":"mmm","html_url":"u"});
+        let pr = branch_pr_from_rest_json(&merged).unwrap();
+        assert_eq!(pr.merge_commit_oid.as_deref(), Some("mmm"));
+        let open = json!({"number":9,"base":{"ref":"main"},"head":{"sha":"h"},"merged_at":null,"merge_commit_sha":"test","html_url":"u"});
+        assert_eq!(
+            branch_pr_from_rest_json(&open).unwrap().merge_commit_oid,
+            None
+        );
+    }
+
+    #[test]
+    fn branch_pr_url_names_the_origin_owner_and_encodes_the_head() {
+        assert_eq!(
+            branch_pr_url("up/repo", "me", "feat/x y", "merged"),
+            "https://api.github.com/repos/up/repo/pulls?state=closed&head=me%3Afeat/x%20y&per_page=100"
+        );
+        assert!(branch_pr_url("o/r", "me", "b", "open").contains("state=open&"));
+    }
+
+    #[test]
+    fn set_base_payload_rejects_dash_and_empty() {
+        assert_eq!(set_base_payload("").unwrap_err(), "base must not be empty");
+        assert_eq!(
+            set_base_payload("-x").unwrap_err(),
+            "invalid branch name: -x"
+        );
+        assert_eq!(
+            set_base_payload("main").unwrap(),
+            serde_json::json!({"base":"main"})
+        );
+    }
+
+    #[test]
+    fn api_error_keeps_validation_details() {
+        let body = r#"{"message":"Validation Failed","errors":[{"resource":"Issue","field":"assignees","code":"invalid"},{"message":"milestone not found"}]}"#;
+        assert_eq!(
+            map_api_error(422, body),
+            "GitHub API error (422): Validation Failed (assignees: invalid; milestone not found)"
+        );
+    }
+
+    #[test]
+    fn api_error_without_details_is_unchanged() {
+        assert_eq!(
+            map_api_error(404, r#"{"message":"Not Found"}"#),
+            "GitHub API error (404): Not Found"
+        );
+    }
+
     use super::*;
     use serde_json::json;
+
+    // ─── Signed attachment URLs (#302) ───────────────────────────────────────
+
+    #[test]
+    fn collects_signed_attachment_urls_from_body_html() {
+        let a = "https://private-user-images.githubusercontent.com/1/2-aaaa.png?jwt=x.y.z";
+        let b = "https://private-user-images.githubusercontent.com/1/3-bbbb.gif?jwt=p&amp;q=1";
+        let html1 = format!(
+            r#"<p><a href="{a}"><img alt="x" src="{a}" style="max-width: 100%;"></a></p><img src="https://camo.githubusercontent.com/abc">"#
+        );
+        let html2 = format!(
+            r#"<img src="{a}"><img data-canonical-src="https://private-user-images.githubusercontent.com/9/9-zzzz.png" src="{b}">"#
+        );
+        assert_eq!(
+            signed_attachment_urls([html1.as_str(), html2.as_str()]),
+            vec![
+                a.to_string(),
+                "https://private-user-images.githubusercontent.com/1/3-bbbb.gif?jwt=p&q=1"
+                    .to_string()
+            ]
+        );
+        assert!(signed_attachment_urls(["<img src=\"unterminated"]).is_empty());
+        assert_eq!(
+            signed_attachment_urls([
+                "<img\tsrc=\"https://private-user-images.githubusercontent.com/x\">"
+            ]),
+            vec!["https://private-user-images.githubusercontent.com/x".to_string()]
+        );
+    }
+
+    #[test]
+    fn decodes_the_character_references_of_an_attribute() {
+        assert_eq!(
+            decode_html_entities("a&amp;b&#x3D;c&#61;d&quot;&#39;&lt;&gt;"),
+            "a&b=c=d\"'<>"
+        );
+        assert_eq!(decode_html_entities("x&unknown;y & z&"), "x&unknown;y & z&");
+    }
+
+    #[test]
+    fn one_failed_endpoint_does_not_cost_the_others_urls() {
+        let a = "https://private-user-images.githubusercontent.com/1/2-aaaa.png?jwt=x";
+        let ok = Ok(vec![format!(r#"<img src="{a}">"#)]);
+        assert_eq!(
+            signed_urls_from_fetches(vec![Err("403".into()), ok]),
+            Ok((vec![a.to_string()], false))
+        );
+        assert_eq!(
+            signed_urls_from_fetches(vec![Err("403".into()), Err("502".into())]),
+            Err("403".to_string())
+        );
+        assert_eq!(
+            signed_urls_from_fetches(vec![Ok(vec![])]),
+            Ok((vec![], true))
+        );
+    }
+
+    #[test]
+    fn reads_body_html_from_an_object_or_an_array() {
+        assert_eq!(
+            body_htmls(&json!({ "body_html": "<p>a</p>" })),
+            vec!["<p>a</p>"]
+        );
+        assert_eq!(
+            body_htmls(&json!([{ "body_html": "1" }, { "body": "no html" }, { "body_html": "2" }])),
+            vec!["1", "2"]
+        );
+        assert!(body_htmls(&serde_json::Value::Null).is_empty());
+    }
+
+    // ─── OAuth App access restrictions (org-level 403) ───────────────────────
+
+    const RESTRICTED: &str = "GitHub API error (403): Although you appear to have the correct authorization credentials, the `Dendreo` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited. For more information on these restrictions, including how to enable this app, visit https://docs.github.com/articles/restricting-access-to-your-organization-s-data/";
+
+    #[test]
+    fn recognises_the_oauth_restriction_error() {
+        assert!(is_oauth_restricted(RESTRICTED));
+        assert!(!is_oauth_restricted(
+            "GitHub API error (403): API rate limit exceeded"
+        ));
+        assert!(!is_oauth_restricted("GitHub API error (404): Not Found"));
+    }
+
+    #[test]
+    fn restriction_message_names_the_org_and_both_ways_out() {
+        let msg = oauth_restricted_message(RESTRICTED);
+        assert!(msg.contains("Dendreo"), "{msg}");
+        assert!(msg.contains("gh auth login"), "{msg}");
+        assert!(msg.contains("github.com/settings/applications"), "{msg}");
+        // No org name in the text: still a usable message.
+        let generic = oauth_restricted_message("OAuth App access restrictions");
+        assert!(generic.contains("gh auth login"), "{generic}");
+    }
+
+    #[test]
+    fn a_parent_refusal_is_remembered_for_that_repository_only() {
+        let cwd = "/tmp/gitwand-test-parent-memo";
+        let key = "repo:org/parent-memo";
+        let calls = std::cell::Cell::new(0);
+        let first: Option<Result<(), String>> = rest_attempt(
+            cwd,
+            key,
+            Some("tok".into()),
+            || true,
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(RESTRICTED.to_string())
+            },
+        );
+        assert!(first.is_none());
+        let second: Option<Result<(), String>> = rest_attempt(
+            cwd,
+            key,
+            Some("tok".into()),
+            || true,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(
+            second.is_none(),
+            "the refused repository goes straight to gh"
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(!is_marked_restricted(cwd), "the checkout keeps its token");
+    }
+
+    #[test]
+    fn a_restricted_call_on_another_repo_does_not_mark_this_checkout() {
+        // A fork's parent in an org that restricts OAuth apps: fall back to
+        // `gh` for that call, but keep the GitWand token for the fork itself.
+        let cwd = "/tmp/gitwand-test-restricted-parent";
+        let out: Option<Result<(), String>> = rest_attempt(
+            cwd,
+            "repo:org/parent-a",
+            Some("tok".into()),
+            || true,
+            |_| Err(RESTRICTED.to_string()),
+        );
+        assert!(out.is_none());
+        assert!(!is_marked_restricted(cwd));
+    }
+
+    #[test]
+    fn a_restricted_call_falls_back_to_gh_and_marks_the_repo() {
+        let cwd = "/tmp/gitwand-test-restricted-a";
+        let out: Option<Result<(), String>> = rest_attempt(
+            cwd,
+            cwd,
+            Some("tok".into()),
+            || true,
+            |_| Err(RESTRICTED.to_string()),
+        );
+        assert!(out.is_none(), "caller must fall through to the gh path");
+        assert!(is_marked_restricted(cwd));
+        assert_eq!(token_for_repo(cwd, Some("tok".into())), None);
+        // Another repository keeps the GitWand token.
+        assert_eq!(
+            token_for_repo("/tmp/gitwand-test-other", Some("tok".into())),
+            Some("tok".to_string())
+        );
+    }
+
+    #[test]
+    fn without_gh_a_restricted_call_explains_instead_of_falling_back() {
+        let cwd = "/tmp/gitwand-test-restricted-b";
+        let out: Option<Result<(), String>> = rest_attempt(
+            cwd,
+            cwd,
+            Some("tok".into()),
+            || false,
+            |_| Err(RESTRICTED.to_string()),
+        );
+        let err = out.expect("no gh: the REST result is final").unwrap_err();
+        assert!(
+            err.contains("Dendreo") && err.contains("gh auth login"),
+            "{err}"
+        );
+        // Not marked: the next call tries the GitWand token again, in case the
+        // organization approved GitWand in the meantime.
+        assert!(!is_marked_restricted(cwd));
+    }
+
+    #[test]
+    fn other_results_pass_through_untouched() {
+        let cwd = "/tmp/gitwand-test-restricted-c";
+        let ok: Option<Result<i32, String>> =
+            rest_attempt(cwd, cwd, Some("tok".into()), || true, |_| Ok(7));
+        assert_eq!(ok, Some(Ok(7)));
+        let err: Option<Result<i32, String>> = rest_attempt(
+            cwd,
+            cwd,
+            Some("tok".into()),
+            || true,
+            |_| Err("GitHub API error (404): Not Found".to_string()),
+        );
+        assert_eq!(
+            err,
+            Some(Err("GitHub API error (404): Not Found".to_string()))
+        );
+        assert!(!is_marked_restricted(cwd));
+        let none: Option<Result<i32, String>> = rest_attempt(cwd, cwd, None, || true, |_| Ok(1));
+        assert_eq!(none, None, "no GitWand token: the gh path runs");
+    }
 
     #[test]
     fn rollup_from_check_runs_failure_wins() {
@@ -2088,5 +3402,361 @@ mod tests {
     #[test]
     fn top_pr_from_rest_json_empty_list_is_none() {
         assert_eq!(top_pr_from_rest_json(&[]), None);
+    }
+
+    fn fork_info(is_fork: bool, origin: &str, parent: &str) -> ForkInfo {
+        ForkInfo {
+            is_fork,
+            origin: origin.to_string(),
+            parent: parent.to_string(),
+        }
+    }
+
+    // Regression: `rest_pr_ready` resolved the PR via `get_pr_json` (origin
+    // first), so on a fork it marked the fork's same-numbered PR ready instead
+    // of the upstream PR the list shows. Every PR action now uses the base repo.
+    #[test]
+    fn the_base_repo_is_the_parent_for_a_fork_else_origin() {
+        assert_eq!(
+            base_repo_of(&fork_info(true, "me/proj", "upstream/proj")),
+            "upstream/proj"
+        );
+        assert_eq!(base_repo_of(&fork_info(false, "me/proj", "")), "me/proj");
+        assert_eq!(base_repo_of(&fork_info(true, "me/proj", "")), "me/proj");
+    }
+
+    // Regression: after merging a fork PR, `rest_merge_pr` deleted `head.ref`
+    // in the base repo, removing an unrelated same-named upstream branch.
+    #[test]
+    fn head_branch_to_delete_is_the_base_repo_for_a_same_repo_pr() {
+        let pr = serde_json::json!({
+            "base": { "repo": { "full_name": "owner/proj" } },
+            "head": { "ref": "feature", "repo": { "full_name": "owner/proj" } }
+        });
+        assert_eq!(
+            head_branch_to_delete(&pr),
+            Some(("owner/proj".to_string(), "feature".to_string()))
+        );
+    }
+
+    #[test]
+    fn head_branch_to_delete_leaves_a_fork_pr_alone() {
+        let pr = serde_json::json!({
+            "base": { "repo": { "full_name": "upstream/proj" } },
+            "head": { "ref": "feature", "repo": { "full_name": "me/proj" } }
+        });
+        assert_eq!(head_branch_to_delete(&pr), None);
+    }
+
+    #[test]
+    fn head_branch_to_delete_is_none_when_the_fork_was_deleted() {
+        let pr = serde_json::json!({
+            "base": { "repo": { "full_name": "upstream/proj" } },
+            "head": { "ref": "main", "repo": null }
+        });
+        assert_eq!(head_branch_to_delete(&pr), None);
+    }
+}
+
+#[cfg(test)]
+mod checks_unavailable_tests {
+    use super::{api_error_has_status, checks_unavailable};
+
+    #[test]
+    fn an_api_error_status_is_read_from_both_formats() {
+        assert!(api_error_has_status(
+            "GitHub API error (404): Not Found",
+            404
+        ));
+        assert!(api_error_has_status("gh: Not Found (HTTP 404)", 404));
+        assert!(!api_error_has_status(
+            "gh api GET repos/o/r/contents/crash (404).md: HTTP 502",
+            404
+        ));
+        assert!(!api_error_has_status(
+            "GitHub API error (403): Forbidden",
+            404
+        ));
+    }
+
+    #[test]
+    fn forbidden_or_not_found_means_no_checks_to_show() {
+        assert!(checks_unavailable(
+            "GitHub API error (403): Resource not accessible by personal access token"
+        ));
+        assert!(checks_unavailable("GitHub API error (404): Not Found"));
+        assert!(checks_unavailable(
+            "gh api check-runs: gh: Resource not accessible by integration (HTTP 403)"
+        ));
+    }
+
+    #[test]
+    fn rate_limits_oauth_restrictions_and_other_errors_are_failures() {
+        assert!(!checks_unavailable(
+            "GitHub API error (403): API rate limit exceeded for user"
+        ));
+        assert!(!checks_unavailable(
+            "gh: You have exceeded a secondary rate limit (HTTP 403)"
+        ));
+        assert!(!checks_unavailable(
+            "GitHub API error (403): the `X` organization has enabled OAuth App access restrictions"
+        ));
+        assert!(!checks_unavailable("GitHub API error (500): boom"));
+        assert!(!checks_unavailable("curl: (6) Could not resolve host"));
+    }
+}
+
+#[cfg(test)]
+mod etag_key_tests {
+    use super::etag_key;
+
+    #[test]
+    fn depends_on_the_token_without_containing_it() {
+        let a = etag_key("https://api.github.com/x", "tok-a");
+        let b = etag_key("https://api.github.com/x", "tok-b");
+        assert_ne!(a, b);
+        assert!(!a.contains("tok-a"));
+        assert_eq!(a, etag_key("https://api.github.com/x", "tok-a"));
+    }
+}
+
+#[cfg(test)]
+mod etag_cache_tests {
+    use super::EtagCache;
+
+    #[test]
+    fn evicts_the_least_recently_used_entry_only() {
+        let mut c = EtagCache::new(2);
+        c.insert("a".into(), "ea".into(), "A".into());
+        c.insert("b".into(), "eb".into(), "B".into());
+        assert!(c.get("a").is_some()); // a is now more recent than b
+        c.insert("c".into(), "ec".into(), "C".into());
+        assert!(c.get("b").is_none());
+        assert_eq!(c.get("a"), Some(("ea".into(), "A".into())));
+        assert_eq!(c.get("c"), Some(("ec".into(), "C".into())));
+    }
+
+    #[test]
+    fn replacing_a_key_never_evicts() {
+        let mut c = EtagCache::new(2);
+        c.insert("a".into(), "1".into(), "A".into());
+        c.insert("b".into(), "1".into(), "B".into());
+        c.insert("a".into(), "2".into(), "A2".into());
+        assert!(c.get("b").is_some());
+        assert_eq!(c.get("a"), Some(("2".into(), "A2".into())));
+    }
+}
+
+#[cfg(test)]
+mod list_page_plan_tests {
+    use super::list_page_plan;
+
+    #[test]
+    fn small_windows_are_one_page_from_the_start() {
+        assert_eq!(list_page_plan(0, 10), (10, 1, 0));
+        assert_eq!(list_page_plan(40, 10), (50, 1, 0));
+    }
+
+    /// Past 100: pages of 100, starting at the one holding `offset`, so
+    /// "load more" never hits a wall or an empty page.
+    #[test]
+    fn past_100_it_starts_at_the_offsets_page() {
+        assert_eq!(list_page_plan(100, 10), (100, 2, 100));
+        assert_eq!(list_page_plan(1_250, 50), (100, 13, 1_200));
+    }
+}
+
+#[cfg(test)]
+mod with_rest_pr_tests {
+    use super::*;
+    use crate::worktree::test_support::TempRepo;
+
+    /// `with_rest_pr` keys a parent's OAuth refusal on the parent only once
+    /// the fork is known; it never makes a request to find out.
+    #[test]
+    fn the_cached_fork_parent_is_read_without_a_request() {
+        let repo = TempRepo::new();
+        let cwd = repo.path.to_str().unwrap();
+        let origin = format!("gw-cfp-{}/proj", std::process::id());
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{origin}.git"),
+        ]);
+        assert_eq!(cached_fork_parent(cwd), None);
+        let cache = FORK_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        cache.lock().unwrap().insert(
+            origin.clone(),
+            ForkInfo {
+                is_fork: true,
+                origin: origin.clone(),
+                parent: "upstream/proj".to_string(),
+            },
+        );
+        assert_eq!(cached_fork_parent(cwd).as_deref(), Some("upstream/proj"));
+        cache.lock().unwrap().insert(
+            origin.clone(),
+            ForkInfo {
+                is_fork: false,
+                origin: origin.clone(),
+                parent: String::new(),
+            },
+        );
+        assert_eq!(cached_fork_parent(cwd), None);
+        cache.lock().unwrap().remove(&origin);
+    }
+}
+
+#[cfg(test)]
+mod checkout_pr_head_tests {
+    use super::checkout_pr_head;
+    use crate::worktree::test_support::{git_at, TempRepo};
+
+    /// `repo` with a bare `origin` carrying `refs/pull/7/head` at a commit of
+    /// a side branch. Returns (repo, bare, PR head sha).
+    fn with_pr7() -> (TempRepo, std::path::PathBuf, String) {
+        let repo = TempRepo::new();
+        let bare = repo.add_bare_origin();
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        let head = repo.commit("pr.txt", "1\n", "pr 1");
+        repo.git(&["push", "-q", "origin", "side:refs/pull/7/head"]);
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["branch", "-q", "-D", "side"]);
+        (repo, bare, head)
+    }
+
+    fn cwd(repo: &TempRepo) -> &str {
+        repo.path.to_str().unwrap()
+    }
+
+    #[test]
+    fn creates_the_branch_at_the_pr_head() {
+        let (repo, _bare, head) = with_pr7();
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "pr-7");
+    }
+
+    #[test]
+    fn moves_an_existing_branch_forward_checked_out_or_not() {
+        let (repo, bare, _head) = with_pr7();
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        // The PR gains a commit.
+        repo.git(&["checkout", "-q", "-b", "next", "pr-7"]);
+        let next = repo.commit("pr.txt", "2\n", "pr 2");
+        repo.git(&["push", "-q", "origin", "next:refs/pull/7/head"]);
+        // On pr-7: fast-forwarded in place.
+        repo.git(&["checkout", "-q", "pr-7"]);
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), next);
+        // Not on pr-7: moved, then checked out.
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["branch", "-q", "-f", "pr-7", "pr-7~1"]);
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), next);
+        assert_eq!(git_at(&bare, &["rev-parse", "refs/pull/7/head"]), next);
+    }
+
+    /// A `pr-7` from another PR #7 (the fork's own, before #262) or a
+    /// force-pushed PR: refused with what to do, and left as it was.
+    #[test]
+    fn refuses_a_branch_with_commits_the_pr_does_not_have() {
+        let (repo, _bare, _head) = with_pr7();
+        repo.git(&["checkout", "-q", "-b", "pr-7", "main"]);
+        let other = repo.commit("other.txt", "x\n", "another PR 7");
+        repo.git(&["checkout", "-q", "main"]);
+        let err = checkout_pr_head(cwd(&repo), "origin", 7).unwrap_err();
+        assert!(err.contains("have diverged"), "{err}");
+        assert!(err.contains("left as it is"), "{err}");
+        assert_eq!(repo.git(&["rev-parse", "pr-7"]), other);
+        assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "main");
+    }
+
+    /// The PR rewound (by anyone, its author or the user as maintainer):
+    /// pr-7 ahead of a PR head that moved back is refused like a divergence,
+    /// pr-7 left as it is.
+    #[test]
+    fn refuses_a_rewound_pr() {
+        let (repo, bare, head) = with_pr7();
+        repo.git(&["checkout", "-q", "-b", "next", &head]);
+        repo.git(&["commit", "-q", "--allow-empty", "-m", "pr 2"]);
+        let pr2 = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["push", "-q", "origin", "next:refs/pull/7/head"]);
+        repo.git(&["checkout", "-q", "main"]);
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        repo.git(&["checkout", "-q", "main"]);
+        // Rewound to the first commit.
+        repo.git(&[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{head}:refs/pull/7/head"),
+        ]);
+        let err = checkout_pr_head(cwd(&repo), "origin", 7).unwrap_err();
+        assert!(err.contains("rewound"), "{err}");
+        assert_eq!(repo.git(&["rev-parse", "pr-7"]), pr2);
+        assert_eq!(git_at(&bare, &["rev-parse", "refs/pull/7/head"]), head);
+    }
+
+    /// The user pushed part of their pr-7 work to the PR: the PR moved
+    /// forward, pr-7 is still ahead of it — local work, not a rewind.
+    #[test]
+    fn a_pr_that_only_moved_forward_is_not_a_rewind() {
+        let (repo, _bare, _head) = with_pr7();
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        let a = repo.commit("a.txt", "a\n", "A");
+        let b = repo.commit("b.txt", "b\n", "B");
+        repo.git(&["push", "-q", "origin", &format!("{a}:refs/pull/7/head")]);
+        repo.git(&["checkout", "-q", "main"]);
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), b);
+    }
+
+    /// The user's own commits on `pr-7` (ahead of the PR): checked out as
+    /// they are, never refused or rewritten.
+    #[test]
+    fn checks_out_a_branch_ahead_of_the_pr_as_it_is() {
+        let (repo, _bare, _head) = with_pr7();
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        let mine = repo.commit("mine.txt", "m\n", "my work");
+        repo.git(&["checkout", "-q", "main"]);
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), mine);
+        assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "pr-7");
+        // Already on it: still fine.
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), mine);
+        // A merge of main on top (others' commits): still local work.
+        repo.git(&["checkout", "-q", "main"]);
+        repo.commit("main.txt", "x\n", "main moves");
+        repo.git(&["checkout", "-q", "pr-7"]);
+        repo.git(&["merge", "-q", "--no-edit", "main"]);
+        let merged = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["checkout", "-q", "main"]);
+        checkout_pr_head(cwd(&repo), "origin", 7).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), merged);
+    }
+}
+
+#[cfg(test)]
+mod redact_url_tests {
+    use super::redact_url_userinfo;
+
+    #[test]
+    fn a_remote_url_shows_without_its_credentials() {
+        assert_eq!(
+            redact_url_userinfo("https://oauth2:glpat-SECRET@gitlab.example/team/app.git"),
+            "https://gitlab.example/team/app.git"
+        );
+        assert_eq!(
+            redact_url_userinfo("https://github.com/me/app.git"),
+            "https://github.com/me/app.git"
+        );
+        assert_eq!(
+            redact_url_userinfo("git@host:me/app.git"),
+            "git@host:me/app.git"
+        );
     }
 }

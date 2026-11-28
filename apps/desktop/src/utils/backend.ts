@@ -21,7 +21,8 @@
  */
 
 // ─── Infrastructure (shared with sub-modules via backend-core.ts) ────────────
-import { isTauri, tauriInvoke, devFetch, DEV_SERVER, IPC_TIMEOUT, devTerminalOpen, devWatchRepoOpen, devWatchRepoClose, devGitClone, devGitFetch } from './backend-core';
+import { dispatchTerminalEvent, type TerminalEvent } from "./terminalEvents";
+import { isTauri, tauriInvoke, devFetch, devGet, DEV_SERVER, IPC_TIMEOUT, devTerminalOpen, devPtyStream, devWatchRepoOpen, devWatchRepoClose, devGitClone, devGitFetch } from './backend-core';
 export { isTauri };
 // ─── Cross-module type imports for workspace helpers ─────────────────────────
 // PullRequest is defined in backend-pr.ts but used by workspacePrsAll here.
@@ -410,6 +411,51 @@ export async function listRepoTree(cwd: string): Promise<RepoTreeResult> {
   return res.json();
 }
 
+// ─── One working-tree directory (Files view, v3.11.2) ────────────────
+
+/** One entry of `listRepoDir`. `path` is repo-relative with `/` separators. */
+export interface RepoDirEntry {
+  name: string;
+  path: string;
+  /** Symlinks are reported, never followed. */
+  kind: "file" | "dir" | "symlink";
+  /** Matched by an ignore rule and not tracked. Only returned when requested. */
+  ignored: boolean;
+  /** Byte length for files; 0 for directories and symlinks. */
+  size: number;
+}
+
+export interface RepoDirListing {
+  entries: RepoDirEntry[];
+  /** More than 5,000 listable entries: only the first 5,000 are returned. */
+  truncated: boolean;
+}
+
+/**
+ * List one directory of the working tree (`dir` is repo-relative, "" for the
+ * root). `.git` is never listed. Ignored entries are dropped unless
+ * `includeIgnored`, in which case they come back with `ignored: true`.
+ */
+export async function listRepoDir(
+  cwd: string,
+  dir: string,
+  includeIgnored: boolean,
+): Promise<RepoDirListing> {
+  if (isTauri()) {
+    return tauriInvoke<RepoDirListing>("list_repo_dir", { cwd, dir, includeIgnored });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/list-repo-dir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, dir, includeIgnored }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `list_repo_dir failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 // ─── Git status ────────────────────────────────────────────
 
 export interface FileChange {
@@ -545,6 +591,9 @@ export interface GitDiff {
    * a "diff truncated at X MB" banner.
    */
   truncatedFromBytes?: number;
+  /** Set when git printed `Binary files … differ`: a content change no hunk
+   *  describes (multi-file diffs: `git_show`, the combined diff). */
+  binary?: true;
 }
 
 /**
@@ -558,6 +607,12 @@ export async function getGitDiff(
   if (isTauri()) {
     const raw = await tauriInvoke<{
       path: string;
+      status?: GitDiff["status"];
+      oldPath?: string;
+      truncatedFromBytes?: number;
+      isDirectory?: boolean;
+      newFiles?: string[];
+      nestedRepo?: boolean;
       hunks: Array<{
         header: string;
         old_start: number;
@@ -575,6 +630,15 @@ export async function getGitDiff(
 
     return {
       path: raw.path,
+      // Already camelCase on the wire (explicit serde renames in types.rs).
+      // Dropping them hid the 5 MB truncation banner and the untracked-
+      // directory / nested-repo panel (issue #183) in the packaged app only.
+      status: raw.status,
+      oldPath: raw.oldPath,
+      truncatedFromBytes: raw.truncatedFromBytes,
+      isDirectory: raw.isDirectory,
+      newFiles: raw.newFiles,
+      nestedRepo: raw.nestedRepo,
       hunks: raw.hunks.map((h) => ({
         header: h.header,
         oldStart: h.old_start,
@@ -723,6 +787,20 @@ export async function getGitRevCount(
   return typeof data === "number" ? data : (data.count ?? 0);
 }
 
+/**
+ * Fingerprint of what the Git Tree's all-refs log starts from and decorates:
+ * refs, every worktree's HEAD and branch, stash entries
+ * (`git_refs_fingerprint`). Compare for equality only.
+ */
+export async function getGitRefsFingerprint(cwd: string): Promise<string> {
+  if (isTauri()) {
+    return tauriInvoke<string>("git_refs_fingerprint", { cwd });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-refs-fingerprint?cwd=${encodeURIComponent(cwd)}`);
+  if (!res.ok) throw new Error(`Failed to get the refs fingerprint: ${res.status}`);
+  return (await res.json()) as string;
+}
+
 // ─── Git stage / unstage ──────────────────────────────────────
 
 /**
@@ -739,6 +817,44 @@ export async function gitStage(cwd: string, paths: string[]): Promise<void> {
     body: JSON.stringify({ cwd, paths }),
   });
   if (!res.ok) throw new Error(`Failed to stage files: ${res.status}`);
+}
+
+/** Tracked paths that match an ignore rule (`git ls-files -ci --exclude-standard`). */
+export interface TrackedIgnored {
+  /** At most 500 repo-relative paths. */
+  paths: string[];
+  /** Uncapped number of matching tracked paths. */
+  total: number;
+  /** True when `paths` is shorter than `total`. */
+  truncated: boolean;
+}
+
+/**
+ * List tracked files that now match `.gitignore` / `.git/info/exclude`.
+ */
+export async function gitTrackedIgnored(cwd: string): Promise<TrackedIgnored> {
+  if (isTauri()) {
+    return tauriInvoke<TrackedIgnored>("git_tracked_ignored", { cwd });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-tracked-ignored?cwd=${encodeURIComponent(cwd)}`);
+  if (!res.ok) throw new Error(`Failed to list tracked ignored files: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Untrack files (git rm --cached): they stay on disk, the removal is staged.
+ */
+export async function gitUntrackPaths(cwd: string, paths: string[]): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("git_untrack_paths", { cwd, paths });
+    return;
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-untrack-paths`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, paths }),
+  });
+  if (!res.ok) throw new Error(`Failed to untrack files: ${res.status}`);
 }
 
 /**
@@ -794,16 +910,26 @@ export async function gitUnstagePatch(cwd: string, patch: string): Promise<void>
 // ─── Git commit ───────────────────────────────────────────────
 
 /**
- * Create a commit with the given message. Returns the short hash.
+ * Commit staged changes; returns the short hash. When `identity` is given
+ * (see `commitIdentityFor`), it is injected as `-c user.name=… -c
+ * user.email=…` — plus `user.signingkey` when set — for this commit only:
+ * the repo's git config is left untouched.
  */
-export async function gitCommit(cwd: string, message: string): Promise<string> {
+export async function gitCommit(
+  cwd: string,
+  message: string,
+  identity?: { name: string; email: string; signingKey?: string | null } | null,
+): Promise<string> {
+  const identityName = identity?.name ?? null;
+  const identityEmail = identity?.email ?? null;
+  const identitySigningKey = identity?.signingKey ?? null;
   if (isTauri()) {
-    return tauriInvoke<string>("git_commit", { cwd, message });
+    return tauriInvoke<string>("git_commit", { cwd, message, identityName, identityEmail, identitySigningKey });
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-commit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, message }),
+    body: JSON.stringify({ cwd, message, identityName, identityEmail, identitySigningKey }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -885,6 +1011,8 @@ export interface GitPushPullResult {
   success: boolean;
   message: string;
   conflicts?: boolean;
+  /** Fetch only: whether any ref moved; absent when it could not be told (#287). */
+  refsChanged?: boolean;
 }
 
 /**
@@ -894,20 +1022,33 @@ export interface GitPushPullResult {
  * which publishes the current branch to a same-named branch on origin and
  * records it as the upstream. Used when pushing a branch that has no
  * tracking configured yet.
+ *
+ * `force` pushes with `--force-with-lease`. With `lease`, the lease is explicit
+ * (`--force-with-lease=refs/heads/<branch>:<sha>`): the push is refused unless
+ * the remote branch still sits on `sha`, whatever a later fetch brought in.
  */
 export async function gitPush(
   cwd: string,
   setUpstream: boolean = false,
   force: boolean = false,
+  lease?: { branch: string; sha: string },
 ): Promise<GitPushPullResult> {
+  const leaseBranch = lease?.branch ?? null;
+  const leaseSha = lease?.sha ?? null;
   if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_push", { cwd, setUpstream, force }, IPC_TIMEOUT.NETWORK);
+    return tauriInvoke<GitPushPullResult>(
+      "git_push",
+      { cwd, setUpstream, force, leaseBranch, leaseSha },
+      IPC_TIMEOUT.NETWORK,
+    );
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-push`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, setUpstream, force }),
+    body: JSON.stringify({ cwd, setUpstream, force, leaseBranch, leaseSha }),
   });
+  // A refusal before git runs is the Rust command's `Err`: throw it.
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? `git push failed (${res.status})`);
   return res.json();
 }
 
@@ -941,20 +1082,57 @@ export async function gitPull(
   return res.json();
 }
 
+/** Result of `gitFastForwardToUpstream`. A refusal is a result, never a throw. */
+export interface FastForwardResult {
+  fastForwarded: boolean;
+  /** `operation | detached | noUpstream | conflicts | localCommits | trackedEdits | gitRefused | upToDate` */
+  reason?: string;
+  /** git's own message when it refused the fast-forward. */
+  stderr?: string;
+  /** Commits advanced by (or behind by, when refused). */
+  behind: number;
+  branch?: string | null;
+}
+
+/**
+ * Opt-in auto fast-forward: under the repo write lock, re-check every
+ * repo-side condition and only then `merge --ff-only @{upstream}`.
+ */
+export async function gitFastForwardToUpstream(cwd: string): Promise<FastForwardResult> {
+  if (isTauri()) {
+    return tauriInvoke<FastForwardResult>("git_fast_forward_to_upstream", { cwd });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/git-fast-forward-to-upstream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd }),
+  });
+  return res.json();
+}
+
 /**
  * Fetch from remote (updates tracking info without merging). `onProgress`,
  * if given, receives live updates over a scoped IPC channel (v3.10.0) —
  * pass it only for user-initiated fetches; the background poller omits it
  * so the UI never flickers on an automatic tick.
  */
-export async function gitFetch(cwd: string, onProgress?: (p: CloneProgress) => void): Promise<GitPushPullResult> {
+/** `remote`: fetch that remote instead of the default one. */
+export async function gitFetch(
+  cwd: string,
+  onProgress?: (p: CloneProgress) => void,
+  remote?: string,
+): Promise<GitPushPullResult> {
   if (isTauri()) {
     const { Channel } = await import("@tauri-apps/api/core");
     const channel = new Channel<CloneProgress>();
     if (onProgress) channel.onmessage = onProgress;
-    return tauriInvoke<GitPushPullResult>("git_fetch", { cwd, onProgress: channel }, IPC_TIMEOUT.NETWORK);
+    return tauriInvoke<GitPushPullResult>(
+      "git_fetch",
+      { cwd, onProgress: channel, remote: remote ?? null },
+      IPC_TIMEOUT.NETWORK,
+    );
   }
-  return devGitFetch(cwd, onProgress);
+  return devGitFetch(cwd, onProgress, remote);
 }
 
 /**
@@ -1020,8 +1198,8 @@ export async function gitOperationAction(
 }
 
 export interface RepoOperationState {
-  /** "clean" | "rebase" | "rebase_interactive" | "merge" | "cherry_pick" | "revert" */
-  state: 'clean' | 'rebase' | 'rebase_interactive' | 'merge' | 'cherry_pick' | 'revert';
+  /** "clean" | "rebase" | "rebase_interactive" | "merge" | "cherry_pick" | "revert" | "bisect" */
+  state: 'clean' | 'rebase' | 'rebase_interactive' | 'merge' | 'cherry_pick' | 'revert' | 'bisect';
   /** True when there are still unresolved conflict markers in the working tree. */
   hasConflict: boolean;
   /** SHA of the commit being applied (REBASE_HEAD / MERGE_HEAD / …). */
@@ -1051,6 +1229,99 @@ export async function gitRepoState(cwd: string): Promise<RepoOperationState> {
 }
 
 
+// ─── Guided bisect ────────────────────────────────────────────
+
+/** A bisect in progress (`git_bisect_status`, commands/bisect.rs). */
+export interface BisectStatus {
+  /** A bisect is in progress; false once it has ended, every other field empty. */
+  active: boolean;
+  /** HEAD, the commit under test. */
+  current: string | null;
+  /** What End bisect returns to (branch name or hash). */
+  start: string | null;
+  bad: string | null;
+  good: string[];
+  skipped: string[];
+  /** Commits left and estimated steps, once a bad and a good commit are known. */
+  remaining: number | null;
+  steps: number | null;
+  /** Set once git cannot narrow further: one = the first bad commit, several = left by skips. */
+  candidates: string[];
+  /** [bad term, good term] ("bad"/"good" unless the bisect set its own). */
+  terms: [string, string];
+  /** Subject, author and date of the commit under test and the candidates. */
+  commits: BisectCommit[];
+  /** The last mark was recorded but git could not check out the next commit: `next` moves on. */
+  pendingCheckout: boolean;
+}
+
+export interface BisectCommit {
+  hash: string;
+  subject: string;
+  author: string;
+  /** Author date, ISO 8601. */
+  date: string;
+}
+
+/** `next` checks out the next commit to test after a `pendingCheckout`. */
+export type BisectVerdict = "good" | "bad" | "skip" | "next";
+
+async function bisectPost<T>(route: string, body: Record<string, unknown>): Promise<T> {
+  const res = await devFetch(`${DEV_SERVER}${route}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error ?? `${route} failed: ${res.status}`);
+  return data as T;
+}
+
+export async function gitBisectStatus(cwd: string): Promise<BisectStatus> {
+  if (isTauri()) return tauriInvoke<BisectStatus>("git_bisect_status", { cwd });
+  const res = await devFetch(`${DEV_SERVER}/api/git-bisect-status?cwd=${encodeURIComponent(cwd)}`);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error ?? `bisect status failed: ${res.status}`);
+  return data as BisectStatus;
+}
+
+/**
+ * Start a bisect between two commits (full hashes), ordered by ancestry.
+ * With `keepOrder` ("Bisect from here"), `bad` must be HEAD and `good` an
+ * ancestor of it: never swapped.
+ */
+export async function gitBisectStart(cwd: string, bad: string, good: string, keepOrder = false): Promise<BisectStatus> {
+  // A checkout of the whole working tree, then the range walks: as long as a
+  // network command on a large repo, not a 30 s read.
+  if (isTauri()) return tauriInvoke<BisectStatus>("git_bisect_start", { cwd, bad, good, keepOrder }, IPC_TIMEOUT.NETWORK);
+  return bisectPost<BisectStatus>("/api/git-bisect-start", { cwd, bad, good, keepOrder });
+}
+
+/**
+ * Mark the commit under test. `expected` is the commit the user answered
+ * for: refused (`bisect:moved`) when the commit under test is another one.
+ */
+export async function gitBisectMark(
+  cwd: string,
+  verdict: BisectVerdict,
+  expected: string | null = null,
+): Promise<BisectStatus> {
+  if (isTauri()) return tauriInvoke<BisectStatus>("git_bisect_mark", { cwd, verdict, expected }, IPC_TIMEOUT.NETWORK);
+  return bisectPost<BisectStatus>("/api/git-bisect-mark", { cwd, verdict, expected });
+}
+
+/**
+ * End the bisect and check out what it started from; with `stay`, end it on
+ * the current commit (when the start branch is gone or cannot be checked out).
+ */
+export async function gitBisectReset(cwd: string, stay = false): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("git_bisect_reset", { cwd, stay }, IPC_TIMEOUT.NETWORK);
+    return;
+  }
+  await bisectPost<null>("/api/git-bisect-reset", { cwd, stay });
+}
+
 /**
  * Rebase the current branch onto `onto`, non-interactively.
  *
@@ -1076,6 +1347,296 @@ export async function gitRebaseOnto(
     throw new Error(err.error ?? `git rebase onto ${onto} failed`);
   }
   return res.json();
+}
+
+// ─── Stacked branches (v3.14) ───────────────────────────────────────
+// Mirrors of the Rust types in src-tauri/src/stack/mod.rs, snake_case as
+// serialized. `PendingRestack` is internal to Rust and not exposed here.
+
+export type StackMoment = "parent_moved" | "parent_merged";
+export type StackLayerState =
+  | "up_to_date"
+  | "out_of_date"
+  | "parent_merged"
+  | "parent_missing"
+  | "base_lost";
+
+export interface MergedParentHint {
+  branch: string;
+  number: number;
+  head_ref_oid: string | null;
+  /** The merged PR's merge commit (the squash): a moment-2 target must contain it. */
+  merge_commit_oid: string | null;
+}
+
+export interface StackLayerStatus {
+  branch: string;
+  parent: string;
+  base: string | null;
+  parent_tip: string | null;
+  state: StackLayerState;
+  inherited: boolean;
+  actionable: boolean;
+  merge_signal: "forge" | "cherry" | "merge_commit" | null;
+  merged_pr: number | null;
+  parent_behind_upstream: number;
+  top: string;
+}
+
+export interface FinalizedRestack {
+  moment: StackMoment;
+  bottom: string;
+  merged_parent: string | null;
+  new_parent: string | null;
+  moved: string[];
+  switched_back_to: string | null;
+  switch_error: SwitchError | null;
+  /** The merged parent when deleting it loses nothing (unchanged since merged, not checked out); else null. */
+  delete_offer: DeleteOffer | null;
+}
+
+/** A merged parent that may be deleted, and the tip that was verified (the delete's compare-and-swap value). */
+export interface DeleteOffer {
+  branch: string;
+  tip: string;
+}
+
+/** Why a finalize could not switch back to the branch the user was on. */
+export interface SwitchError {
+  branch: string;
+  reason: string;
+}
+
+/** A pending restack record that could not be settled, by the top that holds it. */
+export interface PendingError {
+  top: string;
+  error: string;
+}
+
+export interface StackReport {
+  trunk: string | null;
+  remote_trunk: string | null;
+  layers: StackLayerStatus[];
+  rebase_in_progress: boolean;
+  finalized: FinalizedRestack | null;
+  git_supports_restack: boolean;
+  /** One per stuck record, sorted by top. */
+  pending_errors: PendingError[];
+}
+
+export interface StackMeta {
+  branch: string;
+  parent: string;
+  base: string | null;
+}
+
+/**
+ * Why a restack plan is refused. The backend emits `rebase_in_progress`,
+ * `up_to_date`, `git_too_old`, `detached`, `dirty`, `occupied`,
+ * `occupied_rebasing`, `parent_behind`, `no_remote_trunk`,
+ * `merged_work_missing` and `no_old_base` (`branch` names the target for
+ * `merged_work_missing`). `fetch_failed` and
+ * `stale_preview` are synthesized by the frontend (useStacks): the first from
+ * a failed fetch, the second from a `git_restack` error starting with
+ * "stale preview:". Rust never puts them in a plan's `refusal`.
+ */
+export type RestackRefusalCode =
+  | "rebase_in_progress"
+  | "up_to_date"
+  | "git_too_old"
+  | "detached"
+  | "dirty"
+  | "occupied"
+  | "occupied_rebasing"
+  | "parent_behind"
+  | "no_remote_trunk"
+  | "merged_work_missing"
+  | "no_old_base"
+  | "fetch_failed"
+  | "stale_preview";
+
+export interface RestackRefusal {
+  code: RestackRefusalCode;
+  message: string;
+  /** The occupied branch, or the target (`parent_behind`, `merged_work_missing`). */
+  branch: string | null;
+  /** The worktree holding `branch` (`occupied`, `occupied_rebasing`). */
+  path: string | null;
+  /** The code's value: a commit count (`parent_behind`), a git version (`git_too_old`), a fetch error (`fetch_failed`). */
+  detail: string | null;
+}
+
+export interface RestackMovingRef {
+  branch: string;
+  in_stack: boolean;
+  upstream: string | null;
+  /** The push lease; null without an upstream, with a gone tracking ref, or when `push_block` is set. */
+  remote_sha: string | null;
+  /** Why this branch must not be pushed to its upstream (it tracks a local or another-named branch). */
+  push_block: string | null;
+}
+
+export interface RestackPlan {
+  moment: StackMoment;
+  bottom: string;
+  parent: string;
+  onto_ref: string;
+  onto_sha: string;
+  upstream_sha: string;
+  top: string;
+  top_sha: string;
+  moving: RestackMovingRef[];
+  new_parent: string | null;
+  refusal: RestackRefusal | null;
+}
+
+export interface PreviewedRestack {
+  onto_sha: string;
+  upstream_sha: string;
+  top_sha: string;
+  moving: string[];
+}
+
+/** POST a stack route on the dev-server; a non-ok response throws its `error`. */
+async function devStackPost<T>(route: string, body: Record<string, unknown>, fallback: string): Promise<T> {
+  const res = await devFetch(`${DEV_SERVER}${route}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error ?? fallback);
+  }
+  return res.json();
+}
+
+/** Stack layers of the repo, with each layer's state against its parent. */
+export async function stackStatus(
+  cwd: string,
+  trunk: string | null,
+  mergedParents: MergedParentHint[],
+): Promise<StackReport> {
+  if (isTauri()) {
+    return tauriInvoke<StackReport>("stack_status", { cwd, configuredTrunk: trunk, mergedParents });
+  }
+  return devStackPost<StackReport>(
+    "/api/stack-status",
+    { cwd, configuredTrunk: trunk, mergedParents },
+    "stack status failed",
+  );
+}
+
+/** Declare `parent` as the stack parent of `branch`. */
+export async function stackSetParent(
+  cwd: string,
+  branch: string,
+  parent: string,
+  trunk: string | null,
+): Promise<StackMeta> {
+  if (isTauri()) {
+    return tauriInvoke<StackMeta>("stack_set_parent", { cwd, branch, parent, configuredTrunk: trunk });
+  }
+  return devStackPost<StackMeta>(
+    "/api/stack-set-parent",
+    { cwd, branch, parent, configuredTrunk: trunk },
+    `set stack parent of ${branch} failed`,
+  );
+}
+
+/** Remove `branch` from its stack. */
+export async function stackUnset(cwd: string, branch: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke<void>("stack_unset", { cwd, branch });
+    return;
+  }
+  await devStackPost<unknown>("/api/stack-unset", { cwd, branch }, `unset stack of ${branch} failed`);
+}
+
+/**
+ * Delete the merged parent a restack offered to delete, only if it still
+ * points at `tip` (compare-and-swap): a commit added since makes it fail
+ * with "<branch> changed since the restack: not deleted …".
+ */
+export async function stackDeleteMergedParent(cwd: string, branch: string, tip: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke<void>("stack_delete_merged_parent", { cwd, branch, tip });
+    return;
+  }
+  await devStackPost<unknown>(
+    "/api/stack-delete-merged-parent",
+    { cwd, branch, tip },
+    `delete of ${branch} failed`,
+  );
+}
+
+/** Plan the restack of the stack whose top is `branch` (read-only). */
+export async function stackRestackPlan(
+  cwd: string,
+  branch: string,
+  trunk: string | null,
+  mergedParents: MergedParentHint[],
+): Promise<RestackPlan> {
+  if (isTauri()) {
+    return tauriInvoke<RestackPlan>("stack_restack_plan", {
+      cwd,
+      branch,
+      configuredTrunk: trunk,
+      mergedParents,
+    });
+  }
+  return devStackPost<RestackPlan>(
+    "/api/stack-restack-plan",
+    { cwd, branch, configuredTrunk: trunk, mergedParents },
+    `restack plan for ${branch} failed`,
+  );
+}
+
+/**
+ * Run the restack the user previewed. `previewed` pins the plan the preview
+ * showed; the backend refuses with `stale_preview` when the repo moved since.
+ * `{ conflict }` is true when the rebase halted on a merge conflict.
+ */
+export async function gitRestack(
+  cwd: string,
+  branch: string,
+  trunk: string | null,
+  mergedParents: MergedParentHint[],
+  previewed: PreviewedRestack,
+): Promise<{ conflict: boolean }> {
+  if (isTauri()) {
+    return tauriInvoke<{ conflict: boolean }>("git_restack", {
+      cwd,
+      branch,
+      configuredTrunk: trunk,
+      mergedParents,
+      previewed,
+    });
+  }
+  return devStackPost<{ conflict: boolean }>(
+    "/api/git-restack",
+    { cwd, branch, configuredTrunk: trunk, mergedParents, previewed },
+    `restack of ${branch} failed`,
+  );
+}
+
+/**
+ * Force-push one local branch to its upstream under `--force-with-lease`
+ * pinned to `leaseSha`, without checking it out.
+ */
+export async function gitPushBranch(
+  cwd: string,
+  branch: string,
+  leaseSha: string,
+): Promise<GitPushPullResult> {
+  if (isTauri()) {
+    return tauriInvoke<GitPushPullResult>("git_push_branch", { cwd, branch, leaseSha }, IPC_TIMEOUT.NETWORK);
+  }
+  return devStackPost<GitPushPullResult>(
+    "/api/git-push-branch",
+    { cwd, branch, leaseSha },
+    `push of ${branch} failed`,
+  );
 }
 
 /**
@@ -1112,52 +1673,189 @@ export async function gitInteractiveRebase(
 /**
  * Get the diff(s) for a specific commit.
  */
+/** A `GitDiff` as serde emits it: hunk fields in snake_case. */
+export interface RawGitDiff {
+  path: string;
+  hunks: Array<{
+    header: string;
+    old_start: number;
+    old_count: number;
+    new_start: number;
+    new_count: number;
+    lines: Array<{
+      type: string;
+      content: string;
+      old_line_no?: number | null;
+      new_line_no?: number | null;
+    }>;
+  }>;
+  status?: string;
+  oldPath?: string;
+  truncatedFromBytes?: number;
+  binary?: boolean;
+}
+
+/** Maps a Rust `GitDiff` (snake_case hunks) to the frontend `GitDiff`. */
+export function mapRawGitDiff(d: RawGitDiff): GitDiff {
+  return {
+    path: d.path,
+    hunks: d.hunks.map((h) => ({
+      header: h.header,
+      oldStart: h.old_start,
+      oldCount: h.old_count,
+      newStart: h.new_start,
+      newCount: h.new_count,
+      lines: h.lines.map((l) => ({
+        type: l.type as "context" | "add" | "delete",
+        content: l.content,
+        // serde emits `null` for a side the line is not on.
+        oldLineNo: l.old_line_no as number | undefined,
+        newLineNo: l.new_line_no as number | undefined,
+      })),
+    })),
+    status: d.status as GitDiff["status"],
+    oldPath: d.oldPath,
+    ...(d.truncatedFromBytes !== undefined ? { truncatedFromBytes: d.truncatedFromBytes } : {}),
+    ...(d.binary === true ? { binary: true as const } : {}),
+  };
+}
+
 export async function getGitShow(cwd: string, hash: string): Promise<GitDiff[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<
-      Array<{
-        path: string;
-        hunks: Array<{
-          header: string;
-          old_start: number;
-          old_count: number;
-          new_start: number;
-          new_count: number;
-          lines: Array<{
-            type: string;
-            content: string;
-            old_line_no?: number;
-            new_line_no?: number;
-          }>;
-        }>;
-        status?: string;
-        oldPath?: string;
-      }>
-    >("git_show", { cwd, hash });
-
-    return raw.map((d) => ({
-      path: d.path,
-      hunks: d.hunks.map((h) => ({
-        header: h.header,
-        oldStart: h.old_start,
-        oldCount: h.old_count,
-        newStart: h.new_start,
-        newCount: h.new_count,
-        lines: h.lines.map((l) => ({
-          type: l.type as "context" | "add" | "delete",
-          content: l.content,
-          oldLineNo: l.old_line_no,
-          newLineNo: l.new_line_no,
-        })),
-      })),
-      status: d.status as GitDiff["status"],
-      oldPath: d.oldPath,
-    }));
+    const raw = await tauriInvoke<RawGitDiff[]>("git_show", { cwd, hash });
+    return raw.map(mapRawGitDiff);
   }
 
   const qs = `?cwd=${encodeURIComponent(cwd)}&hash=${encodeURIComponent(hash)}`;
   const res = await devFetch(`${DEV_SERVER}/api/git-show${qs}`);
   if (!res.ok) throw new Error(`Failed to get commit diff: ${res.status}`);
+  return res.json();
+}
+
+// ─── Combined diff (v3.15) ───────────────────────────────────
+
+/** A selected commit, in replay order. */
+export interface CombinedCommit {
+  hash: string;
+  shortHash: string;
+  subject: string;
+  author: string;
+  /** Author date, strict ISO 8601. */
+  date: string;
+}
+
+/** A file the replay could not merge: shown commit by commit. */
+export interface CombinedFallbackFile {
+  path: string;
+  /**
+   * `merge-tree` reported it (or its rename partner). `false` = a companion
+   * that falls back conservatively: never describe it as a conflict.
+   */
+  conflicted: boolean;
+  /** Replay order. */
+  perCommit: { hash: string; diff: GitDiff }[];
+  /**
+   * Full hashes, at most 5; only for conflicted files. Conflicted with no
+   * blocker = a conflict between selected commits.
+   */
+  blockers: string[];
+}
+
+export interface CombinedDiff {
+  /** Full hash of the replay base; `null` = the empty tree. */
+  base: string | null;
+  /** Replay order (ancestors first). */
+  commits: CombinedCommit[];
+  /** Net diff, fallback files removed. */
+  diffs: GitDiff[];
+  /** `steps[i]` = `-U0` diff of commit i's replay, fallback files removed. */
+  steps: GitDiff[][];
+  fallback: CombinedFallbackFile[];
+  /** The 16 MB payload budget cut steps (no markers) or entries (header-only). */
+  truncated: boolean;
+  /**
+   * The entries the budget made header-only (sorted, unique): their
+   * `truncatedFromBytes` is an estimated payload weight, not a file size over
+   * the 5 MB per-file cap.
+   */
+  budgetOmitted: CombinedBudgetOmitted[];
+}
+
+/**
+ * An entry the payload budget made header-only: a net entry (`commit: null`)
+ * or the per-commit fallback section of `commit` — one path can have both,
+ * only some of them cut.
+ */
+export interface CombinedBudgetOmitted {
+  path: string;
+  commit: string | null;
+}
+
+/** The Rust `CombinedDiff` payload: its `GitDiff`s keep snake_case hunks. */
+export type RawCombinedDiff = Omit<CombinedDiff, "diffs" | "steps" | "fallback"> & {
+  diffs: RawGitDiff[];
+  steps: RawGitDiff[][];
+  fallback: Array<Omit<CombinedFallbackFile, "perCommit"> & { perCommit: { hash: string; diff: RawGitDiff }[] }>;
+};
+
+/** Maps every `GitDiff` of the Rust payload with `mapRawGitDiff`. */
+export function mapRawCombinedDiff(raw: RawCombinedDiff): CombinedDiff {
+  return {
+    base: raw.base,
+    commits: raw.commits,
+    diffs: raw.diffs.map(mapRawGitDiff),
+    steps: raw.steps.map((step) => step.map(mapRawGitDiff)),
+    fallback: raw.fallback.map((f) => ({
+      path: f.path,
+      conflicted: f.conflicted,
+      perCommit: f.perCommit.map((p) => ({ hash: p.hash, diff: mapRawGitDiff(p.diff) })),
+      blockers: f.blockers,
+    })),
+    truncated: raw.truncated,
+    budgetOmitted: raw.budgetOmitted.map((o) => ({ path: o.path, commit: o.commit })),
+  };
+}
+
+/**
+ * Combined diff of 2 to 50 commits (any order), optionally limited to
+ * `paths`. Throws the backend's message (invalid hash, bounds, unknown
+ * commit, git too old) so the view can show it.
+ */
+export async function getCombinedDiff(cwd: string, hashes: string[], paths?: string[]): Promise<CombinedDiff> {
+  if (isTauri()) {
+    return mapRawCombinedDiff(await tauriInvoke<RawCombinedDiff>("git_combined_diff", { cwd, hashes, paths }));
+  }
+
+  const res = await devFetch(`${DEV_SERVER}/api/git-combined-diff`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(paths === undefined ? { cwd, hashes } : { cwd, hashes, paths }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error || `Failed to get combined diff: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** One commit of a file's `--follow` history and the file's name there
+ *  (absent for a merge). */
+export interface FileLineageEntry {
+  hash: string;
+  path?: string;
+}
+
+/**
+ * Every commit of `path`'s `--follow` history (root-relative), newest first:
+ * the names a file-history combined diff needs, without the log bodies.
+ */
+export async function getGitFileLineage(cwd: string, path: string): Promise<FileLineageEntry[]> {
+  if (isTauri()) return tauriInvoke<FileLineageEntry[]>("git_file_lineage", { cwd, path });
+  const res = await devFetch(`${DEV_SERVER}/api/git-file-lineage?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error || `Failed to get file lineage: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -1201,6 +1899,12 @@ export async function getGitBlame(cwd: string, path: string, algorithm: BlameAlg
 // ─── Git file log ────────────────────────────────────────────
 
 export interface FileLogEntry {
+  /**
+   * The file's repo-root-relative name at this commit, from the `--follow`
+   * walk (the old name before a rename). Set by `getGitFileLog` and
+   * `getGitFileLogPickaxe`; absent from range results and merge commits.
+   */
+  path?: string;
   hashFull: string;
   hash: string;
   author: string;
@@ -1214,8 +1918,8 @@ export interface FileLogEntry {
  */
 export async function getGitFileLog(cwd: string, path: string, count = 50): Promise<FileLogEntry[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<Array<{ hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log", { cwd, path, count });
-    return raw.map(r => ({ hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
+    const raw = await tauriInvoke<Array<{ path?: string; hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log", { cwd, path, count });
+    return raw.map(r => ({ ...(r.path !== undefined ? { path: r.path } : {}), hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
   }
   const qs = `?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}&count=${count}`;
   const res = await devFetch(`${DEV_SERVER}/api/git-file-log${qs}`);
@@ -1231,8 +1935,8 @@ export type PickaxeMode = "S" | "G";
  */
 export async function getGitFileLogPickaxe(cwd: string, path: string, search: string, mode: PickaxeMode = "S"): Promise<FileLogEntry[]> {
   if (isTauri()) {
-    const raw = await tauriInvoke<Array<{ hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log_pickaxe", { cwd, path, search, mode });
-    return raw.map(r => ({ hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
+    const raw = await tauriInvoke<Array<{ path?: string; hash_full: string; hash: string; author: string; date: string; message: string; body: string }>>("git_file_log_pickaxe", { cwd, path, search, mode });
+    return raw.map(r => ({ ...(r.path !== undefined ? { path: r.path } : {}), hashFull: r.hash_full, hash: r.hash, author: r.author, date: r.date, message: r.message, body: r.body }));
   }
   const qs = `?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}&search=${encodeURIComponent(search)}&mode=${mode}`;
   const res = await devFetch(`${DEV_SERVER}/api/git-file-log-pickaxe${qs}`);
@@ -1259,16 +1963,23 @@ export async function getGitFileLogRange(cwd: string, path: string, startLine: n
 
 /**
  * Get diff for a specific file between two commits (time-travel diff).
+ *
+ * `fromPath` / `toPath`: the file's repo-root-relative name at each commit,
+ * as `getGitFileLog` reported it (`FileLogEntry.path`). They are how a rename
+ * between the two commits is followed; omitted, both default to `path`.
  */
 export async function getGitFileDiff(
   cwd: string,
   path: string,
   fromHash: string,
   toHash: string,
+  fromPath?: string,
+  toPath?: string,
 ): Promise<GitDiff> {
   if (isTauri()) {
     const raw = await tauriInvoke<{
       path: string;
+      truncatedFromBytes?: number;
       hunks: Array<{
         header: string;
         old_start: number;
@@ -1282,10 +1993,12 @@ export async function getGitFileDiff(
           new_line_no?: number;
         }>;
       }>;
-    }>("git_file_diff", { cwd, path, fromHash, toHash });
+    }>("git_file_diff", { cwd, path, fromHash, toHash, fromPath, toPath });
 
     return {
       path: raw.path,
+      // Already camelCase on the wire (serde rename in types.rs), like git_diff.
+      truncatedFromBytes: raw.truncatedFromBytes,
       hunks: raw.hunks.map((h) => ({
         header: h.header,
         oldStart: h.old_start,
@@ -1302,9 +2015,14 @@ export async function getGitFileDiff(
     };
   }
 
-  const qs = `?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}&from=${encodeURIComponent(fromHash)}&to=${encodeURIComponent(toHash)}`;
-  const res = await devFetch(`${DEV_SERVER}/api/git-file-diff${qs}`);
-  if (!res.ok) throw new Error(`Failed to get file diff: ${res.status}`);
+  const params = new URLSearchParams({ cwd, path, from: fromHash, to: toHash });
+  if (fromPath !== undefined) params.set("fromPath", fromPath);
+  if (toPath !== undefined) params.set("toPath", toPath);
+  const res = await devFetch(`${DEV_SERVER}/api/git-file-diff?${params}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to get file diff: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -1510,6 +2228,27 @@ export async function openInEditor(cwd: string, path: string, editor: string = "
 }
 
 /**
+ * Show a working-tree path in the OS file manager (Files view, v3.11.2):
+ * selected in Finder / Explorer, its folder opened on Linux. Throws with the
+ * backend's message when the path is missing or outside the repo.
+ */
+export async function revealInFileManager(cwd: string, path: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("reveal_in_file_manager", { cwd, path });
+    return;
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/reveal-in-file-manager`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, path }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `reveal_in_file_manager failed: ${res.status}`);
+  }
+}
+
+/**
  * Configure the git binary path used by all Rust git commands.
  * Pass an empty string to reset to the system default ("git").
  */
@@ -1708,16 +2447,22 @@ export async function gitConflictCheck(cwd: string, targetBranch: string): Promi
 // ─── Cherry-pick (Phase 8.2) ───────────────────────────────
 
 /**
- * Cherry-pick one or more commits onto the current branch.
+ * Cherry-pick `hashes` onto HEAD. With `noCommit`, the changes are applied to
+ * the index and working tree without committing (`--no-commit`), leaving them
+ * as WIP for the user to edit, unstage or split before committing.
  */
-export async function gitCherryPick(cwd: string, hashes: string[]): Promise<GitPushPullResult> {
+export async function gitCherryPick(
+  cwd: string,
+  hashes: string[],
+  noCommit = false,
+): Promise<GitPushPullResult> {
   if (isTauri()) {
-    return tauriInvoke<GitPushPullResult>("git_cherry_pick", { cwd, hashes });
+    return tauriInvoke<GitPushPullResult>("git_cherry_pick", { cwd, hashes, noCommit });
   }
   const res = await devFetch(`${DEV_SERVER}/api/git-cherry-pick`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, hashes }),
+    body: JSON.stringify({ cwd, hashes, noCommit }),
   });
   return res.json();
 }
@@ -1766,7 +2511,7 @@ export interface SnapshotMeta {
   /** Full sha of the snapshot commit. */
   commit: string;
   /** What triggered it. */
-  kind: "manual" | "discard" | "reset" | "checkout" | "resolution" | "pre-restore";
+  kind: "manual" | "discard" | "reset" | "checkout" | "resolution" | "pre-restore" | "removal" | "merge-back" | "merge-back-task";
   label: string;
   timestampMs: number;
   headSha: string;
@@ -1774,6 +2519,10 @@ export interface SnapshotMeta {
   headRef: string | null;
   /** MERGE_HEAD sha when taken mid-merge. */
   mergeHead: string | null;
+  /** v3.13 — the worktree it was taken in, before removing it. */
+  worktree?: { path: string; branch: string | null; name: string };
+  /** v3.13 — that worktree's recorded base. */
+  worktreeBase?: { baseRef: string; baseCommit: string };
 }
 
 /** Capture a snapshot. Returns null on a repo with no HEAD yet. */
@@ -1845,7 +2594,7 @@ export async function snapshotPrune(
  * affordance can target this exact point rather than "whatever is newest by
  * the time the user clicks".
  */
-export async function gitResetToCommit(cwd: string, sha: string, mode: "soft" | "mixed" | "hard", snapshotsEnabled?: boolean): Promise<SnapshotMeta | null> {
+export async function gitResetToCommit(cwd: string, sha: string, mode: "soft" | "mixed" | "hard" | "keep", snapshotsEnabled?: boolean): Promise<SnapshotMeta | null> {
   if (isTauri()) {
     return await tauriInvoke("git_reset_to_commit", { cwd, sha, mode, snapshotsEnabled });
   }
@@ -2658,6 +3407,31 @@ export async function previewRebase(
 }
 
 /**
+ * Simule `git rebase --onto <onto> <upstream> <branch>` sans toucher au working
+ * tree : ne rejoue que les commits de la couche, pas ceux de son parent.
+ */
+export async function previewRestack(
+  cwd: string,
+  onto: string,
+  upstream: string,
+  branch: string,
+): Promise<FileMergePreview[]> {
+  if (isTauri()) {
+    return tauriInvoke<FileMergePreview[]>("preview_restack", { cwd, onto, upstream, branch });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/preview-restack`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, onto, upstream, branch }),
+  });
+  if (!res.ok) {
+    const reason = await res.json().then((d) => d?.error).catch(() => null);
+    throw new Error(reason || `Failed to preview restack of ${branch}`);
+  }
+  return res.json();
+}
+
+/**
  * Simule un cherry-pick de `commit` sur HEAD sans toucher au working tree.
  * Même forme de résultat que previewMerge → réutilise le résolveur frontend.
  */
@@ -2719,6 +3493,16 @@ export async function scratchWorktreeCreate(
   return res.json() as Promise<ScratchWorktree>;
 }
 
+/** Résultat d'un merge-back réussi. */
+export interface ScratchMergeBackOutcome {
+  /**
+   * Erreur de la suppression du scratch, faite après coup : le merge-back a
+   * réussi, mais le worktree est resté sur le disque (verrouillé, fichier
+   * ouvert sous Windows). `null` quand tout a été nettoyé.
+   */
+  cleanup_warning: string | null;
+}
+
 /**
  * Ramène les changements résolus du worktree scratch dans le checkout principal
  * en une opération, puis supprime + prune le scratch.
@@ -2726,8 +3510,16 @@ export async function scratchWorktreeCreate(
 export async function scratchWorktreeMergeBack(
   cwd: string,
   scratchPath: string,
-): Promise<void> {
-  await tauriInvoke<void>("scratch_worktree_merge_back", { cwd, scratchPath });
+  snapshotsEnabled?: boolean,
+  /** v3.13 — false: keep the worktree, the caller runs the removal flow next. */
+  cleanup?: boolean,
+): Promise<ScratchMergeBackOutcome> {
+  return tauriInvoke<ScratchMergeBackOutcome>("scratch_worktree_merge_back", {
+    cwd,
+    scratchPath,
+    snapshotsEnabled,
+    cleanup,
+  });
 }
 
 /** Abandonne le worktree scratch (remove --force + prune), sans rien ramener. */
@@ -3176,6 +3968,35 @@ export async function ghIssueDetail(cwd: string, number: number): Promise<IssueD
   return raw as IssueDetail;
 }
 
+/** Result of `ghPrAttachmentUrls`. */
+export interface PrAttachmentUrls {
+  /**
+   * The PR's repository is private: only then are the signed URLs needed.
+   * Null when it could not be read.
+   */
+  private: boolean | null;
+  urls: string[];
+  /**
+   * Every body list was read. When not, an attachment missing from `urls` may
+   * be in a list that failed, rather than one GitHub did not sign.
+   */
+  complete: boolean;
+}
+
+/**
+ * Signed, short-lived URLs of the files uploaded to PR `number`'s description,
+ * comments and reviews — what a private repository serves its attachments
+ * under (#302). Indexed by `indexSignedAttachments`.
+ */
+export async function ghPrAttachmentUrls(cwd: string, number: number): Promise<PrAttachmentUrls> {
+  if (isTauri()) return tauriInvoke<PrAttachmentUrls>("gh_pr_attachment_urls", { cwd, number });
+  const res = await devFetch(`${DEV_SERVER}/api/gh-pr-attachment-urls?cwd=${encodeURIComponent(cwd)}&number=${number}`);
+  if (!res.ok) throw new Error(`gh PR attachment URLs failed: ${res.status}`);
+  const raw = await res.json();
+  if (raw.error) throw new Error(raw.error);
+  return raw as PrAttachmentUrls;
+}
+
 /** List the conversation comments on an issue. */
 export async function ghIssueComments(cwd: string, number: number): Promise<IssueComment[]> {
   if (isTauri()) return tauriInvoke<IssueComment[]>("gh_issue_comments", { cwd, number });
@@ -3186,13 +4007,22 @@ export async function ghIssueComments(cwd: string, number: number): Promise<Issu
   return raw as IssueComment[];
 }
 
-/** Add a comment to an issue; returns the created comment. */
-export async function ghIssueAddComment(cwd: string, number: number, body: string): Promise<IssueComment> {
-  if (isTauri()) return tauriInvoke<IssueComment>("gh_issue_add_comment", { cwd, number, body });
+/** Add a comment to an issue; returns the created comment. `pr`: `number` is
+ *  a pull request from the PR list (a Launchpad nudge), commented in the repo
+ *  the PR lives in (the fork's parent on a fork). */
+export async function ghIssueAddComment(
+  cwd: string,
+  number: number,
+  body: string,
+  pr: boolean = false,
+): Promise<IssueComment> {
+  if (isTauri()) {
+    return tauriInvoke<IssueComment>("gh_issue_add_comment", { cwd, number, body, pr }, IPC_TIMEOUT.NETWORK);
+  }
   const res = await devFetch(`${DEV_SERVER}/api/gh-issue-comment`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd, number, body }),
+    body: JSON.stringify({ cwd, number, body, pr }),
   });
   const raw = await res.json();
   if (!res.ok || raw.error) throw new Error(raw.error || `gh issue comment failed: ${res.status}`);
@@ -3292,6 +4122,343 @@ export async function gitWorktreeRemove(cwd: string, path: string, force?: boole
   }
 }
 
+/** v3.13 — A repository's worktree hook commands, read from its main worktree. */
+export interface WorktreeHooks {
+  setup: string | null;
+  teardown: string | null;
+  url: string | null;
+}
+
+export interface HookTrustStatus {
+  hooks: WorktreeHooks;
+  /** SHA-256 of the hooks; null when the repo defines none. */
+  hash: string | null;
+  /** True when there is nothing to run, or the user trusted this exact hash. */
+  trusted: boolean;
+  /** Canonical main worktree root, the key of the trust store. */
+  repoRoot: string;
+}
+
+/** v3.13 — Whether the user trusts this repository's worktree hooks. */
+export async function worktreeHooksTrust(cwd: string): Promise<HookTrustStatus> {
+  if (isTauri()) {
+    return tauriInvoke<HookTrustStatus>("worktree_hooks_trust", { cwd });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/worktree-hooks-trust`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Failed to read worktree hook trust: ${res.status}`);
+  return data as HookTrustStatus;
+}
+
+/**
+ * v3.13 — Trust this repository's worktree hooks. Refuses when they changed
+ * since `hash` was read, so trust only ever covers commands the user saw.
+ */
+export async function worktreeHooksTrustSet(cwd: string, hash: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("worktree_hooks_trust_set", { cwd, hash });
+    return;
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/worktree-hooks-trust-set`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, hash }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to trust worktree hooks: ${res.status}`);
+  }
+}
+
+/** A process still running in a worktree (`worktreeStopProcesses`). */
+export interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  name: string;
+}
+
+// ─── v3.13 worktree service ──────────────────────────────
+
+/** Where a new worktree starts from (`worktree::base::BaseResolution`). */
+export interface BaseResolution {
+  base_ref: string;
+  commit: string;
+  /** Unix seconds of the fetch, when the base was just fetched. */
+  fetched_at: number | null;
+  fallback_reason: "no-remote" | "no-default-branch" | "fetch-failed" | null;
+  /** git's message, for `fetch-failed`. */
+  fallback_detail: string | null;
+}
+
+export interface WorktreeBaseInfo {
+  base: BaseResolution;
+  /** Default directory for new worktrees (`worktree.dir`, or `<repo>.worktrees`). */
+  dir: string;
+}
+
+export interface IncludeWarning {
+  path: string;
+  reason: "tracked" | "not-ignored" | "outside" | "exists" | "symlink-fallback" | "link-skipped" | "error";
+  detail: string | null;
+}
+
+export type WorktreeKind = "task" | "manual";
+
+export interface CreatedWorktree {
+  path: string;
+  branch: string;
+  /** `{name}` in the worktree's hooks. */
+  name: string;
+  kind: WorktreeKind;
+  base: BaseResolution;
+  warnings: IncludeWarning[];
+  created_at: number;
+}
+
+async function devPost<T>(route: string, body: unknown, what: string): Promise<T> {
+  const res = await devFetch(`${DEV_SERVER}${route}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `${what}: ${res.status}`);
+  return data as T;
+}
+
+/** v3.13 — fetch the remote default branch now and say what a new worktree would start from. */
+export async function worktreeResolveBase(cwd: string): Promise<WorktreeBaseInfo> {
+  if (isTauri()) {
+    return tauriInvoke<WorktreeBaseInfo>("worktree_resolve_base", { cwd }, IPC_TIMEOUT.NETWORK);
+  }
+  return devPost<WorktreeBaseInfo>("/api/worktree-resolve-base", { cwd }, "Failed to resolve the base");
+}
+
+/**
+ * v3.13 — create a worktree through the worktree service: base (fetched when
+ * not given), branch (`task/<name>` by default, no upstream), directory,
+ * `include` files and the record. Does not run `setup`.
+ */
+export async function worktreeCreate(
+  cwd: string,
+  req: { name: string; base?: string; branch?: string; path?: string; kind: WorktreeKind },
+): Promise<CreatedWorktree> {
+  const args = {
+    cwd,
+    name: req.name,
+    base: req.base ?? null,
+    branch: req.branch ?? null,
+    path: req.path ?? null,
+    kind: req.kind,
+  };
+  if (isTauri()) {
+    return tauriInvoke<CreatedWorktree>("worktree_create", args, IPC_TIMEOUT.NETWORK);
+  }
+  return devPost<CreatedWorktree>("/api/worktree-create", args, "Failed to create the worktree");
+}
+
+/**
+ * v3.13 — run the repository's `setup` hook for a worktree in a PTY, like
+ * `terminalOpen`. `hash` is the one the user trusted; the backend refuses if
+ * the hooks changed since.
+ */
+export async function worktreeRunHook(
+  cwd: string,
+  path: string,
+  hook: "setup" | "teardown",
+  hash: string,
+  opts: { cols: number; rows: number; onExit?: (code: number | null) => void },
+  onOutput: (chunk: string) => void,
+): Promise<number> {
+  if (isTauri()) {
+    const { Channel } = await import("@tauri-apps/api/core");
+    const channel = new Channel<TerminalEvent>();
+    channel.onmessage = (event) => dispatchTerminalEvent(event, onOutput, opts.onExit);
+    return tauriInvoke<number>("worktree_run_hook", {
+      cwd,
+      path,
+      hook,
+      hash,
+      cols: opts.cols,
+      rows: opts.rows,
+      onOutput: channel,
+    });
+  }
+  const params = new URLSearchParams({ cwd, path, hook, hash, cols: String(opts.cols), rows: String(opts.rows) });
+  return devPtyStream("/api/worktree-run-hook", params, opts.onExit, onOutput);
+}
+
+/** v3.13 — the worktree's URL (first non-empty line of `url`), or null when the repo defines none. */
+export async function worktreeUrl(cwd: string, path: string, hash: string): Promise<string | null> {
+  if (isTauri()) {
+    return tauriInvoke<string | null>("worktree_url", { cwd, path, hash });
+  }
+  return devPost<string | null>("/api/worktree-url", { cwd, path, hash }, "Failed to get the worktree URL");
+}
+
+/**
+ * v3.13 — stop what runs in a linked worktree of `cwd`'s repository: GitWand's
+ * terminal sessions there, then (after 500 ms) the processes it started whose
+ * working directory is still inside. Processes GitWand did not start are only
+ * listed, unless `killForeign` ("Stop all"). Returns what still runs there.
+ * Refuses the main worktree and any path that is not a linked worktree.
+ */
+export async function worktreeStopProcesses(
+  cwd: string,
+  path: string,
+  killForeign: boolean,
+): Promise<ProcessInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<ProcessInfo[]>("worktree_stop_processes", { cwd, path, killForeign });
+  }
+  const res = await devFetch(`${DEV_SERVER}/api/worktree-stop-processes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, path, killForeign }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Failed to stop worktree processes: ${res.status}`);
+  return data as ProcessInfo[];
+}
+
+/** What GitWand may do to a worktree before removing it (`worktree::guard`). */
+export interface WorktreeGuard {
+  untouchable: boolean;
+  reasons: ("locked" | "keep-file" | "other-tool")[];
+  /** Created by GitWand (a record, or a pre-v3.13 scratch worktree). */
+  owned: boolean;
+  /** Created by the worktree service: the only ones whose hooks run. */
+  recorded: boolean;
+  /** The repo defines `teardown` and this worktree is recorded. */
+  teardown_required: boolean;
+  branch: string | null;
+  lock_reason: string | null;
+}
+
+/** Removal steps 1–3: processes still running block it, then no snapshot. */
+export interface RemovePrepared {
+  survivors: ProcessInfo[];
+  snapshot: SnapshotMeta | null;
+}
+
+export interface RemoveOptions {
+  snapshotId?: string | null;
+  teardownCode?: number | null;
+  teardownSkipped?: boolean;
+  removeAnyway?: boolean;
+  deleteBranch?: boolean;
+  confirmNotOwned?: boolean;
+}
+
+export interface RemoveOutcome {
+  branch_deleted: string | null;
+  warnings: string[];
+}
+
+/** v3.13 — whether a worktree may be removed (spec §7.1). */
+export async function worktreeGuard(cwd: string, path: string): Promise<WorktreeGuard> {
+  if (isTauri()) return tauriInvoke<WorktreeGuard>("worktree_guard", { cwd, path });
+  return devPost<WorktreeGuard>("/api/worktree-guard", { cwd, path }, "Failed to check the worktree");
+}
+
+/** v3.13 — removal steps 1–3: guards, stop the processes, snapshot. */
+export async function worktreeRemovePrepare(cwd: string, path: string, killForeign: boolean): Promise<RemovePrepared> {
+  if (isTauri()) return tauriInvoke<RemovePrepared>("worktree_remove_prepare", { cwd, path, killForeign });
+  return devPost<RemovePrepared>("/api/worktree-remove-prepare", { cwd, path, killForeign }, "Failed to prepare the removal");
+}
+
+/** v3.13 — removal steps 1 and 5–7, once teardown ran, was skipped or overridden. */
+export async function worktreeRemove(cwd: string, path: string, opts: RemoveOptions): Promise<RemoveOutcome> {
+  if (isTauri()) return tauriInvoke<RemoveOutcome>("worktree_remove", { cwd, path, opts });
+  return devPost<RemoveOutcome>("/api/worktree-remove", { cwd, path, opts }, "Failed to remove the worktree");
+}
+
+/** v3.13 — `git worktree unlock`, the only action offered on a locked worktree. */
+export async function worktreeUnlock(cwd: string, path: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("worktree_unlock", { cwd, path });
+    return;
+  }
+  await devPost("/api/worktree-unlock", { cwd, path }, "Failed to unlock the worktree");
+}
+
+/** Why a merge-back cannot start now (`worktree::merge_back::Refusal`). */
+export interface MergeBackRefusal {
+  code:
+    | "untouchable"
+    | "not-owned"
+    | "detached"
+    | "unknown-target"
+    | "wrong-branch"
+    | "main-in-progress"
+    | "task-in-progress"
+    | "overlap"
+    | "nothing";
+  message: string;
+  paths: string[];
+}
+
+/** Merge-back steps 1–2 (`worktree::merge_back::check`). */
+export interface MergeBackCheck {
+  task_branch: string;
+  task_path: string;
+  name: string;
+  target: string;
+  default_target: string;
+  main_path: string;
+  main_branch: string | null;
+  main_clean: boolean;
+  task_commits: number;
+  task_dirty: boolean;
+  /** The target already contains the task branch. */
+  task_merged: boolean;
+  /** The main checkout has staged changes (what a squash leaves). */
+  main_staged: boolean;
+  refusal: MergeBackRefusal | null;
+}
+
+export interface MergeBackPrepared {
+  check: MergeBackCheck;
+  survivors: ProcessInfo[];
+  task_snapshot: SnapshotMeta | null;
+  main_snapshot: SnapshotMeta | null;
+  committed_wip: boolean;
+}
+
+/** v3.13 — whether a task can be merged back into `target` now (read-only). */
+export async function worktreeMergeBackCheck(cwd: string, path: string, target?: string | null): Promise<MergeBackCheck> {
+  if (isTauri()) return tauriInvoke<MergeBackCheck>("worktree_merge_back_check", { cwd, path, target: target ?? null });
+  return devPost<MergeBackCheck>("/api/worktree-merge-back-check", { cwd, path, target: target ?? null }, "Failed to check the merge-back");
+}
+
+/** v3.13 — stop the task's processes, commit its outstanding work, snapshot both sides. */
+export async function worktreeMergeBackPrepare(cwd: string, path: string, target: string): Promise<MergeBackPrepared> {
+  if (isTauri()) return tauriInvoke<MergeBackPrepared>("worktree_merge_back_prepare", { cwd, path, target });
+  return devPost<MergeBackPrepared>("/api/worktree-merge-back-prepare", { cwd, path, target }, "Failed to prepare the merge-back");
+}
+
+/** v3.13 — squash mode: the task's changes staged on the target. */
+export async function worktreeMergeBackSquash(cwd: string, path: string, target: string): Promise<{ conflicts: boolean }> {
+  if (isTauri()) return tauriInvoke<{ conflicts: boolean }>("worktree_merge_back_squash", { cwd, path, target });
+  return devPost<{ conflicts: boolean }>("/api/worktree-merge-back-squash", { cwd, path, target }, "Failed to squash the task");
+}
+
+/** v3.13 — rebase mode, last step: the target fast-forwards to the rebased task. */
+export async function worktreeMergeBackFastForward(cwd: string, path: string, target: string): Promise<{ conflicts: boolean }> {
+  if (isTauri()) return tauriInvoke<{ conflicts: boolean }>("worktree_merge_back_fast_forward", { cwd, path, target });
+  return devPost<{ conflicts: boolean }>("/api/worktree-merge-back-fast-forward", { cwd, path, target }, "Failed to fast-forward the target");
+}
+
+/** v3.13 — a `removal` or `merge-back-task` snapshot as a new worktree (spec §9). */
+export async function snapshotRestoreAsWorktree(cwd: string, id: string, name?: string): Promise<CreatedWorktree> {
+  if (isTauri()) return tauriInvoke<CreatedWorktree>("snapshot_restore_as_worktree", { cwd, id, name: name ?? null });
+  return devPost<CreatedWorktree>("/api/snapshot-restore-as-worktree", { cwd, id, name: name ?? null }, "Failed to restore the snapshot as a worktree");
+}
+
 /** Prune stale worktree administrative files. */
 export async function gitWorktreePrune(cwd: string): Promise<void> {
   if (isTauri()) {
@@ -3368,13 +4535,21 @@ export async function agentSessionLaunch(cwd: string, tool: string): Promise<voi
  */
 export async function terminalOpen(
   cwd: string,
-  opts: { shell?: string; agent?: string; cols: number; rows: number },
+  opts: {
+    shell?: string;
+    agent?: string;
+    cols: number;
+    rows: number;
+    /** Called once, after the last output chunk. `null` when GitWand closed the session or the code is unknown. */
+    onExit?: (code: number | null) => void;
+  },
   onOutput: (chunk: string) => void,
 ): Promise<number> {
   if (isTauri()) {
     const { Channel } = await import("@tauri-apps/api/core");
-    const channel = new Channel<string>();
-    channel.onmessage = onOutput;
+    // One channel for output and exit: Tauri orders messages within a channel only.
+    const channel = new Channel<TerminalEvent>();
+    channel.onmessage = (event) => dispatchTerminalEvent(event, onOutput, opts.onExit);
     return tauriInvoke<number>("terminal_open", {
       cwd,
       shell: opts.shell ?? null,
@@ -3963,6 +5138,23 @@ export async function gitCommitTemplatePath(cwd: string): Promise<string | null>
   return data?.path ?? null;
 }
 
+/**
+ * Read the commit.template configured for the repo, or null if unset. The
+ * backend resolves the path from git config itself: the template usually
+ * lives outside the repo (`~/.gitmessage`), where `readFile` refuses to read.
+ */
+export async function readCommitTemplate(cwd: string): Promise<string | null> {
+  if (isTauri()) return tauriInvoke<string | null>("read_commit_template", { cwd });
+  const res = await devFetch(`${DEV_SERVER}/api/read-commit-template`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error || "read_commit_template failed");
+  return data?.content ?? null;
+}
+
 // ─── Re-exports from per-domain sub-modules (v2.11) ──────────────────────────
 // All 77 existing `import { ... } from './utils/backend'` continue to work.
 // Vite/Rollup tree-shakes these: functions not reachable from the main chunk
@@ -3973,3 +5165,126 @@ export * from './backend-bitbucket';
 export * from './backend-gitea';
 export * from './backend-ai';
 
+
+// ─── Issue creation (#301) ──────────────────────────────────────────────────
+
+import type { ReviewerCandidate } from "./backend-pr";
+
+/** A repository an issue can be filed on: `origin`, or a fork's parent. */
+export interface IssueTarget {
+  /** `owner/repo`. */
+  repo: string;
+  htmlUrl: string;
+  hasIssues: boolean;
+  isOrigin: boolean;
+  /** The user may set labels, assignees and a milestone (GitHub drops them otherwise). */
+  canTriage: boolean;
+}
+
+/** Result of `ghIssueTargets`: empty `targets` when `origin` is not GitHub. */
+export interface IssueTargets {
+  targets: IssueTarget[];
+  /** The first target with issues turned on, `null` when none has. */
+  defaultRepo: string | null;
+}
+
+export interface CreateIssueInput {
+  repo: string;
+  title: string;
+  body: string;
+  labels: string[];
+  assignees: string[];
+  /** Milestone number, not title. */
+  milestone: number | null;
+}
+
+export interface CreatedIssue {
+  number: number;
+  url: string;
+}
+
+export interface RepoLabel {
+  name: string;
+  color: string;
+  description: string | null;
+}
+
+export interface RepoMilestone {
+  number: number;
+  title: string;
+  dueOn: string | null;
+}
+
+/** Whether `origin` is a GitHub repository — local, no request (shows the entry points). */
+export async function ghIssueAvailable(cwd: string): Promise<boolean> {
+  if (isTauri()) return tauriInvoke<boolean>("gh_issue_available", { cwd });
+  return devGet<boolean>("/api/gh-issue-available", { cwd }, "gh issue available");
+}
+
+/** Where an issue can be filed, read fresh (the form opening). */
+export async function ghIssueTargets(cwd: string): Promise<IssueTargets> {
+  if (isTauri()) return tauriInvoke<IssueTargets>("gh_issue_targets", { cwd }, IPC_TIMEOUT.NETWORK);
+  return devGet<IssueTargets>("/api/gh-issue-targets", { cwd }, "gh issue targets");
+}
+
+export async function ghCreateIssue(cwd: string, input: CreateIssueInput): Promise<CreatedIssue> {
+  // NETWORK, not the 30 s default: the backend may take longer (the `gh`
+  // path allows 60 s), and a frontend timeout while the POST still lands
+  // would invite a second, duplicate issue.
+  if (isTauri()) return tauriInvoke<CreatedIssue>("gh_create_issue", { cwd, input }, IPC_TIMEOUT.NETWORK);
+  return devPost<CreatedIssue>("/api/gh-create-issue", { cwd, input }, "gh create issue");
+}
+
+/** A resolver report on GitWand's own repository (#301): github.com, whatever the current repository. */
+export async function ghCreateGitwandIssue(input: { title: string; body: string }): Promise<CreatedIssue> {
+  // NETWORK, as for `ghCreateIssue`: a frontend timeout while the POST still
+  // lands would invite a duplicate.
+  if (isTauri()) return tauriInvoke<CreatedIssue>("gh_create_gitwand_issue", { input }, IPC_TIMEOUT.NETWORK);
+  return devPost<CreatedIssue>("/api/gh-create-gitwand-issue", { input }, "gh create gitwand issue");
+}
+
+/** Whether a report can be written to GitWand's repository (a token, or `gh` on github.com). */
+export async function ghGitwandWritable(): Promise<boolean> {
+  if (isTauri()) return tauriInvoke<boolean>("gh_gitwand_writable", {});
+  return devGet<boolean>("/api/gh-gitwand-writable", {}, "gh gitwand writable");
+}
+
+export async function ghListLabels(cwd: string, repo: string): Promise<RepoLabel[]> {
+  if (isTauri()) return tauriInvoke<RepoLabel[]>("gh_list_labels", { cwd, repo }, IPC_TIMEOUT.NETWORK);
+  return devGet<RepoLabel[]>("/api/gh-list-labels", { cwd, repo }, "gh list labels");
+}
+
+/** One issue template file of a target, raw (parsed in `utils/issueTemplates`). */
+export interface TemplateFile {
+  path: string;
+  content: string;
+  /** GitHub's single-template file (`ISSUE_TEMPLATE.md`): it prefills the form. */
+  single: boolean;
+}
+
+/** A target's issue template files, and the repository they came from (#301). */
+export interface IssueTemplateFiles {
+  source: string;
+  files: TemplateFile[];
+  /** Every listed file was read (an incomplete set is not cached). */
+  complete: boolean;
+}
+
+export async function ghIssueTemplates(cwd: string, repo: string): Promise<IssueTemplateFiles> {
+  if (isTauri()) return tauriInvoke<IssueTemplateFiles>("gh_issue_templates", { cwd, repo }, IPC_TIMEOUT.NETWORK);
+  return devGet<IssueTemplateFiles>("/api/gh-issue-templates", { cwd, repo }, "gh issue templates");
+}
+
+export async function ghListMilestones(cwd: string, repo: string): Promise<RepoMilestone[]> {
+  if (isTauri()) return tauriInvoke<RepoMilestone[]>("gh_list_milestones", { cwd, repo }, IPC_TIMEOUT.NETWORK);
+  return devGet<RepoMilestone[]>("/api/gh-list-milestones", { cwd, repo }, "gh list milestones");
+}
+
+/** Same shape as `ghListReviewerCandidates` (`avatar_url` → `avatarUrl`). */
+export async function ghListAssignees(cwd: string, repo: string): Promise<ReviewerCandidate[]> {
+  type Raw = { login: string; name?: string | null; avatar_url?: string | null };
+  const raw = isTauri()
+    ? await tauriInvoke<Raw[]>("gh_list_assignees", { cwd, repo }, IPC_TIMEOUT.NETWORK)
+    : await devGet<Raw[]>("/api/gh-list-assignees", { cwd, repo }, "gh list assignees");
+  return raw.map((u) => ({ login: u.login, name: u.name ?? null, avatarUrl: u.avatar_url ?? null }));
+}

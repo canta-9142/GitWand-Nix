@@ -128,6 +128,18 @@ export function assertOperationSucceeded(
   }
 }
 
+/**
+ * v3.13 merge-back: how a merge is run when it is not the plain one.
+ * `runMerge` replaces `deps.runMerge` (`--no-ff --no-edit`, or `--squash`);
+ * `skipFinalize` is for a squash, which leaves no operation to `--continue`.
+ */
+export interface ApplyOptions {
+  runMerge?: (ref: string) => Promise<void>;
+  skipFinalize?: boolean;
+  /** v3.14 restack: replaces `deps.runRebaseOnto` (`rebase --onto <onto> <upstream> <branch>`). */
+  runRebase?: (ref: string) => Promise<{ conflict: boolean }>;
+}
+
 /** Bounded so a pathological rebase reports instead of spinning forever. */
 const MAX_REBASE_STEPS = 100;
 
@@ -191,6 +203,7 @@ export function useApplyFromPreview(deps: ApplyDeps) {
     operation: PreviewOperation,
     ref_: string,
     estimatedHunks: number,
+    opts: ApplyOptions = {},
   ): Promise<ApplyOutcome> {
     const cwd = deps.cwd();
     const base: ApplyOutcome = {
@@ -221,7 +234,9 @@ export function useApplyFromPreview(deps: ApplyDeps) {
     // 0. Pre-flight. Refuse before the snapshot, so a refusal changes nothing.
     try {
       const st = await deps.repoState();
-      if (st.state && st.state !== "clean") {
+      // A bisect blocks nothing (the user's call, 2026-11-26): git decides,
+      // as it did before `git_repo_state` reported bisects.
+      if (st.state && st.state !== "clean" && st.state !== "bisect") {
         return finish({
           ...base,
           stoppedReason: "op-failed",
@@ -240,9 +255,9 @@ export function useApplyFromPreview(deps: ApplyDeps) {
 
     // 2. Run the real operation.
     try {
-      if (operation === "merge") await deps.runMerge(ref_);
+      if (operation === "merge") await (opts.runMerge ?? deps.runMerge)(ref_);
       else if (operation === "cherry-pick") await deps.runCherryPick(ref_);
-      else await deps.runRebaseOnto(ref_);
+      else await (opts.runRebase ?? deps.runRebaseOnto)(ref_);
     } catch (e) {
       return finish({ ...base, stoppedReason: "op-failed", operationError: msg(e) });
     }
@@ -346,7 +361,7 @@ export function useApplyFromPreview(deps: ApplyDeps) {
     //    A merge or cherry-pick that never conflicted has nothing to continue.
     let finalized = false;
     if (applied > 0 || resolvedFiles.length > 0) {
-      if (operation !== "rebase") {
+      if (operation !== "rebase" && !opts.skipFinalize) {
         try {
           await deps.finalize(operation);
         } catch (e) {

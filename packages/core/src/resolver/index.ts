@@ -14,7 +14,9 @@
  * `resolve` depuis `../resolver.js`.
  */
 
+import { retractForInvariant, retractForParseTree, withoutFormatResolver } from "./retract.js";
 import type {
+  ClassifyInput,
   ConfidenceScore,
   ConflictHunk,
   ConflictType,
@@ -34,7 +36,7 @@ import {
 import { parseConflictMarkers, toConflictHunk } from "../parser.js";
 
 import { EMPTY_VALIDATION, validateMergedContent } from "./validation.js";
-import { checkParseTreeValid, applyPostMergeRiskPenalty } from "./validate-parse-tree.js";
+import { checkParseTreeValid } from "./validate-parse-tree.js";
 import { runStrictValidation } from "./validate-strict.js";
 import { isGeneratedFile, reclassifyIfGenerated } from "./generated-detection.js";
 import { findEcosystem } from "../regenerate/registry.js";
@@ -52,6 +54,7 @@ import { dispatchFormatAware } from "./format-dispatch.js";
 import { assembleResolution } from "./assemble.js";
 import { setLlmFallbackEnabled } from "../patterns/llm-proposed.js";
 import { setRefMergeEnabled } from "../patterns/refactoring-aware-merge.js";
+import complexPattern from "../patterns/complex.js";
 import { runLlmFallbackPhase } from "./llm-pipeline.js";
 
 /**
@@ -97,8 +100,10 @@ function reclassifyFormatSemantic(hunk: ConflictHunk, resolverUsed: string): Con
   return {
     ...hunk,
     type: "format_semantic",
+    formatResolver: resolverUsed,
     confidence,
     explanation: `Hunk resolved semantically by the "${resolverUsed}" resolver (merged by the format's structure, not by lines).`,
+    explanationRef: { key: "formatSemantic", params: [resolverUsed] },
     trace: {
       ...hunk.trace,
       selected: "format_semantic",
@@ -115,6 +120,53 @@ function reclassifyFormatSemantic(hunk: ConflictHunk, resolverUsed: string): Con
   };
 }
 
+/** The format-semantic explanation, in both forms, on a hunk that keeps its type. */
+function explainedAsFormatMerge(hunk: ConflictHunk, resolverUsed: string): ConflictHunk {
+  return {
+    ...hunk,
+    explanation: `Hunk resolved semantically by the "${resolverUsed}" resolver (merged by the format's structure, not by lines).`,
+    explanationRef: { key: "formatSemantic", params: [resolverUsed] },
+  };
+}
+
+/**
+ * A format-aware resolution that was not applied (policy, confidence gate).
+ * The hunk stays classified `format_semantic`, naming no resolver and not
+ * claiming the merge — except an `llm_proposed` one, returned as it came so
+ * that the LLM fallback still gets it.
+ */
+function heldBack(hunk: ConflictHunk, effective: ConflictHunk): ConflictHunk {
+  return hunk.type === "llm_proposed" ? hunk : withoutFormatResolver(effective);
+}
+
+/**
+ * Un résolveur format-aware a établi un vrai conflit (ex. imports : le même
+ * module importé sous deux formes). La classification textuelle — par exemple
+ * `insertion_at_boundary`, qui garderait les deux lignes — ne tient plus : le
+ * hunk devient `complex`, confiance nulle, comme tout conflit qui demande un humain.
+ */
+function reclassifyFormatConflict(hunk: ConflictHunk, resolverUsed: string, reason: string): ConflictHunk {
+  if (hunk.type === "complex") return hunk;
+  // `complex` ignore son entrée (score et texte fixes) ; endLine n'est pas porté par le hunk.
+  const input: ClassifyInput = { ...hunk, endLine: hunk.startLine };
+  return {
+    ...hunk,
+    type: "complex",
+    confidence: complexPattern.confidence(input),
+    explanation: complexPattern.explanation(input),
+    explanationRef: complexPattern.explanationRef?.(input),
+    trace: {
+      ...hunk.trace,
+      selected: "complex",
+      summary: `Format-aware resolver "${resolverUsed}" found a genuine conflict — reclassified as complex.`,
+      steps: [
+        ...hunk.trace.steps,
+        { type: "complex" as ConflictType, passed: true, reason },
+      ],
+    },
+  };
+}
+
 /**
  * accuracy lot 1 — Un hunk non-complex résolu par un résolveur format-aware garde son
  * type (la classification textuelle reste vraie) mais sa confiance intègre la
@@ -122,7 +174,7 @@ function reclassifyFormatSemantic(hunk: ConflictHunk, resolverUsed: string): Con
  * et elle doit être visible dans la trace au lieu d'un bypass silencieux.
  */
 function boostFormatValidated(hunk: ConflictHunk, resolverUsed: string): ConflictHunk {
-  if (CONFIDENCE_ORDER[hunk.confidence.label] >= CONFIDENCE_ORDER.high) return hunk;
+  if (CONFIDENCE_ORDER[hunk.confidence.label] >= CONFIDENCE_ORDER.high) return { ...hunk, formatResolver: resolverUsed };
   const confidence: ConfidenceScore = {
     score: Math.max(hunk.confidence.score, 75),
     label: "high",
@@ -133,7 +185,7 @@ function boostFormatValidated(hunk: ConflictHunk, resolverUsed: string): Conflic
     ],
     penalties: hunk.confidence.penalties,
   };
-  return { ...hunk, confidence };
+  return { ...hunk, confidence, formatResolver: resolverUsed };
 }
 
 /**
@@ -221,17 +273,27 @@ function resolveHunk(
   if (!generatedGate) {
     const dispatch = dispatchFormatAware(hunk, filePath, options);
     if (dispatch.status === "resolved") {
+      // `llm_proposed` is what `complex` becomes while the LLM fallback is on.
+      // It keeps that type, so a merge refused here (policy, confidence) or
+      // retracted inside `resolve()` still reaches the LLM phase; it says what
+      // resolved it: the format resolver. (A parse-tree retraction in
+      // resolveAsync returns before that phase, as for every hunk.)
       const effective = hunk.type === "complex"
         ? reclassifyFormatSemantic(hunk, dispatch.resolverUsed)
-        : boostFormatValidated(hunk, dispatch.resolverUsed);
+        : hunk.type === "llm_proposed"
+          ? explainedAsFormatMerge(boostFormatValidated(hunk, dispatch.resolverUsed), dispatch.resolverUsed)
+          : boostFormatValidated(hunk, dispatch.resolverUsed);
       const { policy: fmtPolicy, cfg: fmtCfg } = computeEffectivePolicy(filePath, options);
       const fmtMinConfidence = computeEffectiveMinConfidence(fmtCfg, options);
       // Une fusion sémantique combine du contenu des deux côtés — même famille
       // de risque que non_overlapping. Les politiques qui l'excluent (strict,
       // prefer-safety) l'excluent donc aussi, comme pour le résolveur imports.
-      if (effective.type === "format_semantic" && !fmtCfg.allowNonOverlapping) {
+      // An llm_proposed hunk merged here is the same semantic merge (it only
+      // keeps its type for the LLM phase): the policy applies to it too.
+      if ((effective.type === "format_semantic" || hunk.type === "llm_proposed") && !fmtCfg.allowNonOverlapping) {
         return {
-          hunk: effective,
+          // Not applied: no resolver produced this hunk's resolution.
+          hunk: heldBack(hunk, effective),
           lines: null,
           reason: `Semantic merge (${dispatch.resolverUsed}) disabled by the "${fmtPolicy}" policy — it combines content from both sides.`,
         };
@@ -249,7 +311,7 @@ function resolveHunk(
             ? `below the minConfidenceScore of ${fmtGate.required}`
             : `insufficient (minimum required: ${fmtGate.required}, policy: ${fmtPolicy})`;
         return {
-          hunk: effective,
+          hunk: heldBack(hunk, effective),
           lines: null,
           reason: `Confidence ${effective.confidence.label} (score: ${effective.confidence.score}) is ${because} to apply the format-aware resolution.`,
         };
@@ -258,6 +320,9 @@ function resolveHunk(
     }
     if (dispatch.status === "rejected-policy") {
       return { hunk, lines: null, reason: dispatch.reason };
+    }
+    if (dispatch.status === "conflict") {
+      return { hunk: reclassifyFormatConflict(hunk, dispatch.resolverUsed, dispatch.reason), lines: null, reason: dispatch.reason };
     }
     // dispatch.status === "not-applicable" → on continue vers le moteur textuel.
     // `dispatch.note` porte la raison d'échec du résolveur spécialisé (pour
@@ -447,22 +512,12 @@ export function resolve(
   // Une résolution qui casse un invariant n'est pas appliquée, quel que soit
   // le pattern qui l'a produite.
   if (mergedContent !== null && validation.invariantErrors && validation.invariantErrors.length > 0) {
-    const why = validation.invariantErrors.join(" ");
-    const retractedResolutions = resolutions.map((r) =>
-      r.autoResolved
-        ? {
-            ...r,
-            autoResolved: false,
-            resolvedLines: null,
-            resolutionReason: `Retracted: the merged content violates a format invariant. ${why}`,
-          }
-        : r,
-    );
+    const retracted = retractForInvariant(hunks, resolutions, validation.invariantErrors.join(" "));
     return {
       filePath,
       mergedContent: null,
-      hunks,
-      resolutions: retractedResolutions,
+      hunks: retracted.hunks,
+      resolutions: retracted.resolutions,
       stats: { ...stats, autoResolved: 0, remaining: stats.totalConflicts },
       validation: { ...validation, isValid: false },
     };
@@ -580,12 +635,12 @@ export async function resolveAsync(
     // Parse-tree invalide → rétraction de toutes les résolutions automatiques.
     // On ne peut pas savoir quel hunk a cassé la syntaxe sans une analyse fine,
     // donc on est conservatif : tout remettre en conflits manuels.
-    const retractedResolutions = result.resolutions.map((r) =>
-      r.autoResolved ? applyPostMergeRiskPenalty(r) : r,
-    );
+    const retracted = retractForParseTree(result.hunks, result.resolutions);
+    const retractedResolutions = retracted.resolutions;
 
     return {
       ...result,
+      hunks: retracted.hunks,
       // mergedContent = null indique aux consommateurs que des conflits subsistent.
       // Le contenu original (avec marqueurs) est conservé dans conflictedContent
       // par l'appelant — ici on expose uniquement la MergeResult enrichie.

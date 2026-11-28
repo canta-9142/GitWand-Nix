@@ -39,14 +39,30 @@ export function probePath() {
 }
 
 /**
+ * A minimal environment for a child of a parity test: what the probe, the
+ * dev-server, git and curl need to run, plus `extra`. Nothing else from the
+ * runner's environment, so no token or API key reaches the child (AGENTS.md)
+ * and no proxy variable changes a request. Pass it with `inherit: false`.
+ */
+export function isolatedEnv(extra = {}) {
+  const env = {};
+  for (const k of ["PATH", "Path", "SystemRoot", "TEMP", "TMP", "TMPDIR", "LANG"]) {
+    if (process.env[k] !== undefined) env[k] = process.env[k];
+  }
+  return { ...env, ...extra };
+}
+
+/**
  * Lance le probe avec un `command` + des arguments JSON.
  * Retourne un objet `{ ok, value, error, exitCode }`.
  *
  * `value` est le JSON décodé (ou undefined si erreur), `error` est la chaîne
  * d'erreur telle qu'émise par le probe (champ `error` du JSON, ou stderr en
- * cas d'échec d'invocation du binaire).
+ * cas d'échec d'invocation du binaire). `env` s'ajoute à l'environnement
+ * hérité (ex. `GITWAND_COMBINED_BUDGET_BYTES`, hook de test) ; avec
+ * `{ inherit: false }`, il le remplace (voir `isolatedEnv`).
  */
-export function runProbe(command, args) {
+export function runProbe(command, args, env, { inherit = true } = {}) {
   const bin = probePath();
   if (!existsSync(bin)) {
     throw new Error(
@@ -58,8 +74,12 @@ export function runProbe(command, args) {
 
   const result = spawnSync(bin, [command], {
     input: JSON.stringify(args || {}),
+    ...(env ? { env: inherit ? { ...process.env, ...env } : env } : {}),
     encoding: "utf-8",
     timeout: 10_000,
+    // A combined diff over thousands of files answers several MB of JSON
+    // (spawnSync's default cap is 1 MB).
+    maxBuffer: 64 * 1024 * 1024,
   });
 
   if (result.error) {
