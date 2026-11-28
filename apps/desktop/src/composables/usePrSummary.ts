@@ -6,6 +6,7 @@
  * summary) + commit titles, producing a short what/why/affected-areas
  * block for the Info tab. Cached by `detailKey@headSha` (`usePrCache`).
  */
+import { classifyHunkLine, hunkBodyFromHeader, noHunkBody, type HunkBody } from "@gitwand/core";
 import { gitExec } from "../utils/backend";
 import { useAIProvider } from "./useAIProvider";
 import { localeToAiLanguage } from "./prAiLocale";
@@ -43,16 +44,37 @@ export interface SummaryFileEntry {
 
 function countChanges(raw: string): { additions: number; deletions: number } {
   let additions = 0, deletions = 0;
+  // Count inside hunk bodies only, bounded by their `@@` counts: a removed
+  // `-- x` is the diff line `--- x`, a change, not a file header.
+  let body: HunkBody = noHunkBody();
   for (const line of raw.split("\n")) {
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
-    if (line.startsWith("+")) additions++;
-    else if (line.startsWith("-")) deletions++;
+    const kind = classifyHunkLine(body, line);
+    if (kind === "add") additions++;
+    else if (kind === "delete") deletions++;
+    else if (kind === null) {
+      if (line.startsWith("diff ")) body = noHunkBody();
+      else if (line.startsWith("@@")) body = hunkBodyFromHeader(line);
+    }
   }
   return { additions, deletions };
 }
 
 export function buildSummaryPrompt(
   files: SummaryFileEntry[],
+  commitTitles: string[],
+): string {
+  return buildSummaryPromptFromCounts(
+    files.map((f) => {
+      const { additions, deletions } = countChanges(f.raw);
+      return { path: f.path, added: additions, deleted: deletions };
+    }),
+    commitTitles,
+  );
+}
+
+/** Same prompt from precomputed per-file counts (callers that already hold parsed diffs). */
+export function buildSummaryPromptFromCounts(
+  files: { path: string; added: number; deleted: number }[],
   commitTitles: string[],
 ): string {
   const parts: string[] = [];
@@ -64,10 +86,7 @@ export function buildSummaryPrompt(
   }
   parts.push("");
   parts.push("Files touched:");
-  for (const f of files) {
-    const { additions, deletions } = countChanges(f.raw);
-    parts.push(`- ${f.path} (+${additions}/-${deletions})`);
-  }
+  for (const f of files) parts.push(`- ${f.path} (+${f.added}/-${f.deleted})`);
   return parts.join("\n");
 }
 

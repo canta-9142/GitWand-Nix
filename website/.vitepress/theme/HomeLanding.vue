@@ -1,6 +1,35 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { AUTO_PATTERN_COUNT } from './patterns'
+import { data as blogPosts } from './blog.data'
+import { adventBadge, adventHomeCard, resolveNow, ADVENT_INDEX_PATH, type AdventHomeCard } from './advent/advent-state'
+import AdventSnow from './advent/AdventSnow.vue'
+import NextTeaser from './NextTeaser.vue'
+
+// Advent calendar badge: client-only so the server HTML keeps the normal badge.
+const advent = ref<{ text: string; href: string } | null>(null)
+const adventCard = ref<AdventHomeCard | null>(null)
+onMounted(() => {
+  const now = resolveNow(location.search, new Date())
+  advent.value = adventBadge(now)
+  adventCard.value = adventHomeCard(now)
+})
+
+// Advent card: the CLI command, copyable like the install command.
+const ADVENT_CMD = 'gitwand advent'
+const adventCopied = ref(false)
+async function copyAdvent() {
+  try {
+    await navigator.clipboard.writeText(ADVENT_CMD)
+    adventCopied.value = true
+    setTimeout(() => { adventCopied.value = false }, 1800)
+  } catch {
+    /* clipboard unavailable: the text can still be selected */
+  }
+}
+
+// Newest article, read from website/blog/*.md at build time (see blog.data.ts).
+const latestPost = blogPosts[0]
 
 type Locale = 'en' | 'fr' | 'es' | 'pt-BR' | 'zh-CN'
 
@@ -25,7 +54,7 @@ function setLocale(code: Locale) {
 }
 
 // ── Smart download URL (OS detection) ─────────────────────────────────────
-const LATEST = '3.11.1'
+const LATEST = '3.15.0'
 const RELEASES = 'https://github.com/devlint/GitWand/releases'
 
 // SSR-safe: start with the generic releases page, then switch to the
@@ -101,7 +130,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Natif (sans Electron)",
     mcRow4: "Serveur MCP pour agents",
     agentsCta: "Découvrir IA & agents →",
-    heroAnnounce: "Nouveau dans la v3.11 — l'IA sait enfin pourquoi chaque côté a modifié le code en conflit",
+    heroAnnounce: "Nouveau dans la v3.15 — diffs combinés et bisect guidé",
     heroPoint1: "8 patterns déterministes — zéro pari sur ton code",
     heroPoint2: "100 % local — ton code ne quitte jamais ta machine",
     heroPoint3: "Un seul moteur — Desktop, CLI, VS Code & agents IA",
@@ -118,7 +147,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "Ce petit coup au moral quand 12 fichiers passent au rouge ? Terminé. GitWand classe chaque hunk avec 8 patterns déterministes — sans deviner, sans halluciner — résout tout seul ceux qui n'étaient pas des décisions, et ne te rend que ce qui mérite ton cerveau. Natif, gratuit, MIT.",
     download: 'Télécharger',
     github: 'GitHub',
-    whatsNew: 'Nouveautés v3.11',
+    whatsNew: 'Nouveautés v3.15',
     docs: 'Documentation →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -201,7 +230,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Native (no Electron)",
     mcRow4: "MCP server for agents",
     agentsCta: "Explore AI & agents →",
-    heroAnnounce: "New in v3.11 — the AI now knows why each side changed the conflicting code",
+    heroAnnounce: "New in v3.15 — combined diffs and guided bisect",
     heroPoint1: "8 deterministic patterns — zero gambling with your code",
     heroPoint2: "100% local — your code never leaves your machine",
     heroPoint3: "One engine — Desktop, CLI, VS Code & AI agents",
@@ -218,7 +247,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "That sinking feeling when 12 files turn red? Gone. GitWand classifies every hunk with 8 deterministic patterns — no guessing, no hallucinations — auto-resolves the ones that were never decisions, and hands you only what's worth your brain. Native, free, MIT.",
     download: 'Download',
     github: 'GitHub',
-    whatsNew: "What's new in v3.11",
+    whatsNew: "What's new in v3.15",
     docs: 'Documentation →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -301,7 +330,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Nativo (sin Electron)",
     mcRow4: "Servidor MCP para agentes",
     agentsCta: "Explorar IA y agentes →",
-    heroAnnounce: "Nuevo en la v3.11 — la IA ya sabe por qué cada lado cambió el código en conflicto",
+    heroAnnounce: "Nuevo en la v3.15 — diffs combinados y bisect guiado",
     heroPoint1: "8 patrones deterministas — cero apuestas con tu código",
     heroPoint2: "100 % local — tu código nunca sale de tu máquina",
     heroPoint3: "Un solo motor — Desktop, CLI, VS Code y agentes de IA",
@@ -318,7 +347,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "¿Esa sensación de vacío cuando 12 archivos se ponen en rojo? Se acabó. GitWand clasifica cada hunk con 8 patrones deterministas — sin adivinar, sin alucinar — resuelve solo los que nunca fueron decisiones y te entrega únicamente lo que merece tu cerebro. Nativo, gratis, MIT.",
     download: 'Descargar',
     github: 'GitHub',
-    whatsNew: 'Novedades v3.11',
+    whatsNew: 'Novedades v3.15',
     docs: 'Documentación →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -401,7 +430,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "Nativo (sem Electron)",
     mcRow4: "Servidor MCP para agentes",
     agentsCta: "Explorar IA e agentes →",
-    heroAnnounce: "Novidade na v3.11 — a IA agora sabe por que cada lado alterou o código em conflito",
+    heroAnnounce: "Novidade na v3.15 — diffs combinados e bisect guiado",
     heroPoint1: "8 padrões deterministas — zero aposta com seu código",
     heroPoint2: "100 % local — seu código nunca sai da sua máquina",
     heroPoint3: "Um único motor — Desktop, CLI, VS Code e agentes de IA",
@@ -418,7 +447,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "Aquele frio na barriga quando 12 arquivos ficam vermelhos? Acabou. O GitWand classifica cada hunk com 8 padrões deterministas — sem chutar, sem alucinar — resolve sozinho os que nunca foram decisões e devolve só o que merece seu cérebro. Nativo, gratuito, MIT.",
     download: 'Baixar',
     github: 'GitHub',
-    whatsNew: 'Novidades v3.11',
+    whatsNew: 'Novidades v3.15',
     docs: 'Documentação →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: 'CLI',
@@ -501,7 +530,7 @@ const i18n: Record<Locale, any> = {
     mcRow3: "原生（无 Electron）",
     mcRow4: "面向代理的 MCP 服务器",
     agentsCta: "探索 AI 与代理 →",
-    heroAnnounce: "v3.11 新功能 — AI 现在知道每一方为何修改了冲突代码",
+    heroAnnounce: "v3.15 新功能 — 合并差异与引导式二分查找",
     heroPoint1: "8 种确定性模式 — 绝不拿你的代码赌运气",
     heroPoint2: "100% 本地运行 — 代码永不离开你的机器",
     heroPoint3: "一个引擎 — 桌面端、CLI、VS Code 与 AI 代理",
@@ -518,7 +547,7 @@ const i18n: Record<Locale, any> = {
     heroSub: "12 个文件同时变红的那种心凉？不会再有。GitWand 用 8 种确定性模式分类每个 hunk——不猜测、无幻觉——自动解决那些本就无需决定的冲突，只把真正值得你思考的部分交还给你。原生、免费、MIT。",
     download: '下载',
     github: 'GitHub',
-    whatsNew: 'v3.11 新特性',
+    whatsNew: 'v3.15 新特性',
     docs: '文档 →',
     platforms: 'macOS · Linux · Windows',
     heroTabCli: '命令行',
@@ -587,7 +616,11 @@ const t = computed(() => i18n[locale.value])
 // `t` sert les sections historiques, `nt` les nouvelles.
 const NC: Record<Locale, any> = {
   en: {
-    badge: 'v3.11 — the AI now knows why each side changed the conflicting code',
+    nextTitle: "This is the future of GitWand.",
+    nextBody: "v4 turns the Git client into one working environment, where coding agents are supervised and controlled and their work is integrated with proof. Here is the sketch, with part of it still under the cover.",
+    nextCta: "See where GitWand is going",
+    nextNote: "",
+    badge: 'v3.15 — combined diffs across several commits, and a guided bisect that finds the commit that broke it',
     h1a: 'The merge ends', h1b: 'without you', h1c: '.',
     sub: 'Eight deterministic patterns classify every hunk, settle the ones that carried no decision, and hand you back only what deserves your attention. Native, local, MIT.',
     cta: 'Download GitWand',
@@ -639,7 +672,11 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   fr: {
-    badge: "v3.11 — l'IA sait enfin pourquoi chaque côté a modifié le code en conflit",
+    nextTitle: "Voici le futur de GitWand.",
+    nextBody: "La v4 fait du client Git un seul environnement de travail, où les agents de code sont supervisés et contrôlés, et où leur travail est intégré preuve à l’appui. En voici l’esquisse, dont une partie est encore sous le voile.",
+    nextCta: "Voir où va GitWand",
+    nextNote: "Page en anglais",
+    badge: 'v3.15 — diffs combinés sur plusieurs commits, et un bisect guidé qui trouve le commit fautif',
     h1a: 'Le merge se termine', h1b: 'sans toi', h1c: '.',
     sub: 'Huit patterns déterministes classent chaque hunk, règlent ceux qui ne demandaient aucune décision, et te laissent uniquement ce qui vaut ton attention. Natif, local, MIT.',
     cta: 'Télécharger GitWand',
@@ -691,7 +728,11 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   es: {
-    badge: 'v3.11 — la IA ya sabe por qué cada lado cambió el código en conflicto',
+    nextTitle: "Este es el futuro de GitWand.",
+    nextBody: "La v4 convierte el cliente Git en un único entorno de trabajo, donde los agentes de código se supervisan y se controlan, y su trabajo se integra con pruebas. Este es el boceto; una parte sigue bajo la lona.",
+    nextCta: "Ver hacia dónde va GitWand",
+    nextNote: "Página en inglés",
+    badge: 'v3.15 — diffs combinados de varios commits y un bisect guiado que encuentra el commit culpable',
     h1a: 'El merge termina', h1b: 'sin ti', h1c: '.',
     sub: 'Ocho patrones deterministas clasifican cada hunk, resuelven los que no exigían ninguna decisión y te devuelven solo lo que merece tu atención. Nativo, local, MIT.',
     cta: 'Descargar GitWand',
@@ -743,7 +784,11 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   'pt-BR': {
-    badge: 'v3.11 — a IA agora sabe por que cada lado alterou o código em conflito',
+    nextTitle: "Este é o futuro do GitWand.",
+    nextBody: "A v4 transforma o cliente Git em um único ambiente de trabalho, onde os agentes de código são supervisionados e controlados, e o trabalho deles é integrado com provas. Este é o esboço; parte dele ainda está sob a capa.",
+    nextCta: "Ver para onde vai o GitWand",
+    nextNote: "Página em inglês",
+    badge: 'v3.15 — diffs combinados de vários commits e um bisect guiado que encontra o commit culpado',
     h1a: 'O merge termina', h1b: 'sem você', h1c: '.',
     sub: 'Oito padrões determinísticos classificam cada hunk, resolvem os que não exigiam decisão nenhuma e devolvem só o que merece a sua atenção. Nativo, local, MIT.',
     cta: 'Baixar o GitWand',
@@ -795,7 +840,11 @@ const NC: Record<Locale, any> = {
     dlMeta: 'v3.11.0 — MIT',
   },
   'zh-CN': {
-    badge: 'v3.11 — AI 现在知道每一方为何修改了冲突代码',
+    nextTitle: "这就是 GitWand 的未来。",
+    nextBody: "v4 把 Git 客户端变成一个统一的工作环境：编码代理在其中受到监督和控制，它们的工作在有据可查的情况下被集成。这是它的草图，其中一部分仍盖在罩布之下。",
+    nextCta: "看看 GitWand 的方向",
+    nextNote: "页面为英文",
+    badge: 'v3.15 — 跨多个提交的合并差异，以及找出问题提交的引导式二分查找',
     h1a: '合并结束时', h1b: '不必再找你', h1c: '。',
     sub: '八种确定性模式为每个 hunk 分类，自动处理那些本就无需决策的部分，只把值得你关注的留给你。原生、本地、MIT。',
     cta: '下载 GitWand',
@@ -959,9 +1008,11 @@ function cellClass(v: CompareValue | undefined): string {
 // ── Apparition au défilement (thème Nocturne) ────────────────────────────────
 // Posé ici plutôt que dans le template : aucune section n'a à porter l'attribut,
 // et le rendu SSR reste identique.
-onMounted(() => {
+onMounted(async () => {
   if (typeof window === 'undefined' || !('IntersectionObserver' in window)) return
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+  // Client-only blocks (the advent card) render on the next tick: wait for them.
+  await nextTick()
   const targets = Array.from(
     document.querySelectorAll('.gw-landing .nc-wrap > *, .gw-landing .nc-bento > *, .gw-landing .nc-trio > *'),
   )
@@ -983,21 +1034,6 @@ onMounted(() => {
 <template>
   <div class="gw-landing">
 
-    <!-- Language picker (mirrors the 5 locales of the desktop app) -->
-    <div class="lang-picker" role="group" aria-label="Language">
-      <button
-        v-for="L in LOCALES"
-        :key="L.code"
-        class="lang-pill"
-        :class="{ 'lang-pill--active': locale === L.code }"
-        :title="L.title"
-        :aria-pressed="locale === L.code"
-        @click="setLocale(L.code)"
-      >
-        {{ L.label }}
-      </button>
-    </div>
-
     <!-- ══════════════════════════════════════
          1 · HERO
     ══════════════════════════════════════ -->
@@ -1009,11 +1045,28 @@ onMounted(() => {
       </div>
 
       <div class="nc-wrap nc-hero__body">
-        <a class="nc-pill" href="/changelog">
-          <span class="nc-pill__dot"></span>
-          {{ nt.badge }}
-          <span class="nc-pill__arrow">→</span>
-        </a>
+        <div class="nc-hero__top">
+          <a class="nc-pill" :href="advent?.href ?? '/changelog'">
+            <span class="nc-pill__dot"></span>
+            {{ advent?.text ?? nt.badge }}
+            <span class="nc-pill__arrow">→</span>
+          </a>
+
+          <!-- Language picker (mirrors the 5 locales of the desktop app) -->
+          <div class="lang-picker" role="group" aria-label="Language">
+            <button
+              v-for="L in LOCALES"
+              :key="L.code"
+              class="lang-pill"
+              :class="{ 'lang-pill--active': locale === L.code }"
+              :title="L.title"
+              :aria-pressed="locale === L.code"
+              @click="setLocale(L.code)"
+            >
+              {{ L.label }}
+            </button>
+          </div>
+        </div>
 
         <h1 class="nc-h1">
           {{ nt.h1a }} <span class="nc-shine">{{ nt.h1b }}</span>{{ nt.h1c }}
@@ -1034,6 +1087,36 @@ onMounted(() => {
           <div class="nc-figure"><div class="nc-figure__n">{{ nt.s2n }}</div><div class="nc-figure__l">{{ nt.s2l }}</div></div>
           <div class="nc-figure"><div class="nc-figure__n">{{ nt.s3n }}</div><div class="nc-figure__l">{{ nt.s3l }}</div></div>
         </div>
+      </div>
+
+      <!-- Calendrier de l'Avent (1–25 décembre, côté client) -->
+      <div v-if="adventCard" class="nc-wrap nc-hero__advent">
+        <section class="nc-advent" aria-labelledby="nc-advent-title">
+          <AdventSnow />
+          <div class="nc-advent__text">
+            <span class="nc-eyebrow nc-eyebrow--sm">Git Advent Calendar 🎄</span>
+            <h2 id="nc-advent-title" class="nc-advent__title">24 little-known git commands, one a day until Christmas.</h2>
+            <p class="nc-advent__body">Each door solves a real problem, with a GitWand tip. Open it on the site, or right in your terminal.</p>
+          </div>
+          <div v-if="adventCard.kind === 'teaser'" class="nc-advent__teaser">
+            <span class="nc-advent__teaser-label">The first door opens in</span>
+            <span class="nc-advent__count">
+              <span class="nc-advent__count-n">{{ adventCard.daysLeft }}</span>
+              {{ adventCard.daysLeft === 1 ? 'day' : 'days' }}
+            </span>
+            <span class="nc-advent__note">December 1, Paris time</span>
+            <a class="nc-btn nc-btn--ghost" :href="ADVENT_INDEX_PATH">Peek at the calendar →</a>
+          </div>
+          <div v-else class="nc-advent__actions">
+            <a class="nc-btn nc-btn--primary" :href="ADVENT_INDEX_PATH">{{ adventCard.cta }}</a>
+            <button class="nc-cmd" type="button" @click="copyAdvent" :aria-label="`Copy ${ADVENT_CMD}`">
+              <span class="nc-cmd__prompt">$</span>
+              <code>{{ ADVENT_CMD }}</code>
+              <span class="nc-cmd__hint">{{ adventCopied ? 'Copied' : 'Copy' }}</span>
+            </button>
+            <p class="nc-advent__note">No CLI yet? <code>npx @gitwand/cli advent</code></p>
+          </div>
+        </section>
       </div>
 
       <!-- Capture inclinée : la fenêtre « sort » du fond, puis se fond dedans -->
@@ -1068,6 +1151,9 @@ onMounted(() => {
         </div>
       </div>
     </div>
+
+    <!-- Annonce de la v4 : renvoie vers /next -->
+    <NextTeaser :title="nt.nextTitle" :body="nt.nextBody" :cta="nt.nextCta" :note="nt.nextNote" />
 
     <!-- ══════════════════════════════════════
          3 · DÉMO DE CONFLIT — le moment « ah oui »
@@ -1346,10 +1432,10 @@ onMounted(() => {
         <div class="blog-teaser-header">
           <span class="blog-teaser-label">From the blog</span>
         </div>
-        <a href="/blog/v3-11-three-outcomes-not-two" class="blog-teaser-card">
-          <div class="blog-teaser-meta">September 21, 2026 · 9 min read</div>
-          <h3 class="blog-teaser-title">Three outcomes, not two: what went into GitWand v3.11</h3>
-          <p class="blog-teaser-excerpt">The Conflict Predictor stopped predicting and started running the merge, stopping on what needs a person. And a two-line bug report about an "Abort merge" button that lied led to the real fix: an operation ends three ways, not two. It completes, it halts on a further conflict, or it fails.</p>
+        <a v-if="latestPost" :href="latestPost.url" class="blog-teaser-card">
+          <div class="blog-teaser-meta">{{ latestPost.dateLabel }} · {{ latestPost.readingMinutes }} min read</div>
+          <h3 class="blog-teaser-title">{{ latestPost.title }}</h3>
+          <p class="blog-teaser-excerpt">{{ latestPost.description }}</p>
           <span class="blog-teaser-cta">Read article →</span>
         </a>
       </div>
@@ -1447,10 +1533,6 @@ onMounted(() => {
    Language picker (5 locales, segmented)
 ─────────────────────────────────────────── */
 .lang-picker {
-  position: fixed;
-  top: 78px;
-  right: 20px;
-  z-index: 100;
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -2103,17 +2185,107 @@ onMounted(() => {
 }
 .nc-btn--ghost:hover { border-color: var(--nc-accent-500); color: var(--nc-accent-200); }
 
+.nc-hero__advent { padding-top: 40px; }
+.nc-advent {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 32px;
+  align-items: center;
+  padding: 28px;
+  /* Rotating border: an opaque fill on the padding box over a turning conic gradient. */
+  border: 2px solid transparent;
+  border-radius: var(--nc-radius-lg);
+  background:
+    linear-gradient(var(--nc-surface), var(--nc-surface)) padding-box,
+    conic-gradient(
+      from var(--nc-advent-angle),
+      var(--nc-neutral-800) 0deg,
+      var(--nc-neutral-800) 180deg,
+      var(--nc-accent) 260deg,
+      var(--nc-accent-300) 320deg,
+      #fff 335deg,
+      var(--nc-accent) 350deg,
+      var(--nc-neutral-800) 360deg
+    ) border-box;
+  box-shadow: var(--nc-glow-soft);
+  animation: nc-advent-spin 6s linear infinite;
+}
+@property --nc-advent-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes nc-advent-spin {
+  to { --nc-advent-angle: 360deg; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nc-advent { animation: none; }
+}
+.nc-advent__text,
+.nc-advent__actions { position: relative; }
+.nc-advent__text { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.nc-advent__title {
+  margin: 0;
+  font-size: clamp(22px, 2.4vw, 28px);
+  line-height: 1.15;
+  font-weight: var(--nc-weight-title);
+  letter-spacing: -0.02em;
+  color: var(--nc-accent-100);
+}
+.nc-advent__body { margin: 0; font-size: 15.5px; line-height: 1.55; color: var(--nc-neutral-300); max-width: 48ch; }
+.nc-advent__actions { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; min-width: 0; }
+.nc-advent__teaser { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }
+.nc-advent__teaser-label {
+  font-family: var(--nc-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--nc-neutral-400);
+}
+.nc-advent__count {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 20px;
+  color: var(--nc-neutral-300);
+}
+.nc-advent__count-n {
+  font-size: clamp(48px, 5vw, 64px);
+  line-height: 1;
+  font-weight: var(--nc-weight-title);
+  letter-spacing: -0.03em;
+  color: var(--nc-accent-100);
+  font-variant-numeric: tabular-nums;
+}
+.nc-advent__teaser .nc-btn--ghost { margin-top: 6px; }
+.nc-advent__note { margin: 0; font-size: 13px; color: var(--nc-neutral-400); }
+.nc-advent__note code { font-family: var(--nc-font-mono); color: var(--nc-neutral-300); background: none; padding: 0; }
+@media (max-width: 760px) {
+  .nc-advent { grid-template-columns: 1fr; gap: 20px; padding: 22px; }
+}
+
 /* ── Hero ── */
 .nc-hero { position: relative; overflow: hidden; }
 .nc-hero__decor { position: absolute; inset: 0; pointer-events: none; }
 .nc-hero__orb-a { top: -320px; left: 50%; width: 1100px; height: 760px; margin-left: -550px; }
 .nc-hero__orb-b { top: -220px; right: -180px; width: 760px; height: 620px; }
 .nc-hero__body {
-  padding-top: 64px;
+  padding-top: 24px;
   display: flex;
   flex-direction: column;
   gap: 22px;
 }
+
+.nc-hero__top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.nc-hero__top .nc-pill { align-self: center; }
 
 .nc-pill {
   align-self: flex-start;
@@ -2152,7 +2324,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 13px 14px;
+  padding: 13px 10px 13px 14px;
   font-family: var(--nc-font-mono);
   font-size: 13px;
   color: var(--nc-neutral-300);
@@ -2169,7 +2341,7 @@ onMounted(() => {
   color: var(--nc-neutral-400);
   border-left: 1px solid var(--nc-neutral-800);
   padding-left: 10px;
-  min-width: 4.5em;
+  min-width: 5ch;
   text-align: left;
 }
 
@@ -2682,7 +2854,26 @@ onMounted(() => {
   font-weight: 400;
 }
 .btn-ghost:hover { border-color: var(--nc-accent-500); color: var(--nc-accent-200); }
-.btn-split__main { border-right-color: color-mix(in srgb, var(--nc-accent-300) 45%, transparent); }
+/* Bouton scindé : le cadre (bordure, rayon, halo) porte sur le conteneur,
+   pas sur chaque moitié — sinon l'override .btn-primary ci-dessus redonne à
+   chacune ses propres coins et bordure, et on voit deux boutons accolés. */
+.btn-split {
+  border: 1px solid var(--nc-accent-300);
+  border-radius: var(--nc-radius-md);
+  box-shadow: var(--nc-glow);
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+.btn-split:hover { border-color: var(--nc-accent-200); }
+.btn-split > .btn-primary {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+.btn-split > .btn-primary:hover { transform: none; }
+.btn-split > .btn-split__aside {
+  border-left: 1px solid color-mix(in srgb, var(--nc-accent-300) 45%, transparent);
+}
 
 /* Sélecteur de langue */
 .lang-pill {

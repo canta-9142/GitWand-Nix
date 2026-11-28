@@ -4,7 +4,9 @@
  * fallback chain.
  *
  * Tries, in order: the explicit forge `url`, then a Gravatar derived from
- * `email`, then the deterministic colored-initials disk (see
+ * `email` (only when Settings → `gravatarEnabled` is on: the lookup sends a
+ * hash of the author's email to gravatar.com), then the deterministic
+ * colored-initials disk (see
  * composables/useAvatar). Each photo source that fails to load (or is
  * unavailable) advances to the next stage — so a broken forge avatar still
  * gets a chance at Gravatar before falling back to initials. Single root
@@ -14,6 +16,10 @@
  */
 import { computed, ref, watch } from "vue";
 import { avatarInitials, avatarStyle, gravatarUrl, githubAvatarFromEmail } from "../composables/useAvatar";
+import { proxyImageUrl } from "../utils/imageProxy";
+import { useSettings } from "../composables/useSettings";
+
+const { settings } = useSettings();
 
 const props = defineProps<{
   /** Display name — source for the initials and (with email) the color key. */
@@ -37,13 +43,13 @@ const forgeUrl = ref<string | null>(null);
 const gravatar = ref<string | null>(null);
 
 watch(
-  () => [props.url, props.email, props.size] as const,
-  async ([url, email, size]) => {
+  () => [props.url, props.email, props.size, settings.value.gravatarEnabled] as const,
+  async ([url, email, size, gravatarEnabled]) => {
     // Explicit forge URL wins; otherwise try to derive a GitHub avatar straight
     // from a `users.noreply.github.com` commit email (git-log views have no
     // forge login, only name+email — this recovers the forge photo for free).
     forgeUrl.value = url ?? githubAvatarFromEmail(email, size ?? 48);
-    gravatar.value = await gravatarUrl(email, size ?? 48);
+    gravatar.value = gravatarEnabled ? await gravatarUrl(email, size ?? 48) : null;
     // Start at the first stage that has a candidate photo.
     stage.value = forgeUrl.value ? "forge" : gravatar.value ? "gravatar" : "initials";
   },
@@ -69,7 +75,7 @@ const showPhoto = computed(() => !!resolvedUrl.value);
   >
     <img
       v-if="showPhoto"
-      :src="resolvedUrl!"
+      :src="proxyImageUrl(resolvedUrl!)"
       class="gw-avatar__img"
       alt=""
       loading="lazy"

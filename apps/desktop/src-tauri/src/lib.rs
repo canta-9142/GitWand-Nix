@@ -1,7 +1,11 @@
+pub(crate) mod combined;
 pub(crate) mod commands;
 pub mod git;
+pub(crate) mod process_tree;
 pub(crate) mod shell_env;
+pub(crate) mod stack;
 pub(crate) mod types;
+pub(crate) mod worktree;
 
 pub(crate) use crate::types::*;
 // Used only by the `#[cfg(test)] mod tests` block below (parse_gh_pr_json,
@@ -106,11 +110,12 @@ compile_error!(
 
 // `strip_claude_auth_env` + `resolve_claude_binary` + `resolve_codex_binary`
 // + `resolve_opencode_binary` + `resolve_copilot_binary`
-// + `resolve_antigravity_binary` + 12 AI CLI commands
+// + `resolve_antigravity_binary` + 15 AI CLI commands
 // (detect_claude_cli, claude_cli_prompt, detect_codex_cli, codex_cli_prompt,
+// codex_list_models,
 // claude_cli_login, detect_opencode_cli, opencode_cli_prompt,
-// opencode_list_models, detect_copilot_cli, copilot_cli_prompt,
-// detect_antigravity_cli, antigravity_cli_prompt)
+// opencode_list_models, detect_copilot_cli, copilot_cli_prompt, copilot_list_models,
+// detect_antigravity_cli, antigravity_cli_prompt, antigravity_list_models)
 // migrated to `src/commands/ai.rs` (§3.4f).
 // Handler entries below route to `commands::ai::*`.
 
@@ -234,6 +239,37 @@ pub fn git_diff_parity(cwd: String, path: String, staged: bool) -> Result<types:
     tauri::async_runtime::block_on(commands::read::git_diff(cwd, path, staged))
 }
 
+/// Parity entry point for `git_show` (multi-file commit diff). Same
+/// reasoning as `git_diff_parity`.
+pub fn git_show_parity(cwd: String, hash: String) -> Result<Vec<types::GitDiff>, String> {
+    tauri::async_runtime::block_on(commands::read::git_show(cwd, hash))
+}
+
+/// `budget` overrides the 16 MB payload budget so the parity suite can
+/// exercise the cut with small repos; `None` = the production constant. Only
+/// the probe calls this — the Tauri command itself has no override.
+pub fn git_combined_diff_parity(
+    cwd: String,
+    hashes: Vec<String>,
+    paths: Option<Vec<String>>,
+    budget: Option<usize>,
+) -> Result<types::CombinedDiff, String> {
+    match budget {
+        None => tauri::async_runtime::block_on(commands::combined::git_combined_diff(
+            cwd, hashes, paths,
+        )),
+        Some(b) => combined::replay::combined_diff_with_budget(&cwd, &hashes, paths.as_deref(), b),
+    }
+}
+
+/// Parity entry point for `git_file_lineage`.
+pub fn git_file_lineage_parity(
+    cwd: String,
+    path: String,
+) -> Result<Vec<types::FileLineageEntry>, String> {
+    tauri::async_runtime::block_on(commands::combined::git_file_lineage(cwd, path))
+}
+
 pub fn git_branches_parity(cwd: String) -> Result<Vec<types::GitBranch>, String> {
     tauri::async_runtime::block_on(commands::ops::git_branches(cwd, None))
 }
@@ -255,6 +291,59 @@ pub fn git_blame_parity(
 /// loaded it fine, so QA could not reproduce it (issue #188).
 pub fn read_file_parity(cwd: String, path: String) -> Result<String, String> {
     tauri::async_runtime::block_on(commands::files::read_file(cwd, path))
+}
+
+/// Parity entry point for `read_commit_template`. The path comes from git
+/// config on both sides, a leading `~` is expanded from HOME (then
+/// USERPROFILE), and only a small regular file is read.
+pub fn read_commit_template_parity(cwd: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::block_on(commands::read::read_commit_template(cwd))
+}
+
+/// Parity entry point for `ai_http_request`. Its open-endpoint gate, whose
+/// native question the dev-server cannot mirror (and says so), is replaced by
+/// a loopback-only one: the gate lets loopback through without asking, and
+/// the probe refuses every other origin rather than reach it unasked. Only
+/// `auth: "none"`, so no key is read from the keychain. Answers
+/// `{ status, body }`, as the command.
+pub fn ai_http_request_parity(
+    method: String,
+    url: String,
+    body: Option<String>,
+    auth: String,
+    timeout_secs: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    // Never reach for the user's stored key from a test binary.
+    if auth != "none" {
+        return Err("parity probe: ai_http_request only runs with auth \"none\"".to_string());
+    }
+    let res = commands::ai_http::ai_http_request_inner(
+        &method,
+        &url,
+        body.as_deref(),
+        &auth,
+        timeout_secs,
+        |target| {
+            if commands::ai_http::is_loopback(target) {
+                Ok(())
+            } else {
+                Err("parity probe: ai_http_request only reaches loopback".to_string())
+            }
+        },
+    )?;
+    serde_json::to_value(res).map_err(|e| e.to_string())
+}
+
+/// Parity entry point for `list_repo_dir` (v3.11.2). Rust classifies ignored
+/// entries in process with libgit2; the dev-server shells out to
+/// `git check-ignore`. Two mechanisms answering one question is exactly what
+/// parity coverage exists for.
+pub fn list_repo_dir_parity(
+    cwd: String,
+    dir: String,
+    include_ignored: bool,
+) -> Result<types::RepoDirListing, String> {
+    tauri::async_runtime::block_on(commands::files::list_repo_dir(cwd, dir, include_ignored))
 }
 
 /// Parity entry points for the three Conflict Predictor commands. Until
@@ -280,6 +369,20 @@ pub fn git_operation_action_parity(
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::block_on(commands::ops::git_operation_action(cwd, operation, action))
         .map(|r| serde_json::json!({ "halted": r.halted }))
+}
+
+fn parity_opt(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn parity_merged_parents(
+    args: &serde_json::Value,
+) -> Result<Vec<crate::stack::MergedParentHint>, String> {
+    match args.get("mergedParents") {
+        None | Some(serde_json::Value::Null) => Ok(vec![]),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid arg 'mergedParents': {e}")),
+    }
 }
 
 /// Collapse any success payload to a marker.
@@ -325,6 +428,7 @@ pub fn command_parity(
         "git_cherry_pick" => tauri::async_runtime::block_on(commands::ops::git_cherry_pick(
             s("cwd")?,
             vec![s("hash")?],
+            None,
         ))
         .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
         "git_revert_commit" => tauri::async_runtime::block_on(commands::ops::git_revert_commit(
@@ -378,6 +482,7 @@ pub fn command_parity(
             s("message")?,
             None,
             None,
+            None,
         ))
         .map(parity_ok_marker),
         "git_create_branch" => tauri::async_runtime::block_on(commands::ops::git_create_branch(
@@ -403,6 +508,26 @@ pub fn command_parity(
             Some(false),
         ))
         .map(|r| serde_json::json!({ "success": r.success, "message": r.message })),
+        "git_push" => {
+            let opt = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
+            tauri::async_runtime::block_on(commands::ops::git_push(
+                s("cwd")?,
+                args.get("setUpstream").and_then(|v| v.as_bool()),
+                args.get("force").and_then(|v| v.as_bool()),
+                opt("leaseBranch"),
+                opt("leaseSha"),
+            ))
+            .map(|r| serde_json::json!({ "success": r.success, "message": r.message }))
+        }
+        "git_stash_show" => tauri::async_runtime::block_on(commands::ops::git_stash_show(
+            s("cwd")?,
+            args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        ))
+        .map(|d| serde_json::json!({ "diff": d })),
+        "git_fast_forward_to_upstream" => {
+            tauri::async_runtime::block_on(commands::ops::git_fast_forward_to_upstream(s("cwd")?))
+                .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
+        }
         "git_stage" => {
             tauri::async_runtime::block_on(commands::ops::git_stage(s("cwd")?, vec![s("path")?]))
                 .map(parity_ok_marker)
@@ -410,6 +535,41 @@ pub fn command_parity(
         "git_unstage" => {
             tauri::async_runtime::block_on(commands::ops::git_unstage(s("cwd")?, vec![s("path")?]))
                 .map(parity_ok_marker)
+        }
+        "git_file_log" => tauri::async_runtime::block_on(commands::read::git_file_log(
+            s("cwd")?,
+            s("path")?,
+            args.get("count").and_then(|v| v.as_u64()).map(|n| n as u32),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_file_diff" => tauri::async_runtime::block_on(commands::read::git_file_diff(
+            s("cwd")?,
+            s("path")?,
+            s("fromHash")?,
+            s("toHash")?,
+            s("fromPath").ok(),
+            s("toPath").ok(),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_tracked_ignored" => tauri::async_runtime::block_on(
+            commands::tracked_ignored::git_tracked_ignored(s("cwd")?),
+        )
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "git_untrack_paths" => {
+            let paths: Vec<String> = args
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or_else(|| "missing required arg 'paths' for git_untrack_paths".to_string())?;
+            tauri::async_runtime::block_on(commands::tracked_ignored::git_untrack_paths(
+                s("cwd")?,
+                paths,
+            ))
+            .map(parity_ok_marker)
         }
         "git_stage_patch" => {
             tauri::async_runtime::block_on(commands::ops::git_stage_patch(s("cwd")?, s("patch")?))
@@ -462,6 +622,69 @@ pub fn command_parity(
             tauri::async_runtime::block_on(commands::read::git_config_identity(s("cwd")?))
                 .map(|(name, email)| serde_json::json!([name, email]))
         }
+        // Stacked branches. Optional `trunk`; `mergedParents` / `previewed`
+        // carry the serde shapes of `MergedParentHint` / `PreviewedRestack`.
+        "stack_status" => tauri::async_runtime::block_on(commands::stack::stack_status(
+            s("cwd")?,
+            parity_opt(&args, "trunk"),
+            parity_merged_parents(&args)?,
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "stack_set_parent" => tauri::async_runtime::block_on(commands::stack::stack_set_parent(
+            s("cwd")?,
+            s("branch")?,
+            s("parent")?,
+            parity_opt(&args, "trunk"),
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "stack_delete_merged_parent" => tauri::async_runtime::block_on(
+            commands::stack::stack_delete_merged_parent(s("cwd")?, s("branch")?, s("tip")?),
+        )
+        .map(parity_ok_marker),
+        "stack_unset" => {
+            tauri::async_runtime::block_on(commands::stack::stack_unset(s("cwd")?, s("branch")?))
+                .map(parity_ok_marker)
+        }
+        "stack_restack_plan" => {
+            tauri::async_runtime::block_on(commands::stack::stack_restack_plan(
+                s("cwd")?,
+                s("branch")?,
+                parity_opt(&args, "trunk"),
+                parity_merged_parents(&args)?,
+            ))
+            .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
+        }
+        "git_restack" => {
+            let previewed = serde_json::from_value(
+                args.get("previewed")
+                    .cloned()
+                    .ok_or_else(|| format!("missing required arg 'previewed' for {}", command))?,
+            )
+            .map_err(|e| format!("invalid arg 'previewed': {e}"))?;
+            tauri::async_runtime::block_on(commands::stack::git_restack(
+                s("cwd")?,
+                s("branch")?,
+                parity_opt(&args, "trunk"),
+                parity_merged_parents(&args)?,
+                previewed,
+            ))
+            .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
+        }
+        // Pushes to the branch's own upstream: the tests point it at a local
+        // bare origin, never a network remote.
+        "git_push_branch" => tauri::async_runtime::block_on(commands::ops::git_push_branch(
+            s("cwd")?,
+            s("branch")?,
+            s("leaseSha")?,
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+        "preview_restack" => tauri::async_runtime::block_on(commands::read::preview_restack(
+            s("cwd")?,
+            s("onto")?,
+            s("upstream")?,
+            s("branch")?,
+        ))
+        .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
         other => Err(format!("command-parity does not know '{}'", other)),
     }
 }
@@ -487,12 +710,41 @@ pub fn preview_cherry_pick_parity(
     tauri::async_runtime::block_on(commands::read::preview_cherry_pick(cwd, commit))
 }
 
+pub fn worktree_resolve_base_parity(
+    cwd: String,
+) -> Result<commands::worktree::WorktreeBaseInfo, String> {
+    tauri::async_runtime::block_on(commands::worktree::worktree_resolve_base(cwd))
+}
+
+pub fn worktree_guard_parity(
+    cwd: String,
+    path: String,
+) -> Result<worktree::guard::GuardReport, String> {
+    tauri::async_runtime::block_on(commands::worktree::worktree_guard(cwd, path))
+}
+
+pub fn worktree_merge_back_check_parity(
+    cwd: String,
+    path: String,
+    target: Option<String>,
+) -> Result<worktree::merge_back::MergeBackCheck, String> {
+    tauri::async_runtime::block_on(commands::worktree::worktree_merge_back_check(
+        cwd, path, target,
+    ))
+}
+
 pub fn git_remote_info_parity(cwd: String) -> Result<types::RemoteInfo, String> {
     tauri::async_runtime::block_on(commands::ops::git_remote_info(cwd))
 }
 
 pub fn git_stash_list_parity(cwd: String) -> Result<Vec<types::StashEntry>, String> {
     tauri::async_runtime::block_on(commands::ops::git_stash_list(cwd))
+}
+
+/// Parity entry point for `git_bisect_status` (range, skips, candidates and
+/// scope, ported to `dev-bisect.mjs`).
+pub fn git_bisect_status_parity(cwd: String) -> Result<types::BisectStatus, String> {
+    tauri::async_runtime::block_on(commands::bisect::git_bisect_status(cwd))
 }
 
 /// Parity entry point for `gh_enable_auto_merge`. Only a repo with no forge
@@ -613,41 +865,24 @@ fn get_or_create_install_id() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // On some Linux setups (VMs, older Mesa drivers, missing GPU passthrough)
-    // WebKitGTK fails to create a hardware-accelerated EGL context and
-    // aborts the whole process with `Could not create default EGL display:
-    // EGL_BAD_PARAMETER. Aborting...` before any window is ever shown —
-    // reported as a terminal-visible abort on Ubuntu 26.04 (#135) and as a
-    // silent "app won't open" when launched from a .deb-installed GUI
-    // launcher on Linux Mint 22 (#139). These env vars must be set before
-    // the webview is created (WebKitGTK reads them at that point), so this
-    // has to run before `tauri::Builder::default()...run(...)` below.
-    // Forcing software rendering here lets the app degrade gracefully
-    // instead of aborting. No-op on macOS/Windows.
+    // Linux renders with the GPU. Setups where WebKitGTK can't get an EGL
+    // display abort at startup (#135, #139); a launch sentinel detects that and
+    // switches the next launch to software rendering. Deprecation note and
+    // details in commands/render_fallback.rs.
     #[cfg(target_os = "linux")]
-    {
-        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    commands::render_fallback::prepare_launch();
+
+    // WebKitGTK's DMA-BUF renderer is always turned off, GPU or not: on NVIDIA
+    // under Wayland it kills the process at startup with `Error 71 (Protocol
+    // error) dispatching to Wayland display`. Rendering stays on the GPU; only
+    // the hand-off of finished frames goes through shared memory. Tried and
+    // rejected on an RTX 3090 / Wayland: `__NV_DISABLE_EXPLICIT_SYNC=1` (no
+    // crash, but the window flickers non-stop) and `GDK_BACKEND=x11` (window
+    // does not come up properly). Never override a value the user set
+    // deliberately.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        // #135 follow-up: the two vars above only steer WebKitGTK's compositing
-        // path, not EGL *display acquisition* itself — force Mesa's software
-        // rasterizer as a broader fallback for systems where EGL_BAD_PARAMETER
-        // originates earlier (e.g. native Wayland/Gnome). Never override a value
-        // the user or environment already set deliberately.
-        if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
-            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-        }
-        // #135 follow-up 2: LIBGL_ALWAYS_SOFTWARE forces the GL renderer once an
-        // EGL context exists, but doesn't help when the failure happens earlier,
-        // at EGL *platform display* acquisition under native Wayland. Confirmed
-        // via `ldd` from an affected user that this isn't an AppImage-bundled-library
-        // issue (EGL/GL/Mesa all resolved to the host system, not the bundle) but a
-        // genuine native-Wayland EGL negotiation failure. Forcing GTK onto XWayland
-        // sidesteps that negotiation entirely, at the cost of native Wayland's
-        // fractional scaling and lower input latency. Never override a value the
-        // user or environment already set deliberately.
-        if std::env::var("GDK_BACKEND").is_err() {
-            std::env::set_var("GDK_BACKEND", "x11");
-        }
     }
 
     // macOS GUI apps launched from Finder/Dock get a minimal launchd env
@@ -666,7 +901,18 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_clipboard_manager::init());
+        .plugin(tauri_plugin_clipboard_manager::init())
+        // Remote images, fetched by the backend (`img-src` stays closed).
+        .register_asynchronous_uri_scheme_protocol(
+            commands::image_proxy::SCHEME,
+            |_ctx, request, responder| {
+                // A few dedicated workers, not a thread per image nor the
+                // shared blocking pool (see image_proxy::enqueue).
+                commands::image_proxy::enqueue(request.uri().to_string(), move |r| {
+                    responder.respond(r)
+                });
+            },
+        );
 
     // Anonymous launch telemetry (release builds with --features telemetry
     // only). Registered conditionally because APTABASE_APP_KEY and the
@@ -677,11 +923,22 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // Tag the window title in dev builds so a `tauri dev` window can be
+            // told apart from an installed GitWand. Compiled out of release builds.
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(title) = window.title() {
+                    let _ = window.set_title(&format!("{} (DEV)", title));
+                }
+            }
+
             // Register Cmd+Shift+G (macOS) / Ctrl+Shift+G (Linux/Windows)
             // to bring GitWand to the foreground from anywhere.
+            // Non-fatal: another process may already own the hotkey (e.g. a
+            // prod GitWand running next to `tauri dev`, or an unrelated app).
             use tauri_plugin_global_shortcut::ShortcutState;
             let handle = app.handle().clone();
-            app.global_shortcut().on_shortcut(
+            if let Err(e) = app.global_shortcut().on_shortcut(
                 "CmdOrCtrl+Shift+G",
                 move |_app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {
@@ -695,7 +952,12 @@ pub fn run() {
                         let _ = handle.emit("global-shortcut-activate", ());
                     }
                 },
-            )?;
+            ) {
+                eprintln!(
+                    "[gitwand] global shortcut CmdOrCtrl+Shift+G not registered: {}",
+                    e
+                );
+            }
 
             // Anonymous launch telemetry via Aptabase — fire-and-forget.
             // Replaced Umami: Umami Cloud filters non-browser User-Agents and
@@ -707,8 +969,9 @@ pub fn run() {
             // auto-captures OS, app version and locale, so only install_id is
             // sent as a custom property. track_event runs in the background.
             // Skipped unless built with --features telemetry.
+            // Honours the user's opt-out and DO_NOT_TRACK (commands/telemetry.rs).
             #[cfg(feature = "telemetry")]
-            {
+            if commands::telemetry::telemetry_allowed() {
                 let install_id = get_or_create_install_id();
                 let _ = app.track_event(
                     "launch",
@@ -730,12 +993,15 @@ pub fn run() {
             commands::files::folder_diff,
             commands::files::list_dir,
             commands::files::list_repo_tree,
+            commands::files::list_repo_dir,
             commands::secrets::scan_secrets,
             commands::read::git_status,
             commands::read::git_diff,
             commands::read::git_log,
             commands::ops::git_stage,
             commands::ops::git_unstage,
+            commands::tracked_ignored::git_tracked_ignored,
+            commands::tracked_ignored::git_untrack_paths,
             commands::ops::git_stage_patch,
             commands::ops::git_unstage_patch,
             commands::ops::git_commit,
@@ -743,15 +1009,30 @@ pub fn run() {
             commands::ops::git_split_commit,
             commands::ops::git_push,
             commands::ops::git_pull,
+            commands::ops::git_fast_forward_to_upstream,
             commands::ops::git_fetch,
             commands::ops::git_merge,
             commands::ops::git_operation_action,
             commands::read::git_repo_state,
+            commands::bisect::git_bisect_status,
+            commands::bisect::git_bisect_start,
+            commands::bisect::git_bisect_mark,
+            commands::bisect::git_bisect_reset,
             commands::ops::git_interactive_rebase,
             commands::ops::git_rebase_onto,
+            commands::ops::git_push_branch,
+            commands::stack::stack_status,
+            commands::stack::stack_set_parent,
+            commands::stack::stack_unset,
+            commands::stack::stack_delete_merged_parent,
+            commands::stack::stack_restack_plan,
+            commands::stack::git_restack,
+            commands::read::preview_restack,
             commands::ops::git_add_to_gitignore,
             commands::ops::git_discard,
             commands::read::git_show,
+            commands::combined::git_combined_diff,
+            commands::combined::git_file_lineage,
             commands::ops::git_branches,
             commands::ops::git_create_branch,
             commands::ops::git_switch_branch,
@@ -762,8 +1043,25 @@ pub fn run() {
             commands::ops::git_stash_pop,
             commands::ops::open_in_editor,
             commands::ops::open_url,
+            commands::ops::reveal_in_file_manager,
             commands::ops::set_git_config,
             commands::ops::read_gitwandrc,
+            commands::worktree::worktree_create,
+            commands::worktree::worktree_resolve_base,
+            commands::worktree::worktree_run_hook,
+            commands::worktree::worktree_url,
+            commands::worktree::worktree_guard,
+            commands::worktree::worktree_remove_prepare,
+            commands::worktree::worktree_remove,
+            commands::worktree::worktree_unlock,
+            commands::worktree::worktree_merge_back_check,
+            commands::worktree::worktree_merge_back_prepare,
+            commands::worktree::worktree_merge_back_squash,
+            commands::worktree::worktree_merge_back_fast_forward,
+            commands::worktree::snapshot_restore_as_worktree,
+            commands::worktree_processes::worktree_stop_processes,
+            commands::worktree_trust::worktree_hooks_trust,
+            commands::worktree_trust::worktree_hooks_trust_set,
             commands::read::preview_merge,
             commands::read::preview_rebase,
             commands::read::preview_cherry_pick,
@@ -784,6 +1082,15 @@ pub fn run() {
             commands::gh::gh_pr_freshness_signal,
             commands::gh::gh_create_pr,
             commands::gh::gh_list_reviewer_candidates,
+            commands::gh_issues::gh_issue_targets,
+            commands::gh_issues::gh_issue_available,
+            commands::gh_issues::gh_create_issue,
+            commands::gh_issues::gh_create_gitwand_issue,
+            commands::gh_issues::gh_gitwand_writable,
+            commands::gh_issues::gh_list_labels,
+            commands::gh_issues::gh_issue_templates,
+            commands::gh_issues::gh_list_milestones,
+            commands::gh_issues::gh_list_assignees,
             commands::gh::gh_branches,
             commands::gh::gh_checkout_pr,
             commands::gh::gh_merge_pr,
@@ -796,6 +1103,7 @@ pub fn run() {
             commands::gh::gh_pr_issue_comments,
             commands::gh::gh_issue_detail,
             commands::gh::gh_issue_comments,
+            commands::gh::gh_pr_attachment_urls,
             commands::gh::gh_issue_add_comment,
             commands::gh::gh_issue_set_state,
             commands::gh::gh_list_issues,
@@ -805,7 +1113,15 @@ pub fn run() {
             commands::gh::gh_add_reaction,
             commands::gh::gh_delete_reaction,
             commands::gh::gh_pr_ready,
+            commands::gh::gh_pr_edit,
+            commands::gh::gh_branch_pr,
+            commands::gh::gh_pr_set_base,
             commands::gh::gh_dismiss_review,
+            commands::gh::gh_pr_review_threads,
+            commands::gh::gh_pr_create_comment,
+            commands::gh::gh_pr_update_comment,
+            commands::gh::gh_pr_delete_comment,
+            commands::gh::gh_set_review_thread_resolved,
             commands::gh::gh_request_reviewers,
             commands::gh::gh_fork_info,
             commands::github_api::github_device_start,
@@ -828,6 +1144,7 @@ pub fn run() {
             commands::azure::az_enable_auto_merge,
             commands::azure::az_disable_auto_merge,
             commands::azure::az_pr_ready,
+            commands::azure::az_pr_edit,
             commands::azure::az_checkout_pr,
             commands::azure::az_pr_comments,
             commands::azure::az_pr_create_comment,
@@ -876,6 +1193,7 @@ pub fn run() {
             commands::read::git_file_log,
             commands::read::git_file_log_pickaxe,
             commands::read::git_file_log_range,
+            commands::read::git_file_diff,
             commands::read::git_blame,
             commands::ops::git_checkout_commit,
             commands::ops::git_reset_to_commit,
@@ -900,13 +1218,16 @@ pub fn run() {
             commands::ops::pr_files,
             commands::ai::detect_codex_cli,
             commands::ai::codex_cli_prompt,
+            commands::ai::codex_list_models,
             commands::ai::detect_opencode_cli,
             commands::ai::opencode_cli_prompt,
             commands::ai::opencode_list_models,
             commands::ai::detect_copilot_cli,
             commands::ai::copilot_cli_prompt,
+            commands::ai::copilot_list_models,
             commands::ai::detect_antigravity_cli,
             commands::ai::antigravity_cli_prompt,
+            commands::ai::antigravity_list_models,
             commands::network::check_remote_reachable,
             commands::gitlab::detect_glab,
             commands::gitlab::gl_list_mrs,
@@ -923,6 +1244,7 @@ pub fn run() {
             commands::gitlab::gl_disable_auto_merge,
             commands::gitlab::gl_checkout_mr,
             commands::gitlab::gl_convert_draft_to_ready,
+            commands::gitlab::gl_mr_edit,
             commands::gitlab::gl_mr_notes,
             commands::gitlab::gl_mr_create_note,
             commands::gitlab::gl_mr_update_note,
@@ -942,6 +1264,15 @@ pub fn run() {
             commands::credentials::set_credential,
             commands::credentials::get_credential,
             commands::credentials::delete_credential,
+            commands::ai_http::ai_api_key_set,
+            commands::ai_http::ai_api_key_hint,
+            commands::ai_http::ai_allowed_endpoints,
+            commands::ai_http::ai_revoke_endpoint,
+            commands::ai_http::ai_http_request,
+            commands::telemetry::telemetry_get_state,
+            commands::telemetry::telemetry_set_enabled,
+            commands::render_fallback::software_rendering_get_state,
+            commands::render_fallback::software_rendering_set_enabled,
             // ── Bitbucket Cloud REST v2 ──
             commands::bitbucket::bb_list_prs,
             commands::bitbucket::bb_list_issues,
@@ -964,6 +1295,7 @@ pub fn run() {
             commands::bitbucket::bb_pr_ci_checks,
             commands::bitbucket::bb_pr_annotations,
             commands::bitbucket::bb_convert_draft_to_ready,
+            commands::bitbucket::bb_pr_edit,
             commands::gitea::gitea_current_user,
             commands::gitea::gitea_validate_token,
             commands::gitea::gitea_list_prs,
@@ -984,6 +1316,7 @@ pub fn run() {
             commands::gitea::gitea_merge_pr,
             commands::gitea::gitea_checkout_pr,
             commands::gitea::gitea_convert_draft_to_ready,
+            commands::gitea::gitea_pr_edit,
             // ── MCP catalog ──
             commands::mcp_catalog::mcp_detect_configs,
             commands::mcp_catalog::mcp_read_config,
@@ -995,8 +1328,10 @@ pub fn run() {
             commands::read::git_branch_merged,
             commands::read::git_config_identity,
             commands::read::git_commit_template_path,
+            commands::read::read_commit_template,
             // ── v2.21.0 Monorepo Scope ──
             commands::read::git_rev_count,
+            commands::read::git_refs_fingerprint,
             commands::terminal::terminal_open,
             commands::terminal::terminal_write,
             commands::terminal::terminal_resize,
@@ -1014,6 +1349,10 @@ pub fn run() {
         .on_page_load(|webview, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 commands::watcher::stop_all_for_webview(webview.label());
+            }
+            // The webview came up: this launch got past the EGL abort.
+            if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                commands::render_fallback::launch_succeeded();
             }
         })
         .on_window_event(|window, event| {
@@ -1522,6 +1861,108 @@ mod command_parity_tests {
             err.contains("git_not_a_command"),
             "error names the command: {err}"
         );
+    }
+
+    /// Reaches the command: it answers Ok, or the command's own error,
+    /// which must contain `expected` (never an argument-parsing error).
+    fn assert_reaches_command(
+        r: Result<serde_json::Value, String>,
+        what: &str,
+        expected: Option<&str>,
+    ) {
+        match (r, expected) {
+            (Ok(_), None) => {}
+            (Ok(v), Some(want)) => {
+                panic!("{what}: expected the command to err with {want:?}, got {v}")
+            }
+            (Err(e), want) => {
+                assert!(
+                    !e.contains("missing required arg") && !e.contains("invalid arg"),
+                    "{what}: argument parsing failed: {e}"
+                );
+                let want = want.unwrap_or_else(|| panic!("{what}: unexpected error: {e}"));
+                assert!(e.contains(want), "{what}: {e:?} does not contain {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn stack_arms_parse_their_arguments_and_reach_the_command() {
+        let repo = crate::worktree::test_support::TempRepo::new();
+        let cwd = repo.path.to_str().unwrap();
+        let sha = "0".repeat(40);
+        let r = command_parity(
+            "stack_status".into(),
+            serde_json::json!({
+                "cwd": cwd,
+                "trunk": "main",
+                "mergedParents": [{ "branch": "a", "number": 7, "head_ref_oid": sha }],
+            }),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let r = command_parity(
+            "git_restack".into(),
+            serde_json::json!({
+                "cwd": cwd,
+                "branch": "nope",
+                "mergedParents": [],
+                "previewed": {
+                    "onto_sha": sha, "upstream_sha": sha, "top_sha": sha, "moving": ["nope"],
+                },
+            }),
+        );
+        assert_reaches_command(r, "git_restack", Some("not a stacked branch: nope"));
+        let r = command_parity(
+            "stack_restack_plan".into(),
+            serde_json::json!({ "cwd": cwd, "branch": "nope" }),
+        );
+        assert_reaches_command(r, "stack_restack_plan", Some("not a stacked branch: nope"));
+        let r = command_parity(
+            "stack_set_parent".into(),
+            serde_json::json!({ "cwd": cwd, "branch": "x", "parent": "y" }),
+        );
+        assert_reaches_command(r, "stack_set_parent", Some("Unknown local branch: x"));
+        let r = command_parity(
+            "stack_unset".into(),
+            serde_json::json!({ "cwd": cwd, "branch": "x" }),
+        );
+        assert_reaches_command(r, "stack_unset", None);
+        let r = command_parity(
+            "stack_delete_merged_parent".into(),
+            serde_json::json!({ "cwd": cwd, "branch": "gone", "tip": "a".repeat(40) }),
+        );
+        assert_reaches_command(
+            r,
+            "stack_delete_merged_parent",
+            Some("gone changed since the restack: not deleted"),
+        );
+        let r = command_parity(
+            "preview_restack".into(),
+            serde_json::json!({ "cwd": cwd, "onto": "main", "upstream": "main", "branch": "main" }),
+        );
+        assert_reaches_command(r, "preview_restack", None);
+        let bad = command_parity(
+            "stack_status".into(),
+            serde_json::json!({ "cwd": cwd, "mergedParents": "oops" }),
+        );
+        assert!(bad.unwrap_err().contains("mergedParents"));
+    }
+
+    #[test]
+    fn command_parity_knows_the_stack_commands() {
+        for c in [
+            "stack_status",
+            "stack_set_parent",
+            "stack_unset",
+            "stack_delete_merged_parent",
+            "stack_restack_plan",
+            "git_restack",
+            "preview_restack",
+            "git_push_branch",
+        ] {
+            let err = command_parity(c.into(), serde_json::json!({})).unwrap_err();
+            assert!(!err.contains("does not know"), "{c}: {err}");
+        }
     }
 
     #[test]

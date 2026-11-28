@@ -12,15 +12,19 @@
  */
 import { computed, inject, nextTick, onMounted, ref, useTemplateRef, watch } from "vue";
 import { PR_PANEL_KEY, type PrPanelState } from "../composables/usePrPanel";
-import { renderMarkdown, safeHtml } from "../composables/useSafeHtml";
+import { renderMarkdown, safeHtml, hasBlockedRemoteImages } from "../composables/useSafeHtml";
+import RemoteImagesNotice from "./RemoteImagesNotice.vue";
 import { getGitShortlog, type GitBranch, type ReviewerCandidate } from "../utils/backend";
 import { forgeForRepo } from "../composables/forge/useForge";
 import Avatar from "./Avatar.vue";
 import { useI18n } from "../composables/useI18n";
 import { useAIProvider } from "../composables/useAIProvider";
 import { usePrDescription } from "../composables/usePrDescription";
-import { loadSettings } from "../composables/useSettings";
+import { getTemplateLang, useAiTemplates } from "../composables/useAiTemplates";
 import AiSparkle from "./AiSparkle.vue";
+import AiTemplateMenu from "./AiTemplateMenu.vue";
+import AiContextButton from "./AiContextButton.vue";
+import { getAiExtraContext } from "../composables/useAiExtraContext";
 
 const props = defineProps<{
   currentBranch: string;
@@ -31,28 +35,41 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: "cancel"): void }>();
 
 const p = inject<PrPanelState>(PR_PANEL_KEY)!;
-const { t, locale } = useI18n();
+const { t } = useI18n();
 const ai = useAIProvider();
-const { isGenerating: isGeneratingPrDescription, generate: generatePrDescription } = usePrDescription();
-const aiPrError = ref<string | null>(null);
+const {
+  isGenerating: isGeneratingPrDescription,
+  lastError: aiPrError,
+  generate: generatePrDescription,
+} = usePrDescription();
+// Active AI template (picked from the AI split button), shown on the button.
+const { activeTemplate: activePrTemplate } = useAiTemplates("pr", () => props.cwd);
+
+/** Extra-context scope of the "ctx" segment (see useAiExtraContext). */
+const AI_CTX_SCOPE = "pr-create";
 
 async function generateWithAI() {
-  aiPrError.value = null;
   const hasContent = p.newPrTitle.value.trim() || p.newPrBody.value.trim();
   if (hasContent && !confirm(t("pr.create.aiReplaceConfirm"))) return;
+  // Write through `p` (App-level state), never through this instance: the
+  // view may have unmounted by the time the model answers, and the result
+  // must still land in the form when the user comes back. Dropped if the
+  // user switched repo meanwhile.
+  const cwd = props.cwd;
   try {
-    // PR language: "english" (default) forces English; "ui" follows the app locale.
-    const prLang = loadSettings().prAiLanguage === "ui" ? locale.value : "en";
+    // PR language: picked for this repo, else the Settings default.
+    const prLang = getTemplateLang("pr", cwd);
     const result = await generatePrDescription(
-      props.cwd,
+      cwd,
       props.currentBranch,
       p.newPrBase.value,
-      { locale: prLang },
+      { locale: prLang, extraContext: getAiExtraContext(AI_CTX_SCOPE, cwd) },
     );
+    if (p.cwd.value !== cwd) return;
     if (result.title) p.newPrTitle.value = result.title;
     if (result.body) p.newPrBody.value = result.body;
-  } catch (err: any) {
-    aiPrError.value = err?.message ?? String(err);
+  } catch {
+    // lastError is set by the composable and survives navigation.
   }
 }
 
@@ -269,16 +286,22 @@ function insertCodeBlock() {
 
 // ─── Markdown preview ───────────────────────────────────
 // Markdown rendering is delegated to the shared `useSafeHtml` composable
-// (markdown-it + DOMPurify). We only add the component-specific empty
+// (`utils/markdown.ts` + DOMPurify). We only add the component-specific empty
 // state here. The rendered HTML is fed to `v-html` via `safeHtml()`,
 // which also re-sanitizes for defense in depth.
+// Remote images in the preview wait for "Show images", like a PR's
+// description; the choice lasts while this view is open.
+const previewImagesShown = ref(false);
 const bodyPreview = computed(() => {
   const src = p.newPrBody.value;
   if (!src.trim()) {
     return `<p class="pcv-preview-empty">${t("pr.create.previewEmpty")}</p>`;
   }
-  return renderMarkdown(src);
+  return safeHtml(renderMarkdown(src, { allowRemoteImages: previewImagesShown.value }), {
+    allowRemoteImages: previewImagesShown.value,
+  });
 });
+const previewImagesBlocked = computed(() => hasBlockedRemoteImages(bodyPreview.value));
 
 // ─── Validation ─────────────────────────────────────────
 const canSubmit = computed(
@@ -362,20 +385,39 @@ async function rankByActivity(cwd: string, candidates: ReviewerCandidate[]): Pro
     .sort((a, b) => score(b) - score(a) || a.login.localeCompare(b.login));
 }
 
-onMounted(async () => {
+/** Candidates from the repo the PR will be created in: on a fork, the target
+ *  picked above (the fork or its parent) — reviewers are requested there. */
+let candidatesSeq = 0;
+async function loadReviewerCandidates() {
   if (!props.cwd) return;
+  const seq = ++candidatesSeq;
+  // `createPr` creates on origin when no target is picked: so do these
+  // ("origin" names it when its `owner/name` is not known).
+  const target = p.newPrBaseRepo.value.trim() || p.forkInfo.value?.origin || "origin";
   reviewerCandidatesLoading.value = true;
   try {
     const provider = await forgeForRepo(props.cwd);
-    const candidates = await provider.listReviewerCandidates(props.cwd);
-    reviewerCandidates.value = await rankByActivity(props.cwd, candidates);
+    const candidates = await provider.listReviewerCandidates(props.cwd, target);
+    const ranked = await rankByActivity(props.cwd, candidates);
+    if (seq === candidatesSeq) {
+      reviewerCandidates.value = ranked;
+      // Reviewers picked from the previous target's assignees cannot be
+      // requested on this one (the request is best effort and would drop
+      // them silently): keep only those the new target offers.
+      if (ranked.length > 0) {
+        const logins = new Set(ranked.map((c) => c.login.toLowerCase()));
+        p.newPrReviewers.value = p.newPrReviewers.value.filter((r) => logins.has(r.toLowerCase()));
+      }
+    }
   } catch {
     // Silently ignore — autocomplete is optional, manual typing still works.
-    reviewerCandidates.value = [];
+    if (seq === candidatesSeq) reviewerCandidates.value = [];
   } finally {
-    reviewerCandidatesLoading.value = false;
+    if (seq === candidatesSeq) reviewerCandidatesLoading.value = false;
   }
-});
+}
+onMounted(loadReviewerCandidates);
+watch(() => p.newPrBaseRepo.value, () => void loadReviewerCandidates());
 
 const filteredCandidates = computed<ReviewerCandidate[]>(() => {
   const q = reviewerInput.value.trim().replace(/^@/, "").toLowerCase();
@@ -564,23 +606,37 @@ function removeReviewer(name: string) {
       <section class="pcv-section">
         <div class="pcv-label-row">
           <label class="pcv-label" for="pcv-title-input">{{ t("pr.create.titleLabel") }}</label>
-          <button
-            v-if="ai.isAvailable.value"
-            type="button"
-            class="btn btn--ai pcv-ai-btn"
-            :disabled="isGeneratingPrDescription || baseIsSameAsHead"
-            :title="t('pr.create.aiHint')"
-            @click="generateWithAI"
-          >
-            <span v-if="isGeneratingPrDescription" class="pcv-ai-label">
-              <span class="pcv-spinner pcv-spinner--sm" aria-hidden="true"></span>
-              {{ t('pr.create.aiGenerating') }}
-            </span>
-            <span v-else class="pcv-ai-label">
-              <AiSparkle :size="13" />
-              {{ t('pr.create.aiGenerate') }}
-            </span>
-          </button>
+          <div v-if="ai.isAvailable.value" class="pcv-ai-split ai-split">
+            <button
+              type="button"
+              class="btn btn--ai pcv-ai-btn"
+              :disabled="isGeneratingPrDescription || baseIsSameAsHead"
+              v-tooltip="t('pr.create.aiHint')"
+              @click="generateWithAI"
+            >
+              <span v-if="isGeneratingPrDescription" class="pcv-ai-label ai-loading">
+                <span class="pcv-spinner pcv-spinner--sm" aria-hidden="true"></span>
+                {{ t('pr.create.aiGenerating') }}
+              </span>
+              <span v-else class="pcv-ai-label">
+                <AiSparkle :size="13" />
+                {{ t('pr.create.aiGenerate') }}
+                <span v-if="activePrTemplate" class="pcv-ai-active-tpl">· {{ activePrTemplate.name }}</span>
+              </span>
+            </button>
+            <AiContextButton
+              :scope="AI_CTX_SCOPE"
+              :cwd="cwd"
+              :disabled="isGeneratingPrDescription"
+              button-class="btn btn--ai"
+            />
+            <AiTemplateMenu
+              kind="pr"
+              :cwd="cwd"
+              :disabled="isGeneratingPrDescription"
+              chevron-class="btn btn--ai pcv-ai-chevron"
+            />
+          </div>
         </div>
         <input
           id="pcv-title-input"
@@ -667,10 +723,14 @@ function removeReviewer(name: string) {
           />
 
           <!-- Preview -->
+          <RemoteImagesNotice
+            v-if="editorTab === 'preview' && previewImagesBlocked"
+            @allow="previewImagesShown = true"
+          />
           <div
             v-show="editorTab === 'preview'"
             class="pcv-preview"
-            v-html="safeHtml(bodyPreview)"
+            v-html="bodyPreview"
           />
         </div>
         <p class="pcv-hint">{{ t("pr.create.bodyHint") }}</p>
@@ -1179,19 +1239,33 @@ function removeReviewer(name: string) {
 }
 
 /* ─── AI generate button (matches dashboard .panel-link-ai) ─────────────── */
-.btn.btn--ai.pcv-ai-btn {
-  min-height: 26px;
-  padding: 4px 12px;
+/* AI split button: frame, seams, radii and the ctx segment come from
+   .ai-split in main.css. One rule sizes every segment, including the ctx
+   (AiContextButton) and chevron (AiTemplateMenu) ones. */
+.pcv-ai-split {
+  margin-left: auto;
+}
+.pcv-ai-split > :deep(.btn.btn--ai) {
+  min-height: 24px;
+  padding-top: 3px;
+  padding-bottom: 3px;
   font-size: var(--font-size-sm);
-  border-radius: var(--radius-sm);
   color: var(--color-text);
 }
-.btn.btn--ai.pcv-ai-btn:hover:not(:disabled) {
-  color: var(--color-ai-text);
-  transform: none;
-  background:
-    linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-hover) 100%) padding-box,
-    linear-gradient(135deg, var(--color-accent) 0%, #c084fc 50%, var(--color-accent) 100%) border-box;
+.btn.btn--ai.pcv-ai-btn {
+  padding-left: 12px;
+  padding-right: 12px;
+}
+.pcv-ai-split :deep(.btn.btn--ai.pcv-ai-chevron) {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.pcv-ai-active-tpl {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.7;
 }
 .pcv-spinner--sm {
   width: 10px;

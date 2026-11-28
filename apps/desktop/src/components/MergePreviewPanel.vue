@@ -15,7 +15,7 @@
   <div v-else-if="summary" class="preview-panel">
 
     <!-- Operation selector (merge / rebase / cherry-pick) -->
-    <div class="preview-ops" role="tablist" :aria-label="t('mergePreview.operationLabel')">
+    <div v-if="!embedded" class="preview-ops" role="tablist" :aria-label="t('mergePreview.operationLabel')">
       <button
         v-for="op in OPERATIONS"
         :key="op"
@@ -48,20 +48,20 @@
         :title="t('mergePreview.aiRiskHint')"
         @click="requestMergeRisk"
       >
-        <span v-if="isMergeRiskAssessing">… {{ t('mergePreview.aiRiskAnalyzing') }}</span>
+        <span v-if="isMergeRiskAssessing" class="ai-loading">{{ t('mergePreview.aiRiskAnalyzing') }}</span>
         <span v-else class="preview-ai-label">
           <AiSparkle :size="14" />
           {{ t('mergePreview.aiRisk') }}
         </span>
       </button>
-      <button class="preview-close" @click="$emit('close')">✕</button>
+      <button v-if="!embedded" class="preview-close" @click="$emit('close')">✕</button>
     </div>
 
     <!-- AI risk assessment panel -->
     <div v-if="riskOpen" class="preview-risk" role="status" aria-live="polite">
       <div class="preview-risk-body">
         <span v-if="mergeRiskError" class="preview-risk-error">{{ mergeRiskError }}</span>
-        <span v-else-if="isMergeRiskAssessing && !riskText">{{ t('mergePreview.aiRiskAnalyzing') }}</span>
+        <span v-else-if="isMergeRiskAssessing && !riskText" class="ai-loading">{{ t('mergePreview.aiRiskAnalyzing') }}</span>
         <span v-else>{{ riskText }}</span>
       </div>
       <button v-if="!isMergeRiskAssessing" class="preview-risk-close" @click="dismissRisk">✕</button>
@@ -79,8 +79,16 @@
         {{ summary.manualFiles }} {{ t('mergePreview.manual') }}
       </span>
       <span v-if="summary.cleanFiles > 0" class="stat stat--clean">
-        {{ summary.cleanFiles }} {{ t('mergePreview.clean') }}
+        {{ summary.cleanFiles }} {{ summary.cleanFiles === 1 ? t('mergePreview.cleanOne') : t('mergePreview.clean') }}
       </span>
+    </div>
+
+    <!-- v3.14 — branches a restack will move (absent for merge/rebase) -->
+    <div v-if="movingRefs && movingRefs.length > 0" class="preview-moving">
+      <div class="preview-moving__title">{{ t('stacks.preview.moving') }}</div>
+      <div v-for="m in movingRefs" :key="m.branch" class="preview-moving__row mono">
+        {{ m.branch }}<span v-if="!m.inStack" class="preview-moving__note"> {{ t('stacks.preview.notInStack') }}</span>
+      </div>
     </div>
 
     <!-- Per-file list (conflicting files only) -->
@@ -123,7 +131,7 @@
             :key="i"
             class="preview-hunk"
             :class="hunkClass(h)"
-            :title="`${h.confidenceScore}% (${h.confidenceLabel}) — ${h.reason}`"
+            :title="hunkTitle(h)"
           >
             <!-- A bar, not a number: the score is only actionable on the rows
                  the bar is holding back, and those show it below. -->
@@ -176,7 +184,9 @@
     </div>
 
     <!-- ─── Apply from preview (v3.11.0) ─────────────────── -->
-    <div v-if="summary.conflictingFiles > 0" class="preview-apply">
+    <!-- In the merge-back dialog a clean preview still needs its button:
+         the dialog has no other way to run the operation. -->
+    <div v-if="summary.conflictingFiles > 0 || embedded" class="preview-apply">
       <button
         type="button"
         class="btn btn--primary preview-apply__btn"
@@ -184,12 +194,13 @@
         @click="emit('apply')"
       >
         <span v-if="props.applying">… {{ t('mergePreview.applying') }}</span>
-        <span v-else>{{ t('mergePreview.applyAndMerge') }}</span>
+        <span v-else-if="summary.conflictingFiles > 0">{{ t('mergePreview.applyAndMerge') }}</span>
+        <span v-else>{{ t('mergePreview.applyClean') }}</span>
       </button>
       <!-- "Estimated" is load-bearing: the simulation and the real operation
            use different merge algorithms and can see a different file set, so
            this number is a prediction, not a promise. -->
-      <span class="preview-apply__estimate">
+      <span v-if="summary.conflictingFiles > 0" class="preview-apply__estimate">
         {{ t('mergePreview.applyEstimate',
               String(estimatedAutoResolutions),
               String(estimatedAutoResolutions + heldByThreshold + manualHunks)) }}
@@ -204,7 +215,7 @@
     />
 
     <!-- ─── Scratch worktree (v2.20.0) ───────────────────── -->
-    <div v-if="summary.conflictingFiles > 0" class="preview-scratch">
+    <div v-if="summary.conflictingFiles > 0 && !embedded" class="preview-scratch">
       <!-- Error from the last scratch operation -->
       <div v-if="scratchError" class="preview-scratch-error" role="alert">
         {{ scratchError }}
@@ -255,6 +266,7 @@ import type { MergePreviewSummary, PreviewFileResult, PreviewFileStatus, Preview
 import type { ScratchWorktree } from "../utils/backend.js";
 import { useAIProvider } from "../composables/useAIProvider.js";
 import { useMergeRisk } from "../composables/useMergeRisk.js";
+import { hunkExplanation } from "../utils/hunkExplanation";
 import AiSparkle from "./AiSparkle.vue";
 import MergeApplyReport from "./MergeApplyReport.vue";
 import type { ApplyOutcome } from "../composables/useApplyFromPreview.js";
@@ -264,6 +276,8 @@ const props = defineProps<{
   error: string | null;
   summary: MergePreviewSummary | null;
   conflictingFiles: PreviewFileResult[];
+  /** v3.14 restack — branches the operation will move; omitted for merge/rebase. */
+  movingRefs?: { branch: string; inStack: boolean }[];
   /** Risk level derived by useMergePreview (low / medium / high). */
   riskLevel?: RiskLevel;
   /** Operation currently simulated (merge / rebase / cherry-pick). */
@@ -288,7 +302,27 @@ const props = defineProps<{
   applying?: boolean;
   /** v3.11 — what the last apply did, if one has run. */
   applyOutcome?: ApplyOutcome | null;
+  /**
+   * v3.13 — inside the merge-back dialog, which fixes the operation and
+   * the checkout: no operation tabs, no scratch worktree, no close button.
+   */
+  embedded?: boolean;
 }>();
+
+/**
+ * A hunk's tooltip. In English, core's reason (as before). In another
+ * language, the explanation translated, then core's reason when it says more
+ * (the side a policy took, a convention note, why a hunk is manual: a guard,
+ * a retraction…), which is English audit text.
+ */
+function hunkTitle(h: PreviewHunk): string {
+  const score = `${h.confidenceScore}% (${h.confidenceLabel})`;
+  if (h.messageKey) return `${score} — ${t(h.messageKey)}`;
+  // English: core's reason alone, as before (the explanation would say it twice).
+  if (locale.value === "en") return `${score} — ${h.reason || h.explanation}`;
+  const head = `${score} — ${hunkExplanation(h)}`;
+  return !h.reason || h.reason === h.explanation ? head : `${head}\n${h.reason}`;
+}
 
 const emit = defineEmits<{
   close: [];
@@ -631,6 +665,12 @@ function basename(path: string): string {
 .stat--auto     { background: var(--color-info-soft); color: var(--color-info); }
 .stat--manual   { background: var(--color-warning-soft); color: var(--color-warning); }
 .stat--clean    { background: var(--color-success-soft); color: var(--color-success); }
+
+/* Restack: branches that will move */
+.preview-moving { display: flex; flex-direction: column; gap: 2px; }
+.preview-moving__title { font-size: 11px; color: var(--text-muted); }
+.preview-moving__row { font-size: 12px; }
+.preview-moving__note { color: var(--text-muted); }
 
 /* File list */
 .preview-files {

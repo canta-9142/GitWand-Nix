@@ -77,7 +77,7 @@ pub struct GitStatus {
 
 // ─── Diff types ────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct DiffLine {
     pub r#type: String,
     pub content: String,
@@ -85,7 +85,7 @@ pub struct DiffLine {
     pub new_line_no: Option<i32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct DiffHunk {
     pub header: String,
     pub old_start: i32,
@@ -95,7 +95,7 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct GitDiff {
     pub path: String,
     pub hunks: Vec<DiffHunk>,
@@ -118,6 +118,100 @@ pub struct GitDiff {
     /// panel rather than a file list that leads nowhere.
     #[serde(skip_serializing_if = "Option::is_none", rename = "nestedRepo")]
     pub nested_repo: Option<bool>,
+    /// `Some(true)` when git printed `Binary files … differ` for the file:
+    /// its content changed in a way no hunk describes. Set by
+    /// `parse_multi_file_diff_capped` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<bool>,
+}
+
+// ─── Combined diff ─────────────────────────────────────────────────
+// Built by `git_combined_diff` (`combined/replay.rs`).
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CombinedCommit {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    /// Author date, strict ISO 8601 (`%aI`).
+    pub date: String,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CombinedFallbackCommitDiff {
+    pub hash: String,
+    pub diff: GitDiff,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CombinedFallbackFile {
+    pub path: String,
+    /// `merge-tree` reported this path conflicted (or it is the other half
+    /// of a rename pair with such a path). `false` for a companion that
+    /// falls back conservatively (touched by the conflicted commit, carried
+    /// by a rename, or under a `merge` attribute driver).
+    pub conflicted: bool,
+    pub per_commit: Vec<CombinedFallbackCommitDiff>,
+    pub blockers: Vec<String>,
+}
+
+/// One commit of a file's `--follow` history (`git_file_lineage`): its hash
+/// and the file's name there (`None` for a merge, which names nothing).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileLineageEntry {
+    pub hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CombinedDiff {
+    pub base: Option<String>,
+    pub commits: Vec<CombinedCommit>,
+    pub diffs: Vec<GitDiff>,
+    pub steps: Vec<Vec<GitDiff>>,
+    pub fallback: Vec<CombinedFallbackFile>,
+    /// The total payload budget (`combined/budget.rs`) cut something: step
+    /// entries of some files (no attribution for them) and/or entries made
+    /// header-only.
+    pub truncated: bool,
+    /// The entries the budget made header-only (sorted, unique): their
+    /// `truncated_from_bytes` is an estimated payload weight, not a file
+    /// size over the per-file cap.
+    pub budget_omitted: Vec<CombinedBudgetOmitted>,
+}
+
+/// One entry made header-only by the payload budget: a net entry
+/// (`commit: None`) or the per-commit fallback section of `commit` — one
+/// path can have both, and only some of them cut. Sorted by path, then net
+/// entry first, then commit hash.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct CombinedBudgetOmitted {
+    pub path: String,
+    pub commit: Option<String>,
+}
+
+// ─── Branch PR lookup ──────────────────────────────────────────────
+
+/// A branch's GitHub PR, as the stacked-branches feature needs it: the base it
+/// targets, the head commit (the parent's old tip once merged) and when it
+/// merged. Consumed by `gh_branch_pr`.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct BranchPr {
+    pub number: i64,
+    pub base: String,
+    pub head_ref_oid: String,
+    pub merged_at: Option<String>,
+    pub url: String,
+    /// The merge commit on the base, once merged (`None` for an open PR).
+    pub merge_commit_oid: Option<String>,
 }
 
 // ─── Git log types ─────────────────────────────────────────────────
@@ -194,6 +288,31 @@ pub struct RepoTreeResult {
     pub truncated: bool,
 }
 
+// ─── One working-tree directory (Files view, v3.11.2) ─────────────
+
+/// One entry of `list_repo_dir`. `path` is repo-relative with `/` separators.
+/// `ignored` means "matched by an ignore rule and not tracked". `size` is the
+/// byte length for files, and 0 for directories and symlinks, which are never
+/// followed. The preview reads it to refuse a huge file without reading it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoDirEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: String, // "file" | "dir" | "symlink"
+    pub ignored: bool,
+    pub size: u64,
+}
+
+/// Result of `list_repo_dir`. `truncated` is set when the directory had more
+/// than `MAX_REPO_DIR_ENTRIES` listable entries.
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoDirListing {
+    pub entries: Vec<RepoDirEntry>,
+    pub truncated: bool,
+}
+
 // ─── Directory listing types ──────────────────────────────────────
 
 #[derive(Serialize)]
@@ -227,6 +346,10 @@ pub struct GitPushPullResult {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflicts: Option<bool>,
+    /// Fetch only: whether any ref moved. `None` when it could not be told,
+    /// which callers treat as "maybe" (#287).
+    #[serde(rename = "refsChanged", skip_serializing_if = "Option::is_none")]
+    pub refs_changed: Option<bool>,
 }
 
 // ─── Repo operation state ──────────────────────────────────────────
@@ -240,6 +363,47 @@ pub struct RepoOperationState {
     pub target_branch: Option<String>,
     pub step: u32,
     pub total: u32,
+}
+
+/// A bisect in progress (`commands::bisect`).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BisectStatus {
+    /// A bisect is in progress (`BISECT_LOG`); false once it has ended, with
+    /// every other field empty.
+    pub active: bool,
+    /// HEAD (BISECT_HEAD for `--no-checkout`), the commit under test.
+    pub current: Option<String>,
+    /// What `git bisect reset` returns to (`BISECT_START`).
+    pub start: Option<String>,
+    pub bad: Option<String>,
+    pub good: Vec<String>,
+    pub skipped: Vec<String>,
+    /// `bisect_nr` / `bisect_steps`, once a bad and a good commit are known.
+    pub remaining: Option<u32>,
+    pub steps: Option<u32>,
+    /// Set once git cannot narrow further: one hash is the first bad commit,
+    /// several are left by skips.
+    pub candidates: Vec<String>,
+    /// (bad term, good term).
+    pub terms: (String, String),
+    /// Subject, author and date of the commit under test and the candidates.
+    pub commits: Vec<BisectCommit>,
+    /// HEAD is a commit already marked while git still has commits to test:
+    /// the last mark was recorded but git could not check out the next one
+    /// (uncommitted changes in the way). `next` moves on.
+    pub pending_checkout: bool,
+}
+
+/// A commit the bisect banner describes.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BisectCommit {
+    pub hash: String,
+    pub subject: String,
+    pub author: String,
+    /// Author date, ISO 8601.
+    pub date: String,
 }
 
 // ─── Git branch ────────────────────────────────────────────────────
@@ -274,6 +438,12 @@ pub struct BlameLine {
 
 #[derive(Serialize)]
 pub struct FileLogEntry {
+    /// The file's path at this commit, repo-root-relative, as `git log
+    /// --follow --name-only` reports it: the old name before a rename.
+    /// Only the `--follow` logs (`git_file_log`, `git_file_log_pickaxe`) set
+    /// it; omitted elsewhere, so existing payloads are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub hash_full: String,
     pub hash: String,
     pub author: String,
@@ -658,6 +828,10 @@ pub struct CICheck {
     pub state: String,
     pub conclusion: String,
     pub details_url: String,
+    /// The commit this check ran on, or "" when the forge does not say. After
+    /// a push, the frontend compares it to the PR's head to tell the previous
+    /// commit's checks from the new one's.
+    pub commit_sha: String,
 }
 
 // ─── CI Annotation (v2.18) ─────────────────────────────────────────
@@ -727,6 +901,15 @@ pub struct ScratchWorktree {
     pub created_at: u64,
 }
 
+/// Outcome of a successful merge-back: the task's changes are in the main
+/// checkout. Removing the scratch afterwards is best-effort; when it fails
+/// (locked worktree, Windows file lock) the merge still stands and the
+/// failure is reported here instead of as an error.
+#[derive(Serialize, Clone, Debug)]
+pub struct ScratchMergeBackOutcome {
+    pub cleanup_warning: Option<String>,
+}
+
 // ─── Claude CLI ────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -785,6 +968,23 @@ pub struct AntigravityCliInfo {
     pub logged_in: bool,
     pub status: String,
     pub detail: String,
+}
+
+/// One entry of `agy models`: the `--model` id and its human-readable name
+/// (e.g. `gemini-3.8-flash-high` / `Gemini 3.8 Flash (High)`).
+#[derive(Serialize)]
+pub struct AntigravityModel {
+    pub id: String,
+    pub name: String,
+}
+
+/// One entry of Codex's model catalog (`codex debug models`): the `--model`
+/// slug, its display name, and the reasoning efforts it accepts.
+#[derive(Serialize)]
+pub struct CodexModel {
+    pub id: String,
+    pub name: String,
+    pub efforts: Vec<String>,
 }
 
 // ─── Git hooks ─────────────────────────────────────────────────────

@@ -139,19 +139,61 @@ commit messages displayed as HTML, etc.) must be sanitized with `useSafeHtml.ts`
 
 ## Diff Parsing — Critical Gotcha
 
-When classifying lines in a git diff, detect context lines by checking for a
-leading space character.
+Classify hunk lines only inside a hunk body **bounded by the counts of its
+`@@ -a,b +c,d @@` header**, and classify them by their first character only.
 
 ```typescript
-// WRONG — empty strings pass this test and become phantom context lines
+// WRONG — unbounded: the empty strings that split("\n") leaves between
+// sections and after the last line pass this test and become phantom
+// context lines (then `git apply` rejects the rebuilt patch)
 if (!line.startsWith('\\')) { /* context line */ }
 
-// CORRECT
-if (line.startsWith(' ')) { /* context line */ }
+// WRONG — header filter applied inside a hunk: a removed `-- comment`
+// is the diff line `--- comment`, an added `++x` is `+++x`; both get dropped
+if (line.startsWith('---') || line.startsWith('+++')) continue;
+
+// CORRECT — use the shared hunk-body helpers
+const kind = classifyHunkLine(body, line); // "add" | "delete" | "context" | null
 ```
 
-This applies to both the TypeScript (`packages/core`) and Rust
-(`apps/desktop/src-tauri`) diff parsers. Both implementations must stay in sync.
+The rule, with strict per-side counts from the header:
+
+- `+` → add, while new-side lines remain; `-` → delete, while old-side lines
+  remain (whatever follows: `--- x` is content, not a header).
+- `' '` → context, while lines remain on **both** sides.
+- `""` → context under the same condition (both sides): that is how git
+  prints a blank context line with `diff.suppressBlankEmpty=true` (and how
+  some forges serve it).
+- anything else (`\ No newline at end of file`) is not a hunk line.
+
+A line whose side is used up is not a hunk line: a header that undercounts
+its body ends the hunk there, so a following `--- a/x` is read as a header
+(fail closed). Outside a body — before the first `@@`, after `diff --git`,
+or once the counts are exhausted — `---`/`+++` are file headers and `""` is
+ignored. The bound is what makes treating `""` as context safe; never accept
+`""` in an unbounded parser. A combined `@@@` hunk (`diff --cc`) has
+per-parent counts, is classified by first character only and stays open
+until the next `diff ` line.
+
+Shared implementations, which must stay in sync — do not write another parser:
+
+- **TypeScript**, `packages/core/src/hunk-body.ts` (`classifyHunkLine`,
+  `hunkBodyFromHeader`, `parseHunkHeader`, `noHunkBody`, and
+  `diffFileLineName` for the name on a `--- a/` / `+++ b/` line). Callers:
+  - core: `history/parse.ts` (`isPureMove`);
+  - CLI: `packages/cli/src/commands/scan.ts` (`extractStagedAddedLines`,
+    names through `diffFileLineName`);
+  - desktop frontend: `utils/unifiedDiff.ts` (`parseFileDiff` /
+    `parseUnifiedDiff`, used by PR and commit review and `PullRequestPanel.vue`),
+    `composables/useAbsorb.ts`, `composables/usePrSummary.ts`;
+  - `apps/desktop/dev-server.mjs`: `devParseDiffHunks` for `/api/git-diff`,
+    `/api/git-file-diff`, `/api/git-show`, and `/api/scan-secrets` directly
+    (core loaded once by `loadDevCore`, from `packages/core/dist`).
+- **Rust**, `HunkBody` / `parse_hunk_header` / `parse_diff_hunks` in
+  `apps/desktop/src-tauri/src/git/parse.rs`. Callers: `git_diff`, `git_show`
+  (`parse_multi_file_diff`) and `git_file_diff` in `commands/read.rs`;
+  `extract_staged_added_lines` in `commands/secrets.rs`;
+  `gl_diff_stats_from_files` in `commands/gitlab.rs`.
 
 ---
 
@@ -236,6 +278,22 @@ is a regression risk.
 
 GitWand supports 5 languages. Every user-visible string must have a key in all
 locale files.
+
+One exception: a native dialog the backend shows so that the webview cannot
+draw or answer it (`open_endpoint_prompt` in `commands/ai_http.rs`, the AI
+endpoint question and its refusal message) keeps its 5 translations in Rust.
+The frontend only passes the locale code, never the text. Keep them in step
+with the locale files when a language is added. Other backend error strings
+(the `Err` of a Rust command, shown as the error detail) stay in English, as
+they always have; this exception is only for text the backend shows itself.
+
+A second exception: the explanation of a conflict hunk (`explanationRef` from
+`@gitwand/core`) is translated in `locales/explain/<code>.ts`, one dictionary per
+non-English language typed `Record<ExplanationKey, string>` — English is core's own
+`explanation`. `utils/hunkExplanation.ts` loads them with a dynamic `import()`,
+one per language, so they stay out of the main bundle; never import them
+statically from code in the main chunk. A key core adds does not compile until
+each dictionary has it.
 
 | Code  | Language        |
 |-------|-----------------|

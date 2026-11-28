@@ -102,7 +102,60 @@ const BUDGETS = {
   // eagerly through `AppHeader.vue` → `BranchSelector.vue` (always-mounted
   // header). A v3.11 change added exactly that again and was made dynamic
   // before merge.
-  main_max_kb: 950,
+  //
+  // Raised to 960 for #301 part 4 (issue references in the commit message):
+  // the `#` suggestion logic runs on keystrokes in the always-mounted commit
+  // panel (RepoSidebar), so it is eager by nature; its list component and the
+  // created-issue notice were made lazy, which left main at 951 KB. 960 still
+  // catches the engine leak above (1085 KB) with ~125 KB to spare.
+  //
+  // Raised to 980 for v3.14 stacked branches: the branch badge, the banner,
+  // the restack dialog and the restack flow (fetch / plan / apply / retarget /
+  // push, `useStacksFlow.ts`) are lazy chunks; lazy badge + lazy restack flow
+  // left main at 976 KB (999,590 bytes). The remaining overrun predates this
+  // feature (post-#307 merges): the Task 13 review measured ~963 KB with all
+  // stack code removed.
+  // 980 still catches the engine leak above (1085 KB) with ~105 KB to spare.
+  //
+  // v3.15 combined diffs: main measured at 982 KB (1,005,828 bytes; en strings
+  // + wiring). Combined view, selection, summary and attribution code are all
+  // lazy chunks; main only carries the `getCombinedDiff` / `mapRawGitDiff`
+  // wrappers in backend.ts, the en `combined` strings and the App.vue wiring.
+  // Review pass 3 (word-order-safe file counts, the kept result dropped when
+  // the view closes, prune limited to the unfiltered log): measured at 984 KB
+  // (1,007,247 bytes). The selection code stays lazy (CombinedDiffView sets
+  // the range anchor, not App).
+  //
+  // Push/show reliability fix: main measured at 991 KB (1,014,780 bytes):
+  // the force-push decision (`useForcePush`, `forcePushTarget`, eager like
+  // the rest of the push path: fetch before judging, decided lease,
+  // double-click and tab/branch guards), the `patchDiffArgs` pins and the
+  // localized refusal messages (remote moved, destination unreadable).
+  //
+  // Guided bisect: main measured at 1,001 KB (1,024,757 bytes) once merged
+  // with #314 and #315 (999 KB on its own): the four bisect
+  // wrappers in backend.ts, `operationKinds` (with `movesBisect`),
+  // `bisectEndpoints`, the en `bisect` strings (with the translated refusals,
+  // `bisectError`), the Git Tree menu entries, `useBisectStart`
+  // (ancestry-ordered confirmation) and the App.vue wiring (the bisect poll
+  // while the watcher is down). The banner and `useBisectStatus` are a lazy
+  // chunk.
+  //
+  // 3.15.x lot A (Dockerfile and imports resolvers): main measured at
+  // 1,004 KB. `@gitwand/core` is bundled into main, and the two resolvers
+  // now merge deletions, comments, reorders and every import of a module
+  // three-way instead of falling back to the text engine.
+  //
+  // 3.15.x lot C (security & data safety): main measured at 1,006 KB: the
+  // image proxy rewrite (`imageProxy`, used by the eager Avatar and
+  // useSafeHtml), the PR edit overlay of #234 (usePrPanel), the en strings
+  // of the allowed AI endpoints and of the optional OpenAI-compatible key.
+  // After the lot C review: 1,008 KB (the PR edit overlay's read tracking,
+  // the image URL resolution in useSafeHtml, the local-network rule of the
+  // OpenAI-compatible provider).
+  // QA follow-ups (#323): 1,010 KB — the imports resolver's indentation,
+  // quote and comment handling (`@gitwand/core` is in the main chunk).
+  main_max_kb: 1011,
 
   // Largest chunk other than main — usually a panel or vendor chunk.
   // If > 500 KB, time to investigate (typically means a vendor lib leaked

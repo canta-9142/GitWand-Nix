@@ -10,12 +10,23 @@
 
 import { createServer } from "node:http";
 import { execSync, execFileSync, spawnSync, spawn } from "node:child_process";
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, unlinkSync, realpathSync, renameSync, mkdirSync, mkdtempSync, rmSync, copyFileSync, watch } from "node:fs";
-import { resolve, join, dirname, basename, sep, isAbsolute } from "node:path";
+import { readFileSync, writeFileSync, readdirSync, statSync, lstatSync, existsSync, unlinkSync, realpathSync, renameSync, mkdirSync, mkdtempSync, rmSync, copyFileSync, chmodSync, watch } from "node:fs";
+import { resolve, join, dirname, basename, sep, isAbsolute, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { Socket } from "node:net";
+import { createHash, randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { StringDecoder } from "node:string_decoder";
+import { isUtf8 } from "node:buffer";
+import { devTrustStatus, devTrustSet, mainWorktreeRoot } from "./dev-worktree-trust.mjs";
+import { devStopProcessesIn } from "./dev-worktree-processes.mjs";
+import { devResolveIssueTarget, devIssuePayload, devAssigneesFrom, devGithubError, devLabelsFrom, devMilestonesFrom, devCreateFailure, devGitwandReport, devTemplateFiles, MAY_HAVE_BEEN_CREATED } from "./dev-issues.mjs";
+import { resolveBin } from "./dev-bin.mjs";
+import { devForkParentNwo, devParseGhBranchPr } from "./dev-gh-branch-pr.mjs";
+import { devPrNumber } from "./dev-pr-repo.mjs";
+import { devGitRestack, devPushBlock, devStackDeleteMergedParent, devStackRestackPlan, devStackSetParent, devStackStatus, devStackUnset, devValidateBranchName } from "./dev-stack-service.mjs";
+import { devBisectMark, devBisectRepoState, devBisectReset, devBisectStart, devBisectStatus } from "./dev-bisect.mjs";
+import { devCreateWorktree, devMergeBackCheck, devMergeBackFastForward, devMergeBackPrepare, devMergeBackSquash, devReadSettings, devRemovePrepare, devRemoveWorktree, devResolveBase, devSetupSpawn, devUnlockWorktree, devWorktreeGuard, devWorktreesDir, devWorktreeUrl, devRestoreAsWorktree } from "./dev-worktree-service.mjs";
 const _require = createRequire(import.meta.url);
 // node-pty provides a real PTY in dev mode — proper echo, backspace, unbuffered
 // output, resize, and control sequences without any manual workarounds.
@@ -32,6 +43,24 @@ process.on("unhandledRejection", (reason) => {
 });
 
 /**
+ * Throw unless `cwd` lies inside a git working tree (it or an ancestor holds a
+ * `.git` entry). Mirrors `require_git_worktree` in `src-tauri/src/git/cmd.rs`,
+ * messages included: `/api/read-file` and `/api/write-file` refuse any other
+ * cwd, so `read-file { cwd: "/" }` no longer reads arbitrary files.
+ */
+function requireGitWorktree(cwd) {
+  let dir;
+  try { dir = realpathSync.native(cwd); }
+  catch (e) { throw new Error(`cwd does not resolve: ${e.message}`); }
+  for (;;) {
+    if (existsSync(join(dir, ".git"))) return;
+    const up = dirname(dir);
+    if (up === dir) throw new Error(`cwd is not inside a git working tree: ${cwd}`);
+    dir = up;
+  }
+}
+
+/**
  * Resolve `relPath` under `cwd`, ensuring the result stays inside the canonical
  * cwd. Mirrors the Rust `safe_repo_path` helper in `src-tauri/src/lib.rs` so
  * dev-server and the Tauri backend enforce the same boundary.
@@ -46,27 +75,75 @@ function safeRepoPath(cwd, relPath) {
 
   let cwdCanonical;
   try {
-    cwdCanonical = realpathSync(cwd);
+    // `.native`, like every resolution below: the JS `realpathSync` keeps the
+    // caller's spelling (letter case, NFC/NFD on macOS) while the native one
+    // returns the on-disk name, and mixing the two made every path an escape.
+    cwdCanonical = realpathSync.native(cwd);
   } catch (e) {
     throw new Error(`cwd does not resolve: ${e.message}`);
   }
 
-  const joined = join(cwdCanonical, relPath);
+  // Joined like Rust's `Path::join`: an absolute `relPath` replaces the root,
+  // and nothing is folded lexically. `path.resolve`/`join` would fold
+  // `linkdir/..` to the repo root, while the OS takes it to the parent of the
+  // link's TARGET, so the path is only ever resolved on the filesystem, with
+  // `realpathSync.native` (the JS `realpathSync` folds `..` first, too).
+  const joined = isAbsolute(relPath)
+    ? relPath
+    : cwdCanonical.endsWith(sep) ? cwdCanonical + relPath : cwdCanonical + sep + relPath;
 
-  // For writes the target file may not exist yet — canonicalize the parent
-  // and reassemble the final path.
+  // The path may not exist (a file about to be written, or one whose deletion
+  // is being diffed, possibly with its whole directory). Canonicalize the
+  // deepest ancestor that does exist and append the missing tail, which holds
+  // no symlink since none of it exists; it may only be plain names, never `..`.
+  // "Does not exist" means exactly that: a dangling, looping or unreadable
+  // symlink is a refusal, not a missing directory to skip. The last component
+  // alone may be a symlink that does not resolve (it is not followed here;
+  // `/api/write-file` checks for it). Mirrors the Rust helper, messages included.
   let resolved;
   try {
-    resolved = realpathSync(joined);
-  } catch {
-    const parent = dirname(joined);
-    let parentCanonical;
-    try {
-      parentCanonical = realpathSync(parent);
-    } catch (e) {
-      throw new Error(`parent path does not resolve: ${e.message}`);
+    resolved = realpathSync.native(joined);
+  } catch (err) {
+    const unresolvable = () =>
+      new Error(`path does not resolve: ${joined} (dangling, looping or unreadable component)`);
+    let leafIsSymlink = false;
+    try { leafIsSymlink = lstatSync(joined).isSymbolicLink(); } catch { /* not a symlink */ }
+    // ENOTDIR: a component on the way is a regular file (a deleted `secret/x`
+    // whose folder became a file `secret`); absent too, once the file is found
+    // to be a regular file and not a symlink. Mirrors Rust.
+    let belowAFile = isNotDir(joined, err);
+    if (!isAbsent(joined, err) && !belowAFile && !leafIsSymlink) throw unresolvable();
+
+    let ancestor = joined;
+    let base;
+    for (;;) {
+      const up = dirname(ancestor);
+      if (up === ancestor) throw new Error("path has no resolvable ancestor");
+      ancestor = up;
+      try {
+        base = realpathSync.native(ancestor);
+        break;
+      } catch (e) {
+        if (isNotDir(ancestor, e)) belowAFile = true;
+        else if (!isAbsent(ancestor, e)) throw unresolvable();
+      }
     }
-    resolved = join(parentCanonical, basename(joined));
+    if (belowAFile) {
+      let isFile = false;
+      try { isFile = lstatSync(ancestor).isFile(); } catch { /* not a file */ }
+      if (!isFile) throw unresolvable();
+    }
+    const segments = [];
+    for (const seg of joined.slice(ancestor.length).split(sep)) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") {
+        throw new Error(`path does not resolve: ${joined} (\`..\` below a missing directory)`);
+      }
+      segments.push(seg);
+    }
+    resolved = segments.length
+      ? (base.endsWith(sep) ? base : base + sep) + segments.join(sep)
+      : base;
   }
 
   if (resolved !== cwdCanonical && !resolved.startsWith(cwdCanonical + sep)) {
@@ -75,24 +152,89 @@ function safeRepoPath(cwd, relPath) {
   return resolved;
 }
 
-/** Resolve the full path to a CLI binary, checking Homebrew paths on macOS. */
-function resolveBin(name) {
-  // Try common macOS Homebrew locations first
-  const candidates = [
-    `/opt/homebrew/bin/${name}`,
-    `/usr/local/bin/${name}`,
-    `/usr/bin/${name}`,
-    name, // fallback: rely on PATH
-  ];
-  for (const c of candidates) {
-    try { if (existsSync(c)) return c; } catch { /* ignore */ }
+/**
+ * `true` when `p` failed to resolve only because nothing exists there: not a
+ * dangling or looping symlink, not an unreadable directory. Mirrors Rust's
+ * `is_absent` in `src-tauri/src/git/cmd.rs`.
+ */
+function isAbsent(p, err) {
+  if (err?.code !== "ENOENT") return false;
+  try {
+    lstatSync(p);
+    return false;
+  } catch (e) {
+    return e.code === "ENOENT";
   }
-  return name;
+}
+
+/**
+ * `true` when `p` failed to resolve because a component on the way is not a
+ * directory (ENOTDIR), as seen without following a final symlink. Mirrors
+ * Rust's `is_not_dir`.
+ */
+function isNotDir(p, err) {
+  if (err?.code !== "ENOTDIR") return false;
+  try {
+    lstatSync(p);
+    return false;
+  } catch (e) {
+    return e.code === "ENOTDIR";
+  }
+}
+
+/**
+ * `path` as a clean repo-relative path, `/`-separated (no `./`, an absolute
+ * path inside the repo made relative), falling back to the guard's resolved
+ * path when it cannot be cleaned lexically. Mirrors Rust's
+ * `repo_relative_path` in `commands/read.rs`, so both backends hand git the
+ * same argument and produce the same diff header.
+ */
+function repoRelativePath(cwd, root, path, guarded) {
+  let rel = null;
+  if (isAbsolute(path)) {
+    for (const base of [cwd, root]) {
+      const prefix = base.endsWith(sep) ? base : base + sep;
+      if (path === base) { rel = ""; break; }
+      if (path.startsWith(prefix)) { rel = path.slice(prefix.length); break; }
+    }
+  } else {
+    rel = path;
+  }
+  let parts = [];
+  if (rel !== null) {
+    for (const seg of rel.split(sep)) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") { parts = []; break; }
+      parts.push(seg);
+    }
+  }
+  if (!parts.length) parts = relative(root, guarded).split(sep).filter(Boolean);
+  return parts.join("/");
 }
 
 const GH = resolveBin("gh");
 const GLAB = resolveBin("glab");
 const GIT = resolveBin("git");
+
+/**
+ * Lexical check of a pathspec handed to `git rm --cached` (and of the
+ * combined diff's `paths`, `combinedValidatePaths`). Mirrors
+ * `validate_pathspec` (commands/tracked_ignored.rs) - keep the two in sync.
+ * Not `safeRepoPath`: that one resolves symlinks, so a tracked link pointing
+ * outside the repo would fail the whole batch, though `git rm --cached` only
+ * touches the index entry. Non-empty, no NUL, not absolute, no `..`
+ * component; on Windows `\\` is a separator and a drive/UNC prefix absolute.
+ */
+function validateUntrackPathspec(p) {
+  if (typeof p !== "string" || !p.trim()) throw new Error("path must not be empty");
+  if (p.includes("\0")) throw new Error("path must not contain NUL");
+  const windows = process.platform === "win32";
+  const absolute = p.startsWith("/") || (windows && (p.startsWith("\\") || /^[A-Za-z]:/.test(p)));
+  if (absolute) throw new Error(`path must be relative to the repo (got: ${p})`);
+  if (p.split(windows ? /[\\/]/ : "/").includes("..")) {
+    throw new Error(`path must not contain \`..\` (got: ${p})`);
+  }
+}
 
 /**
  * Extract a percentage from a git progress line, e.g.
@@ -109,10 +251,346 @@ function devExtractPercent(line) {
 }
 
 /**
+ * `@gitwand/core`, imported once and cached. Node resolves it to
+ * `packages/core/dist`, which `pnpm dev:web` / `pnpm dev:server` build first
+ * (`build:core`); started any other way, a missing or stale dist would make
+ * every diff route answer a 500 with a cryptic resolution error, so it is
+ * checked here and reported with the fix. A failed load is not cached, so a
+ * build made after startup is picked up on the next request — but a stale
+ * dist that loaded fine is cached by Node until the dev-server restarts.
+ */
+const DEV_CORE_HELPERS = ["classifyHunkLine", "hunkBodyFromHeader", "noHunkBody", "parseHunkHeader", "scanSecrets"];
+let devCorePromise = null;
+function loadDevCore() {
+  if (devCorePromise) return devCorePromise;
+  devCorePromise = import("@gitwand/core").then(
+    (core) => {
+      const missing = DEV_CORE_HELPERS.filter((name) => typeof core[name] !== "function");
+      if (missing.length > 0) {
+        throw new Error(
+          `@gitwand/core is out of date (missing ${missing.join(", ")}): run \`pnpm --filter @gitwand/core build\`, then restart the dev-server`,
+        );
+      }
+      return core;
+    },
+    (err) => {
+      throw new Error(`@gitwand/core could not be loaded: run \`pnpm --filter @gitwand/core build\` (${err.message})`);
+    },
+  );
+  devCorePromise.catch(() => { devCorePromise = null; });
+  return devCorePromise;
+}
+
+/**
+ * Parse one file's unified diff into hunks — the dev-server twin of Rust's
+ * `parse_diff_hunks` (src-tauri/src/git/parse.rs). `core` is the module from
+ * `loadDevCore()`; its hunk-body helpers are the TS twin of Rust's `HunkBody`:
+ * inside a hunk, bounded by its `@@` counts, a line is classified by its first
+ * character only — a removed `-- note` is the diff line `--- note`, not a file
+ * header — and a bare "" is a blank context line while both counts remain
+ * (`diff.suppressBlankEmpty`). Outside a hunk, "" and headers are skipped.
+ *
+ * Returns `{ hunks, status }`, `status` being "added" when a `new file mode`
+ * header was seen (Rust's `detected_status`).
+ */
+function devParseDiffHunks(core, text) {
+  const { classifyHunkLine, hunkBodyFromHeader, noHunkBody, parseHunkHeader } = core;
+  const hunks = [];
+  let status;
+  let currentHunk = null;
+  let body = noHunkBody();
+  let oldLineNo = 0;
+  let newLineNo = 0;
+
+  for (const line of text.split("\n")) {
+    const kind = currentHunk ? classifyHunkLine(body, line) : null;
+    if (kind) {
+      const content = line.substring(1);
+      if (kind === "add") {
+        currentHunk.lines.push({ type: "add", content, oldLineNo: null, newLineNo });
+        newLineNo++;
+      } else if (kind === "delete") {
+        currentHunk.lines.push({ type: "delete", content, oldLineNo, newLineNo: null });
+        oldLineNo++;
+      } else {
+        currentHunk.lines.push({ type: "context", content, oldLineNo, newLineNo });
+        oldLineNo++;
+        newLineNo++;
+      }
+    } else if (line.startsWith("new file mode")) {
+      status = "added";
+    } else if (line.startsWith("@@")) {
+      if (currentHunk) hunks.push(currentHunk);
+      // Same fallback as Rust's parse_hunk_header for an unparsable header.
+      const range = parseHunkHeader(line) ?? { oldStart: 0, oldCount: 1, newStart: 0, newCount: 1 };
+      oldLineNo = range.oldStart;
+      newLineNo = range.newStart;
+      body = hunkBodyFromHeader(line);
+      currentHunk = { header: line, ...range, lines: [] };
+    } else if (line.startsWith("diff ")) {
+      body = noHunkBody();
+    }
+  }
+  if (currentHunk) hunks.push(currentHunk);
+  return { hunks, status };
+}
+
+/** Rust `str::lines()`: split on `\n`, drop one trailing empty line, strip `\r`. */
+function rustLines(s) {
+  const parts = s.split("\n");
+  if (parts.length && parts[parts.length - 1] === "") parts.pop();
+  return parts.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+}
+
+/**
+ * read.rs `read_c_quoted`: a C-quoted name at the start of `s` →
+ * `[unquoted name (UTF-8), rest after the closing quote]`, or null.
+ */
+function readCQuoted(s) {
+  if (!s.startsWith('"')) return null;
+  const body = Buffer.from(s.slice(1), "utf8");
+  const out = [];
+  const simple = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+  let i = 0;
+  while (i < body.length) {
+    const b = body[i];
+    if (b === 0x22) return [Buffer.from(out).toString("utf8"), body.subarray(i + 1).toString("utf8")];
+    if (b !== 0x5c) {
+      out.push(b);
+      i += 1;
+      continue;
+    }
+    if (i + 1 >= body.length) return null;
+    const c = String.fromCharCode(body[i + 1]);
+    i += 2;
+    if (c in simple) out.push(simple[c]);
+    else if (c >= "0" && c <= "3") {
+      if (i + 1 >= body.length) return null;
+      const d1 = body[i];
+      const d2 = body[i + 1];
+      if (d1 < 0x30 || d1 > 0x37 || d2 < 0x30 || d2 > 0x37) return null;
+      out.push((c.charCodeAt(0) - 0x30) * 64 + (d1 - 0x30) * 8 + (d2 - 0x30));
+      i += 2;
+    } else return null;
+  }
+  return null;
+}
+
+/** read.rs `unquote_header_name`. */
+function unquoteHeaderName(s) {
+  if (!s.startsWith('"')) return s;
+  const q = readCQuoted(s);
+  return q !== null && q[1] === "" ? q[0] : null;
+}
+
+/** read.rs `file_line_name`. */
+function fileLineName(s, prefix) {
+  let name;
+  if (s.startsWith('"')) {
+    const q = readCQuoted(s);
+    if (q === null || (q[1] !== "" && q[1] !== "\t")) return null;
+    name = q[0];
+  } else {
+    const t = s.endsWith("\t") ? s.slice(0, -1) : s;
+    if (t === "/dev/null") return null;
+    name = t;
+  }
+  return name.startsWith(prefix) ? name.slice(prefix.length) : null;
+}
+
+/** read.rs `symmetric_git_header_name`. */
+function symmetricGitHeaderName(line) {
+  if (!line.startsWith("diff --git ")) return null;
+  const rest = line.slice("diff --git ".length);
+  if (rest.startsWith('"')) {
+    const qa = readCQuoted(rest);
+    if (qa === null || !qa[1].startsWith(" ")) return null;
+    const qb = readCQuoted(qa[1].slice(1));
+    if (qb === null || qb[1] !== "") return null;
+    const [a, b] = [qa[0], qb[0]];
+    if (!a.startsWith("a/") || !b.startsWith("b/")) return null;
+    return a.slice(2) === b.slice(2) ? a.slice(2) : null;
+  }
+  // `a/P b/P`: 2·len(P) + 5 (UTF-16 units here, bytes in Rust: same split).
+  const len = rest.length - 5;
+  if (len < 0 || len % 2 !== 0) return null;
+  const p = rest.slice(2, 2 + len / 2);
+  return rest.startsWith("a/") && rest.slice(2 + len / 2) === ` b/${p}` ? p : null;
+}
+
+/**
+ * The dev-server twin of Rust's `parse_multi_file_diff_capped`
+ * (commands/read.rs) — the one multi-file parser, shared by `/api/git-show`
+ * (no cap, like `git_show`) and the combined diff (`DIFF_TRUNCATE_BYTES`).
+ * Splits git's output like Rust's `str::lines()`, one section per
+ * `diff --git` line (no hunk line can start with one), reads the extended
+ * headers before the first hunk, and parses the hunks with
+ * `devParseDiffHunks`. A section longer than `cap` bytes keeps its header
+ * (path, status, oldPath) but no hunks, and reports `truncatedFromBytes`.
+ */
+function devParseMultiFileDiff(core, stdout, cap = null) {
+  const sections = [];
+  for (const line of rustLines(stdout)) {
+    if (line.startsWith("diff --git ")) sections.push([line]);
+    else if (sections.length > 0) sections[sections.length - 1].push(line);
+  }
+  const diffs = [];
+  for (const section of sections) {
+    let status = null;
+    let oldPath = null;
+    let renameTo = null;
+    let minus = null;
+    let plus = null;
+    let binary = false;
+    for (const line of section.slice(1)) {
+      if (line.startsWith("@@")) break;
+      if (line.startsWith("Binary files ")) binary = true;
+      else if (line.startsWith("new file mode")) status = "added";
+      else if (line.startsWith("deleted file mode")) status = "deleted";
+      else if (line.startsWith("rename from ")) {
+        status = "renamed";
+        oldPath = unquoteHeaderName(line.substring("rename from ".length));
+      } else if (line.startsWith("rename to ")) {
+        if (status === null) status = "renamed";
+        renameTo = unquoteHeaderName(line.substring("rename to ".length));
+      } else if (line.startsWith("copy to ")) renameTo = unquoteHeaderName(line.substring("copy to ".length));
+      else if (line.startsWith("--- ")) minus = fileLineName(line.substring(4), "a/");
+      else if (line.startsWith("+++ ")) plus = fileLineName(line.substring(4), "b/");
+    }
+    // Rust's order: `rename to`, `+++ b/…`, `--- a/…`, then the two
+    // identical halves of `diff --git a/P b/P`.
+    const path = renameTo ?? plus ?? minus ?? symmetricGitHeaderName(section[0]);
+    if (path === null) continue;
+    // `status` matters downstream: patchBuilder needs /dev/null for an added
+    // or deleted file, or `git apply --cached` fails during a commit split.
+    // Bytes of the section as git printed it (one `\n` per line).
+    const size = section.reduce((n, l) => n + Buffer.byteLength(l, "utf-8") + 1, 0);
+    const truncated = cap !== null && size > cap;
+    diffs.push({
+      path,
+      hunks: truncated ? [] : devParseDiffHunks(core, section.join("\n")).hunks,
+      ...(status !== null ? { status } : {}),
+      ...(oldPath !== null ? { oldPath } : {}),
+      ...(truncated ? { truncatedFromBytes: size } : {}),
+      // read.rs: `binary` only on a `Binary files … differ` section.
+      ...(binary ? { binary: true } : {}),
+    });
+  }
+  return diffs;
+}
+
+/** Per-directory cap of `list_repo_dir` — mirrors MAX_REPO_DIR_ENTRIES in files.rs. */
+const MAX_REPO_DIR_ENTRIES = 5000;
+
+/** Code-point order, the same as Rust's `str::cmp` (UTF-8 byte order). */
+function cmpCodePoints(a, b) {
+  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+
+/**
+ * Mirror of the Tauri `list_repo_dir` command (Files view, v3.11.2): one level
+ * of the working tree, `.git` skipped, symlinks reported and never followed,
+ * non-UTF-8 names skipped, sorted directories first then case-insensitively,
+ * capped after sorting. Rust classifies ignores in process with libgit2; this
+ * process has no libgit2, so it makes one `git check-ignore -z --stdin` call,
+ * which already leaves tracked paths out (verified 2026-10-01: `build/`
+ * holding a tracked file and a force-added `*.log` are not reported). Slow on
+ * a huge directory, but dev-only. Pinned by tests/parity/list-repo-dir.test.mjs.
+ */
+function devListRepoDir(cwd, rawDir, includeIgnored) {
+  if (!cwd || !cwd.trim()) throw new Error("cwd must not be empty");
+  const dir = String(rawDir ?? "").replace(/^\/+|\/+$/g, "");
+  if (dir.split("/").includes(".git")) throw new Error(`Refusing to list inside .git: ${dir}`);
+  const resolved = safeRepoPath(cwd, dir === "" ? "." : dir);
+  let st;
+  try {
+    st = statSync(resolved);
+  } catch {
+    throw new Error(`Directory not found: ${dir}`);
+  }
+  if (!st.isDirectory()) throw new Error(`Not a directory: ${dir}`);
+
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const raw = [];
+  let dirents;
+  try {
+    dirents = readdirSync(resolved, { withFileTypes: true, encoding: "buffer" });
+  } catch (e) {
+    throw new Error(`Failed to list ${dir || "."}: ${e.message}`);
+  }
+  for (const d of dirents) {
+    let name;
+    try {
+      name = decoder.decode(d.name);
+    } catch {
+      continue; // not UTF-8: no path built from it could round-trip
+    }
+    if (name === ".git") continue;
+    const kind = d.isSymbolicLink() ? "symlink" : d.isDirectory() ? "dir" : "file";
+    let size = 0;
+    if (kind === "file") {
+      try { size = lstatSync(join(resolved, name)).size; } catch { size = 0; }
+    }
+    raw.push({ name, kind, size });
+  }
+  raw.sort((a, b) => {
+    if ((a.kind === "dir") !== (b.kind === "dir")) return a.kind === "dir" ? -1 : 1;
+    return cmpCodePoints(a.name.toLowerCase(), b.name.toLowerCase()) || cmpCodePoints(a.name, b.name);
+  });
+
+  const prefix = dir ? `${dir}/` : "";
+  const rels = raw.map((e) => prefix + e.name);
+  let ignoredSet = new Set();
+  if (rels.length > 0) {
+    const r = spawnSync(GIT, ["check-ignore", "-z", "--stdin"], {
+      cwd,
+      input: rels.join("\0") + "\0",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    // 0 = some ignored, 1 = none ignored; anything else is a git failure,
+    // reported but not fatal (the listing is still right about what exists).
+    if (r.status === 0) {
+      ignoredSet = new Set(r.stdout.toString("utf8").split("\0").filter(Boolean));
+    } else if (r.status !== 1) {
+      console.warn(`[dev] list-repo-dir: git check-ignore failed: ${r.stderr?.toString() ?? r.error}`);
+    }
+  }
+
+  const entries = [];
+  let truncated = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ignored = ignoredSet.has(rels[i]);
+    if (ignored && !includeIgnored) continue;
+    if (entries.length === MAX_REPO_DIR_ENTRIES) {
+      truncated = true;
+      break;
+    }
+    entries.push({ name: raw[i].name, path: rels[i], kind: raw[i].kind, ignored, size: raw[i].size });
+  }
+  return { entries, truncated };
+}
+
+/**
  * Classify one line of `git clone --progress` / `git fetch --progress`
  * stderr into a `{stage,percent,message}` update. Mirrors the Rust
  * `parse_clone_progress` helper in `commands/ops.rs` — keep the two in sync.
  */
+/** Every ref and its target, sorted; `null` when git cannot list them. */
+function devRefFingerprint(cwd) {
+  try {
+    return execFileSync(GIT, ["for-each-ref", "--format=%(refname) %(objectname) %(symref)"], {
+      cwd,
+      encoding: "utf-8",
+      maxBuffer: Infinity,
+    })
+      .split("\n")
+      .sort()
+      .join("\n");
+  } catch {
+    return null;
+  }
+}
+
 function devParseCloneProgress(line) {
   const l = line.trim();
   if (!l) return null;
@@ -168,6 +646,554 @@ const claudeSpawnEnv = (() => {
   delete clean.ANTHROPIC_AUTH_TOKEN;
   return clean;
 })();
+
+/**
+ * Allowlisted environment for an AI CLI prompt. Mirrors `ai_cmd` in
+ * `src-tauri/src/commands/ai.rs`: the CLIs are agents fed untrusted repo
+ * content, so they get home/locale/proxy variables and their own provider's
+ * auth only — never forge tokens (GH_TOKEN, GITLAB_TOKEN) or cloud
+ * credentials (AWS_*, AZURE_*).
+ */
+const AI_ENV_BASE = new Set([
+  "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP", "PATH",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+  "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "USERNAME", "USERDOMAIN",
+  "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+  "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+]);
+/** Mirrors CLAUDE_AUTH_OVERRIDE_ENV (types.rs): stripped so the CLI uses the subscription. */
+const CLAUDE_AUTH_OVERRIDE = ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+const envFlagSet = (v) => {
+  const t = String(v ?? "").trim();
+  return t !== "" && t !== "0" && t.toLowerCase() !== "false";
+};
+const isEnvName = (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n);
+const readText = (p) => { try { return readFileSync(p, "utf-8"); } catch { return null; } };
+/** smol-toml (root devDependency) for Codex's config.toml; absent → no env_key forwarded. */
+let parseToml = null;
+try { ({ parse: parseToml } = await import("smol-toml")); } catch { /* optional */ }
+/** Mirrors `parse_codex_env_keys` (ai.rs): every env_key, env_http_headers values. */
+function codexEnvKeys(text) {
+  if (!parseToml) return [];
+  let doc;
+  try { doc = parseToml(text); } catch { return []; }
+  const out = [];
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== "object") return;
+    for (const [k, x] of Object.entries(v)) {
+      if (k === "env_key" && typeof x === "string") out.push(x);
+      else if (k === "env_http_headers" && x && typeof x === "object") {
+        for (const n of Object.values(x)) if (typeof n === "string") out.push(n);
+      } else walk(x);
+    }
+  };
+  walk(doc);
+  return out.filter(isEnvName);
+}
+/** Mirrors `claude_managed_settings_files` (ai.rs). */
+function claudeManagedSettingsFiles() {
+  const dirs = process.platform === "darwin" ? ["/Library/Application Support/ClaudeCode"]
+    : process.platform === "win32" ? ["C:\\Program Files\\ClaudeCode", "C:\\ProgramData\\ClaudeCode"]
+    : ["/etc/claude-code"];
+  const files = [];
+  for (const d of dirs) {
+    files.push(join(d, "managed-settings.json"));
+    try {
+      files.push(...readdirSync(join(d, "managed-settings.d")).filter((n) => n.endsWith(".json")).sort()
+        .map((n) => join(d, "managed-settings.d", n)));
+    } catch { /* none */ }
+  }
+  return files;
+}
+/**
+ * Mirrors `ai_env_context` (ai.rs): Claude's Bedrock / Vertex / Foundry
+ * switches (env, user settings.json, managed settings), Codex `env_key`s and
+ * opencode `{env:NAME}` from user-level config files only — never from the
+ * repository.
+ */
+function aiEnvContext(cli, env = process.env) {
+  const ctx = { claudeBedrock: false, claudeVertex: false, claudeFoundry: false, configRefs: [] };
+  const home = env.HOME || env.USERPROFILE || "";
+  if (cli === "claude") {
+    ctx.claudeBedrock = envFlagSet(env.CLAUDE_CODE_USE_BEDROCK);
+    ctx.claudeVertex = envFlagSet(env.CLAUDE_CODE_USE_VERTEX);
+    ctx.claudeFoundry = envFlagSet(env.CLAUDE_CODE_USE_FOUNDRY);
+    const dir = (env.CLAUDE_CONFIG_DIR || "").trim() || (home && join(home, ".claude"));
+    const files = [...(dir ? [join(dir, "settings.json")] : []), ...claudeManagedSettingsFiles()];
+    for (const f of files) {
+      const text = readText(f);
+      if (!text) continue;
+      try {
+        const e = JSON.parse(text)?.env ?? {};
+        const flag = (v) => envFlagSet(typeof v === "boolean" ? (v ? "1" : "0") : v);
+        ctx.claudeBedrock ||= flag(e.CLAUDE_CODE_USE_BEDROCK);
+        ctx.claudeVertex ||= flag(e.CLAUDE_CODE_USE_VERTEX);
+        ctx.claudeFoundry ||= flag(e.CLAUDE_CODE_USE_FOUNDRY);
+      } catch { /* not JSON */ }
+    }
+  } else if (cli === "codex") {
+    const dir = (env.CODEX_HOME || "").trim() || (home && join(home, ".codex"));
+    const text = dir && readText(join(dir, "config.toml"));
+    if (text) ctx.configRefs.push(...codexEnvKeys(text));
+  } else if (cli === "opencode") {
+    const files = [];
+    if ((env.OPENCODE_CONFIG || "").trim()) files.push(env.OPENCODE_CONFIG);
+    const cfgHome = (env.XDG_CONFIG_HOME || "").trim() || (home && join(home, ".config"));
+    if (cfgHome) for (const n of ["opencode.json", "opencode.jsonc", "config.json"]) files.push(join(cfgHome, "opencode", n));
+    for (const f of files) {
+      const text = readText(f);
+      if (!text) continue;
+      for (const m of text.matchAll(/\{env:([^}]*)\}/g)) if (isEnvName(m[1])) ctx.configRefs.push(m[1]);
+    }
+  }
+  return ctx;
+}
+/** Mirrors CLAUDE_CONFIG_ENV (ai.rs): Claude Code's documented configuration, by name. */
+const CLAUDE_CONFIG_ENV = new Set([
+  "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_FOUNDRY_BASE_URL",
+  "ANTHROPIC_FOUNDRY_RESOURCE", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+  "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY",
+  "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "CLAUDE_CODE_PROXY_RESOLVES_HOSTS",
+  "CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CODE_SHELL", "CLAUDE_CODE_MAX_RETRIES", "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+  "API_TIMEOUT_MS", "ANTHROPIC_BETAS", "DISABLE_COST_WARNINGS", "MAX_THINKING_TOKENS",
+  "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER", "DISABLE_PROMPT_CACHING",
+  "DISABLE_NON_ESSENTIAL_MODEL_CALLS",
+]);
+const AI_ENV_PROVIDER = {
+  claude: (k, ctx) => !CLAUDE_AUTH_OVERRIDE.includes(k) && (
+    CLAUDE_CONFIG_ENV.has(k)
+    || (ctx.claudeBedrock && k.startsWith("AWS_"))
+    || (ctx.claudeVertex && (["CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_QUOTA_PROJECT", "GCLOUD_PROJECT"].includes(k) || k.startsWith("VERTEX_REGION_") || k.startsWith("CLOUDSDK_")))
+    || (ctx.claudeFoundry && k === "ANTHROPIC_FOUNDRY_API_KEY")),
+  codex: (k) => k.startsWith("CODEX_")
+    || ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORGANIZATION", "OPENAI_PROJECT", "AZURE_OPENAI_API_KEY"].includes(k),
+  opencode: (k) => k.startsWith("OPENCODE_") || [
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY",
+    "OPENROUTER_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
+  ].includes(k),
+  copilot: (k) => k.startsWith("COPILOT_") && k !== "COPILOT_ALLOW_ALL",
+  antigravity: (k) => [
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI",
+  ].includes(k),
+};
+/** Mirrors `cached_ai_env_context` (ai.rs): config files read at most every 10 s per CLI. */
+const aiEnvContextCache = new Map();
+function cachedAiEnvContext(cli) {
+  const hit = aiEnvContextCache.get(cli);
+  if (hit && Date.now() - hit.at < 10_000) return hit.ctx;
+  const ctx = aiEnvContext(cli);
+  aiEnvContextCache.set(cli, { at: Date.now(), ctx });
+  return ctx;
+}
+function aiSpawnEnv(cli) {
+  const ctx = cachedAiEnvContext(cli);
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (AI_ENV_BASE.has(k) || AI_ENV_BASE.has(k.toUpperCase()) || k.startsWith("LC_")
+      || ctx.configRefs.includes(k) || AI_ENV_PROVIDER[cli](k, ctx)) {
+      env[k] = v;
+    }
+  }
+  return env;
+}
+
+/** Mirrors CLAUDE_DENIED_TOOLS (ai.rs). */
+const CLAUDE_DENIED_TOOLS = [
+  "Bash", "BashOutput", "KillBash", "KillShell", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead",
+  "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "SlashCommand", "Skill",
+];
+/** Mirrors `claude_caps` (ai.rs): lockdown flags the installed claude knows, cached per binary. */
+const claudeCapsCache = new Map();
+async function claudeCaps(bin) {
+  // Keyed on the binary's identity (path, size, mtime). 10 s probe in its own
+  // process group, killed as a whole on timeout and never waited on past it.
+  // A failed or empty probe is remembered for 5 minutes. Mirrors `claude_caps`.
+  let id = bin;
+  try { const st = statSync(bin); id = `${bin}\0${st.size}\0${st.mtimeMs}`; } catch { /* keep path */ }
+  const hit = claudeCapsCache.get(id);
+  if (hit?.caps) return hit.caps;
+  const none = { tools: false, settingSources: false, strictMcp: false, noSessionPersistence: false };
+  if (hit?.failedAt && Date.now() - hit.failedAt < 5 * 60_000) return none;
+  const help = await new Promise((resolveHelp) => {
+    let out = "";
+    let done = false;
+    let timer = null; // declared before `finish` can run (spawn may throw synchronously)
+    const finish = (v) => { if (!done) { done = true; if (timer) clearTimeout(timer); resolveHelp(v); } };
+    let child;
+    try {
+      child = spawn(bin, ["--help"], {
+        env: aiSpawnEnv("claude"),
+        stdio: ["ignore", "pipe", "ignore"],
+        detached: process.platform !== "win32",
+      });
+    } catch { return finish(""); }
+    timer = setTimeout(() => {
+      try {
+        if (process.platform === "win32") spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)]);
+        else process.kill(-child.pid, "SIGKILL");
+      } catch { /* already gone */ }
+      finish("");
+    }, 10_000);
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => finish(""));
+    child.on("exit", (code) => {
+      // Give the pipe a moment to drain, without waiting on a grandchild.
+      setTimeout(() => finish(code === 0 ? out : ""), 200);
+    });
+  });
+  if (!help.trim()) {
+    claudeCapsCache.set(id, { failedAt: Date.now() });
+    return none;
+  }
+  const words = new Set(help.split(/[\s,]+/));
+  const caps = {
+    tools: words.has("--tools"),
+    settingSources: words.has("--setting-sources"),
+    strictMcp: words.has("--strict-mcp-config"),
+    noSessionPersistence: words.has("--no-session-persistence"),
+  };
+  claudeCapsCache.set(id, { caps });
+  return caps;
+}
+let aiRunsBaseCache = null;
+/**
+ * Mirrors `ai_runs_base` / `prepare_runs_base` (ai.rs): the per-user base of
+ * the per-run directories, validated once — a real directory (not a
+ * symlink) owned by the current user; mode 0700, with one warning when the
+ * filesystem does not keep it. Never the shared /tmp.
+ */
+function aiRunsBase() {
+  // Prepared again if deleted since (cache cleaner); a failure is not cached.
+  if (aiRunsBaseCache && existsSync(aiRunsBaseCache)) return aiRunsBaseCache;
+  const home = homedir();
+  const xdg = (process.env.XDG_CACHE_HOME || "").trim();
+  const root = process.platform === "darwin" ? join(home, "Library", "Caches")
+    : process.platform === "win32" ? (process.env.LOCALAPPDATA || join(home, "AppData", "Local"))
+    : (isAbsolute(xdg) ? xdg : join(home, ".cache"));
+  const dir = join(root, "gitwand", "ai-runs");
+  mkdirSync(dir, { recursive: true });
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`AI working directory ${dir}: is not a plain directory`);
+  if (process.platform !== "win32") {
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+      throw new Error(`AI working directory ${dir}: belongs to another user`);
+    }
+    try { chmodSync(dir, 0o700); } catch (e) { console.warn(`[dev-server] cannot restrict ${dir}: ${e.message}`); }
+    const mode = lstatSync(dir).mode & 0o777;
+    if (mode & 0o077) console.warn(`[dev-server] ${dir} keeps mode ${mode.toString(8)}; per-run directories still apply`);
+  }
+  sweepStaleRunDirs(dir); // at setup only, never before each run
+  aiRunsBaseCache = dir;
+  return dir;
+}
+/** Mirrors `sweep_stale_run_dirs` / STALE_RUN_AGE (ai.rs): drop run-* leftovers older than a day. */
+function sweepStaleRunDirs(base) {
+  let names = [];
+  try { names = readdirSync(base); } catch { return; }
+  for (const n of names) {
+    if (!n.startsWith("run-")) continue;
+    const p = join(base, n);
+    try {
+      const st = lstatSync(p);
+      const age = Date.now() - st.mtimeMs;
+      if (age <= 24 * 60 * 60_000) continue;
+      // Mirrors sweep_stale_run_dirs: a live owner (the pid in the name, the
+      // app's or a dev server's) keeps it, for up to 7 days (a reused pid).
+      const m = /^run-[0-9a-f]{16}([0-9a-f]{8})$/i.exec(n);
+      if (m && age < 7 * 24 * 60 * 60_000 && devProcessAlive(parseInt(m[1], 16))) continue;
+      rmSync(p, { recursive: true, force: true });
+    } catch { /* gone */ }
+  }
+}
+/**
+ * Mirrors `require_lockdown_flags`: null when `bin <helpArgs>` lists every
+ * flag, else the error to answer (too old, or the probe did not answer).
+ */
+const devLockdownSeen = new Map();
+function devLockdownError(bin, helpArgs, flags, tooOld, cli) {
+  // Cached per binary identity, as help_mentions: an update in place is seen.
+  // A bare name (not found by resolveBin): cached by name for 5 minutes.
+  const what = `${helpArgs.join(" ")}|${flags.join(" ")}`;
+  let id;
+  try { const st = statSync(bin); id = `${bin}|${st.size}|${st.mtimeMs}|${what}`; }
+  catch { id = `${bin}|${Math.floor(Date.now() / 300_000)}|${what}`; }
+  const seen = devLockdownSeen.get(id);
+  // A "missing" answer is checked again after 5 minutes (an update behind a
+  // shim leaves the file unchanged), as RECHECK_MISSING_AFTER in Rust.
+  if (seen && (seen.ok || Date.now() - seen.at < 300_000)) return seen.ok ? null : tooOld;
+  // The run's own filtered environment: no secret reaches the CLI.
+  const r = spawnSync(bin, helpArgs, { encoding: "utf-8", timeout: 10_000, env: aiSpawnEnv(cli) });
+  if (r.error?.code === "ENOENT") return `Binaire \`${basename(bin)}\` introuvable`;
+  if (r.error || r.status === null) {
+    return `Could not check the AI CLI's options (\`${basename(bin)} ${helpArgs.join(" ")}\` did not answer within 10 s): try again`;
+  }
+  const help = `${r.stdout || ""}${r.stderr || ""}`;
+  const has = (f) => new RegExp(`(^|[^\\w-])${f.replace(/[-]/g, "\\-")}(?![\\w-])`, "m").test(help);
+  const ok = flags.every(has);
+  devLockdownSeen.set(id, { ok, at: Date.now() });
+  return ok ? null : tooOld;
+}
+/** True when a process with this pid exists (EPERM is a live process). */
+function devProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; }
+}
+/** The image proxy's CSP, as image_proxy.rs sends on gwimg: answers. */
+const DEV_IMAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+/**
+ * The first JSON object of `text` from offset 0 (strings and escapes
+ * respected), or null: a log line may follow it.
+ */
+function devFirstJsonObject(text) {
+  let depth = 0, inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return text.slice(0, i + 1);
+  }
+  return null;
+}
+
+/** JSON from JSONC: comments and trailing commas dropped. Mirrors `jsonc_to_json`. */
+function devJsoncToJson(text) {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (c === "\\") { out += text[++i] ?? ""; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; out += c; continue; }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      // The closing `*/` starts after the opening one (`/*/` is not closed).
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i++; // on the closing `/`; the loop's i++ steps past it
+      continue;
+    }
+    out += c;
+  }
+  let cleaned = "";
+  inString = false;
+  for (let i = 0; i < out.length; i++) {
+    const c = out[i];
+    if (inString) {
+      cleaned += c;
+      if (c === "\\") { cleaned += out[++i] ?? ""; continue; }
+      if (c === '"') inString = false;
+    } else if (c === '"') { inString = true; cleaned += c; }
+    else if (c === "," && /^\s*[}\]]/.test(out.slice(i + 1))) { /* trailing comma */ }
+    else cleaned += c;
+  }
+  return cleaned;
+}
+
+/**
+ * OPENCODE_CONFIG_CONTENT for a GitWand run: the user's inline config kept,
+ * every MCP server it or the opencode config files declare disabled.
+ * Mirrors `opencode_config_content` + the config files `ai_env_context` reads.
+ */
+let devOpencodeResolved = { at: 0, names: [] };
+function devOpencodeConfigContent(opencodeBin) {
+  const parse = (text) => { try { return JSON.parse(devJsoncToJson(text)); } catch { return null; } };
+  // opencode's resolved config first: every source it reads (mirrors
+  // opencode_resolved_mcp_names), read once a minute at most.
+  const resolvedNames = Date.now() - devOpencodeResolved.at < 60_000 ? [...devOpencodeResolved.names] : [];
+  if (opencodeBin && Date.now() - devOpencodeResolved.at >= 60_000) {
+    try {
+      const r = spawnAiSync(opencodeBin, ["debug", "config"], {
+        env: { ...aiSpawnEnv("opencode"), OPENCODE_DISABLE_PROJECT_CONFIG: "1" },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      // The JSON starts on a line of its own; a log line before it may hold
+      // a brace too. Mirrors opencode_debug_config_mcp_names.
+      const out = r.status === 0 ? String(r.stdout || "") : "";
+      let v = null;
+      let at = 0;
+      for (const line of out.split(/(?<=\n)/)) {
+        if (line.trimStart().startsWith("{")) {
+          const first = devFirstJsonObject(devJsoncToJson(out.slice(at)).trimStart());
+          v = first ? parse(first) : null;
+          if (v) break;
+        }
+        at += line.length;
+      }
+      if (v?.mcp && typeof v.mcp === "object") resolvedNames.push(...Object.keys(v.mcp));
+      // A failed or unreadable read is cached too (empty), as in Rust.
+      devOpencodeResolved = { at: Date.now(), names: [...resolvedNames] };
+    } catch { /* the files below decide */ }
+  }
+  const files = [];
+  if (process.env.OPENCODE_CONFIG?.trim()) files.push(process.env.OPENCODE_CONFIG);
+  const configHome = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config");
+  for (const name of ["opencode.json", "opencode.jsonc", "config.json"]) files.push(join(configHome, "opencode", name));
+  const names = new Set(resolvedNames);
+  for (const f of files) {
+    let text;
+    try { text = readFileSync(f, "utf-8"); } catch { continue; }
+    const v = parse(text);
+    if (v?.mcp && typeof v.mcp === "object") Object.keys(v.mcp).forEach((n) => names.add(n));
+  }
+  const inherited = process.env.OPENCODE_CONFIG_CONTENT ? parse(process.env.OPENCODE_CONFIG_CONTENT) : null;
+  const base = inherited && typeof inherited === "object" && !Array.isArray(inherited) ? inherited : {};
+  // No tool at all, MCP ones included (mirrors opencode_config_content).
+  if (!base.tools || typeof base.tools !== "object" || Array.isArray(base.tools)) base.tools = {};
+  base.tools["*"] = false;
+  if (!base.mcp || typeof base.mcp !== "object" || Array.isArray(base.mcp)) base.mcp = {};
+  Object.keys(base.mcp).forEach((n) => names.add(n));
+  for (const n of [...names].sort()) {
+    const entry = base.mcp[n] && typeof base.mcp[n] === "object" ? base.mcp[n] : {};
+    base.mcp[n] = { ...entry, enabled: false };
+  }
+  return JSON.stringify(base);
+}
+
+/**
+ * Mirrors `ai_prompt_cmd` + `AiRunDir` (ai.rs): run an AI CLI in a fresh
+ * private directory of its own (exclusive, 0700, named `run-<16 hex><8 hex pid>` as `random_token`), a git repository
+ * when the CLI needs one (Codex), removed afterwards whatever happens — never
+ * the repository, never a directory another run could have left files in.
+ */
+function spawnAiSync(bin, args, opts, { gitRepo = false, files = {} } = {}) {
+  const base = aiRunsBase();
+  const dir = join(base, `run-${randomBytes(8).toString("hex")}${process.pid.toString(16).padStart(8, "0")}`);
+  mkdirSync(dir, { mode: 0o700 }); // fails on any existing entry
+  try {
+    if (gitRepo) {
+      const g = spawnSync(GIT, ["init", "-q"], { cwd: dir });
+      if (g.status !== 0) throw new Error(`AI working directory ${dir}: git init failed`);
+    }
+    // Files the CLI reads from its run directory (Copilot's prompt.md).
+    for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content, { mode: 0o600 });
+    return spawnSync(bin, args, { ...opts, cwd: dir });
+  } finally {
+    // Best effort, like AiRunDir's Drop: never replaces the CLI's result.
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* EBUSY/EPERM */ }
+  }
+}
+/** Mirrors `stderr_looks_like_error` (ai.rs). */
+function stderrLooksLikeError(stderr) {
+  const STATUS = ["401", "403", "429", "500", "502", "503", "504"];
+  const PHRASES = ["permission denied", "unauthorized", "forbidden", "rate limit", "rate-limited",
+    "quota exceeded", "insufficient_quota", "invalid api key", "invalid_api_key", "authentication failed"];
+  // eslint-disable-next-line no-control-regex
+  const clean = String(stderr || "").replace(/\x1b\[[\x20-\x3f]*[\x40-\x7e]|\x1b./g, "");
+  return clean.split("\n").some((line) => {
+    const tokens = line.split(/[^A-Za-z0-9_]+/).filter(Boolean);
+    const words = line.split(/\s+/).filter(Boolean);
+    const lower = line.toLowerCase();
+    return tokens.some((t) => t === "ERROR" || t === "FATAL")
+      || line.trimStart().startsWith("error ")
+      || words.some((w) => w.endsWith("Error:") || w.endsWith("error:"))
+      || words.some((w, k) => k > 0 && words[k - 1].startsWith("HTTP/") && /^[45]\d\d$/.test(w))
+      || tokens.some((t, k) => k > 0 && ["status", "http", "code"].includes(tokens[k - 1].toLowerCase()) && STATUS.includes(t))
+      || /"name"\s*:\s*"[^"]*Error"/.test(line)
+      || PHRASES.some((p) => lower.includes(p));
+  });
+}
+/** Mirrors `claude_lockdown_args` (ai.rs): no tools, no project settings, no MCP. */
+function claudeLockdownArgs(caps) {
+  return [
+    ...(caps.tools ? ["--tools", ""] : []),
+    ...(caps.settingSources ? ["--setting-sources", "user"] : []),
+    ...(caps.strictMcp ? ["--strict-mcp-config"] : []),
+    ...(caps.noSessionPersistence ? ["--no-session-persistence"] : []),
+    "--disallowedTools", ...CLAUDE_DENIED_TOOLS,
+  ];
+}
+
+/** dev:web stand-in for the keychain-held AI API key (memory only). */
+let devAiApiKey = "";
+/** Origin the dev key is bound to — mirrors `StoredKey::origin` in ai_http.rs. */
+let devAiApiKeyOrigin = null;
+/**
+ * Parse an AI endpoint as `parse_endpoint` (ai_http.rs) does: http(s), a host,
+ * no credentials, no whitespace / control characters. Throws the same text.
+ */
+function parseAiEndpoint(raw) {
+  const s = String(raw ?? "");
+  if (/[\s\x00-\x1f\x7f]/.test(s)) throw new Error("AI endpoint contains whitespace or control characters");
+  let u;
+  try { u = new URL(s); } catch { throw new Error("AI endpoint must be an http(s) URL"); }
+  if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) {
+    throw new Error("AI endpoint must be an http(s) URL");
+  }
+  if (u.username || u.password) throw new Error("AI endpoint must not carry credentials");
+  return u;
+}
+/** Hosted providers the app's gate lets through (`KNOWN_PROVIDER_ORIGINS`). */
+const DEV_KNOWN_AI_ORIGINS = ["https://api.anthropic.com", "https://api.openai.com"];
+/**
+ * The app's open-endpoint gate, without its question: loopback and the known
+ * providers pass, any other origin only when GITWAND_DEV_AI_ORIGINS lists it.
+ */
+function devAiOriginAllowed(u) {
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const loopback =
+    host === "localhost" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host === "::1";
+  return loopback || DEV_KNOWN_AI_ORIGINS.includes(u.origin) || devAllowedAiOrigins.has(u.origin);
+}
+/**
+ * dev:web stand-in for the origins allowed in the keychain: those
+ * GITWAND_DEV_AI_ORIGINS lists, normalised to an origin. Revoking one
+ * (`/api/ai-revoke-endpoint`) lasts until the dev server restarts.
+ */
+const devAllowedAiOrigins = new Set(
+  String(process.env.GITWAND_DEV_AI_ORIGINS ?? "")
+    .split(",")
+    .map((o) => {
+      try { return parseAiEndpoint(o.trim()).origin; } catch { return null; }
+    })
+    .filter(Boolean),
+);
+const devAiKeyInfo = () => (devAiApiKey ? { hint: aiKeyHint(devAiApiKey), origin: devAiApiKeyOrigin } : null);
+/** dev:web stand-in for the telemetry opt-out marker. */
+let devTelemetryEnabled = true;
+/** dev:web stand-in for the software-rendering marker. */
+let devSoftwareRendering = false;
+/** Masked hint of a key — mirrors `key_hint` in commands/ai_http.rs. */
+function aiKeyHint(key) {
+  if (!key) return null;
+  const chars = [...key];
+  if (chars.length <= 8) return "••••••••";
+  return chars.slice(0, 4).join("") + "••••" + chars.slice(-4).join("");
+}
+
+/**
+ * Effort levels the AI CLIs accept — same allowlist as the Rust backend's
+ * `valid_effort`. Returns the level, or "" to let the CLI keep its default.
+ */
+const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+function validEffort(effort) {
+  const e = String(effort ?? "").trim();
+  return EFFORT_LEVELS.includes(e) ? e : "";
+}
 console.log(`[dev-server] gh binary:  ${GH}`);
 console.log(`[dev-server] git binary: ${GIT}`);
 
@@ -182,6 +1208,11 @@ console.log(`[dev-server] git binary: ${GIT}`);
  * non-zero or the process fails to spawn.
  */
 function gitSpawn(args, cwd) {
+  return gitSpawnBytes(args, cwd).then((buf) => buf.toString("utf-8"));
+}
+
+/** `gitSpawn`, resolving the raw stdout bytes. */
+function gitSpawnBytes(args, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(GIT, args, { cwd });
     const stdoutChunks = [];
@@ -197,9 +1228,1022 @@ function gitSpawn(args, cwd) {
         reject(new Error(`git ${args.join(" ")} exited with ${code}: ${stderr.trim()}`));
         return;
       }
-      resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
+      resolve(Buffer.concat(stdoutChunks));
     });
   });
+}
+
+/** Mirrors `DIFF_TRUNCATE_BYTES` in src-tauri/src/types.rs. */
+const DIFF_TRUNCATE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Mirrors `truncate_diff_output` in src-tauri/src/commands/read.rs: cap raw
+ * diff bytes at DIFF_TRUNCATE_BYTES, cut back to the last newline so the
+ * parser only sees complete lines, and report the original size.
+ */
+function truncateDiffOutput(raw) {
+  if (raw.length <= DIFF_TRUNCATE_BYTES) return { text: raw.toString("utf-8"), truncatedFromBytes: undefined };
+  let cut = DIFF_TRUNCATE_BYTES;
+  while (cut > 0 && raw[cut - 1] !== 0x0a) cut--;
+  return { text: raw.subarray(0, cut).toString("utf-8"), truncatedFromBytes: raw.length };
+}
+
+/**
+ * `gitSpawn` that never rejects on the exit code: resolves `{ code, stdout,
+ * stderr }` (`code` null when git died on a signal — Rust's `code()` is
+ * `None`). `input`, when given, is written to stdin; otherwise stdin is
+ * closed, as Rust's `Stdio::null()`. `env` adds to the inherited environment.
+ * Rejects only when git cannot be spawned.
+ */
+function gitSpawnInput(args, cwd, { input, env } = {}) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(GIT, args, {
+      cwd,
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+    child.on("error", (err) => reject(err));
+    child.on("close", (code) => {
+      const stdoutBytes = Buffer.concat(stdoutChunks);
+      resolvePromise({
+        code,
+        stdout: stdoutBytes.toString("utf-8"),
+        stdoutBytes,
+        stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+      });
+    });
+    if (input !== undefined) {
+      // A child that exits without reading closes the pipe: its exit code is
+      // the answer, not this write's error.
+      child.stdin.on("error", () => {});
+      child.stdin.end(input);
+    }
+  });
+}
+
+// ─── Combined diff (v3.15) ──────────────────────────────────────────────────
+//
+// Mirror of `src-tauri/src/combined/` (mod.rs, order.rs, replay.rs) and of
+// `parse_multi_file_diff_capped` (commands/read.rs), function by function, with
+// the same git arguments, the same error strings and the same output — but in
+// the TS shape (`GitDiff` hunks in camelCase, as `/api/git-show` answers).
+// `tests/parity/git-combined-diff.test.mjs` compares the two.
+
+const COMBINED_MIN_COMMITS = 2;
+const COMBINED_MAX_COMMITS = 50;
+
+/** Input refused before or while resolving it: the route answers 400. */
+class CombinedInputError extends Error {}
+
+/** Mirrors `COMBINED_BUDGET_BYTES` in src-tauri/src/combined/budget.rs. */
+const COMBINED_BUDGET_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The payload budget in force. `GITWAND_COMBINED_BUDGET_BYTES` is a test hook
+ * (the parity suite sets it, on this dev server and on the Rust probe, to cut
+ * small repos): the shipped app has no such override.
+ */
+function combinedBudget() {
+  const v = process.env.GITWAND_COMBINED_BUDGET_BYTES;
+  return v !== undefined && /^\d+$/.test(v) ? Number(v) : COMBINED_BUDGET_BYTES;
+}
+
+/** Mirrors `LINE_OVERHEAD_BYTES` / `FILE_OVERHEAD_BYTES` in budget.rs. */
+const COMBINED_LINE_OVERHEAD_BYTES = 64;
+const COMBINED_FILE_OVERHEAD_BYTES = 256;
+
+/** budget.rs `lines_weight`: content bytes (UTF-8) + the per-line overhead. */
+function combinedLinesWeight(d) {
+  let n = 0;
+  for (const h of d.hunks) {
+    for (const l of h.lines) n += Buffer.byteLength(l.content, "utf8") + COMBINED_LINE_OVERHEAD_BYTES;
+  }
+  return n;
+}
+
+/** budget.rs `weight`: the per-file overhead + the lines. */
+function combinedWeight(d) {
+  return COMBINED_FILE_OVERHEAD_BYTES + combinedLinesWeight(d);
+}
+
+/**
+ * replay.rs `truncated_names`: every name of a file with a truncated entry, in
+ * the net diff or any step, or with an opaque step entry (`opaque`) — a file being all the names its entries link by
+ * renames (union-find, as `combinedApplyBudget` groups step entries).
+ */
+function combinedTruncatedNames(diffs, steps, opaque) {
+  const parent = new Map();
+  const root = (name) => {
+    let r = name;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r);
+    parent.set(name, r);
+    return r;
+  };
+  const all = [...diffs, ...steps.flat()];
+  for (const d of all) {
+    const a = root(d.path);
+    if (d.oldPath !== undefined) {
+      const b = root(d.oldPath);
+      if (a !== b) parent.set(b, a);
+    }
+  }
+  const seeds = new Set(all.filter((d) => d.truncatedFromBytes !== undefined).map((d) => root(d.path)));
+  for (const name of opaque) seeds.add(root(name));
+  const names = new Set();
+  if (seeds.size === 0) return names;
+  for (const n of [...parent.keys()]) if (seeds.has(root(n))) names.add(n);
+  return names;
+}
+
+/**
+ * budget.rs `apply_budget`: (a) drop the step entries of whole files (names
+ * linked by renames), heaviest first, ties by smallest name; (b) then make the
+ * net / per-commit entries whose lines weigh most header-only, ties in payload
+ * order. Entries with no line are never made header-only. Mutates; returns
+ * `{ truncated, omitted }` — whether it cut anything, and the entries (b)
+ * made header-only as `{ path, commit }` (commit: the per-commit section's
+ * hash, null for a net entry), sorted by path then net first then commit,
+ * unique (`BudgetCut`, `CombinedBudgetOmitted`).
+ */
+function combinedApplyBudget(diffs, steps, fallback, budget) {
+  const entries = [...diffs, ...fallback.flatMap((f) => f.perCommit.map((p) => p.diff))];
+  const commits = [...diffs.map(() => null), ...fallback.flatMap((f) => f.perCommit.map((p) => p.hash))];
+  let total = entries.reduce((n, d) => n + combinedWeight(d), 0) +
+    steps.flat().reduce((n, d) => n + combinedWeight(d), 0);
+  if (total <= budget) return { truncated: false, omitted: [] };
+  let cut = false;
+  const omitted = new Map();
+
+  // (a) Files = names linked by renames; each file's root is its smallest name.
+  const parent = new Map();
+  const root = (name) => {
+    let r = name;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r);
+    parent.set(name, r);
+    return r;
+  };
+  for (const d of steps.flat()) {
+    const a = root(d.path);
+    if (d.oldPath !== undefined) {
+      const b = root(d.oldPath);
+      if (a !== b) {
+        const [lo, hi] = cmpCodePoints(a, b) < 0 ? [a, b] : [b, a];
+        parent.set(hi, lo);
+      }
+    }
+  }
+  const groups = new Map();
+  for (const d of steps.flat()) {
+    const r = root(d.path);
+    groups.set(r, (groups.get(r) ?? 0) + combinedWeight(d));
+  }
+  const order = [...groups.entries()]
+    .filter(([, n]) => n > 0)
+    .sort(([a], [b]) => cmpCodePoints(a, b))
+    .sort(([, x], [, y]) => y - x);
+  const dropped = new Set();
+  for (const [name, n] of order) {
+    if (total <= budget) break;
+    total -= n;
+    dropped.add(name);
+    cut = true;
+  }
+  if (dropped.size > 0) {
+    for (let i = 0; i < steps.length; i++) steps[i] = steps[i].filter((d) => !dropped.has(root(d.path)));
+  }
+
+  // (b) Header-only entries, largest first.
+  if (total > budget) {
+    const bySize = entries.map((d, i) => [i, combinedLinesWeight(d)]).filter(([, n]) => n > 0).sort(([, x], [, y]) => y - x);
+    for (const [i, n] of bySize) {
+      if (total <= budget) break;
+      entries[i].hunks = [];
+      entries[i].truncatedFromBytes = n;
+      omitted.set(`${entries[i].path}\0${commits[i] ?? ""}`, { path: entries[i].path, commit: commits[i] });
+      total -= n;
+      cut = true;
+    }
+  }
+  const byEntry = (a, b) =>
+    cmpCodePoints(a.path, b.path) ||
+    (a.commit === b.commit ? 0 : a.commit === null ? -1 : b.commit === null ? 1 : cmpCodePoints(a.commit, b.commit));
+  return { truncated: cut, omitted: [...omitted.values()].sort(byEntry) };
+}
+
+/** `git version 2.39.3 (Apple Git-146)` → `[2, 39]` (`stack::guard`). */
+async function combinedGitVersion() {
+  let out;
+  try {
+    out = await gitSpawnInput(["--version"], process.cwd());
+  } catch {
+    return null;
+  }
+  if (out.code !== 0) return null;
+  const t = out.stdout.trim();
+  if (!t.startsWith("git version ")) return null;
+  const nums = t.slice("git version ".length).split(".");
+  const num = (s) => (s !== undefined && /^\d+$/.test(s) ? Number(s) : null);
+  const major = num(nums[0]);
+  const minor = num(nums[1]);
+  return major === null || minor === null ? null : [major, minor];
+}
+
+/** mod.rs `validate_hashes`. */
+function combinedValidateHashes(hashes) {
+  const out = [];
+  for (const h of hashes) {
+    if (!(h.length >= 7 && h.length <= 64 && /^[0-9a-fA-F]+$/.test(h))) {
+      throw new CombinedInputError(`Invalid commit hash: ${h}`);
+    }
+    if (!out.includes(h)) out.push(h);
+  }
+  if (out.length < COMBINED_MIN_COMMITS) throw new CombinedInputError("Select at least 2 commits.");
+  if (out.length > COMBINED_MAX_COMMITS) throw new CombinedInputError("Select at most 50 commits.");
+  return out;
+}
+
+/** order.rs `run`: `git_cmd()` with no pins. */
+async function combinedOrderRun(cwd, args) {
+  try {
+    return await gitSpawnInput(args, cwd);
+  } catch (e) {
+    throw new Error(`git: ${e.message}`);
+  }
+}
+
+/** order.rs `resolve_and_order`: full hashes, ancestors first. */
+async function combinedResolveAndOrder(cwd, hashes) {
+  const remaining = [];
+  for (const h of hashes) {
+    const out = await combinedOrderRun(cwd, ["rev-parse", "--verify", "--end-of-options", `${h}^{commit}`]);
+    if (out.code !== 0) throw new CombinedInputError(`Unknown commit: ${h}`);
+    const full = out.stdout.trim();
+    if (!remaining.includes(full)) remaining.push(full);
+  }
+  if (remaining.length < COMBINED_MIN_COMMITS) throw new CombinedInputError("Select at least 2 commits.");
+  if (remaining.length > COMBINED_MAX_COMMITS) throw new CombinedInputError("Select at most 50 commits.");
+
+  // `describe`
+  const log = await combinedOrderRun(cwd, [
+    "log",
+    "--no-walk=unsorted",
+    "--no-show-signature",
+    "--format=%H%x00%ct%x00%h%x00%s%x00%an%x00%aI",
+    "--end-of-options",
+    ...remaining,
+  ]);
+  if (log.code !== 0) throw new Error(`git log failed: ${log.stderr.trim()}`);
+  const meta = new Map();
+  for (const line of rustLines(log.stdout)) {
+    const f = line.split("\0");
+    if (f.length !== 6) continue;
+    const ts = /^[+-]?\d+$/.test(f[1]) ? Number(f[1]) : 0;
+    meta.set(f[0], [ts, { hash: f[0], shortHash: f[2], subject: f[3], author: f[4], date: f[5] }]);
+  }
+  const missing = remaining.find((h) => !meta.has(h));
+  if (missing !== undefined) throw new Error(`Could not read commit metadata: ${missing}`);
+
+  let result = [];
+  let rest = [...remaining];
+  while (rest.length > 0) {
+    let tips;
+    if (rest.length === 1) {
+      tips = [...rest];
+    } else {
+      const out = await combinedOrderRun(cwd, ["merge-base", "--independent", ...rest]);
+      if (out.code !== 0) throw new Error(`git merge-base failed: ${out.stderr.trim()}`);
+      tips = rustLines(out.stdout).map((l) => l.trim()).filter((l) => l !== "");
+    }
+    if (tips.length === 0) throw new Error("Could not order the selected commits.");
+    rest = rest.filter((h) => !tips.includes(h));
+    const layer = tips.filter((h) => meta.has(h)).map((h) => meta.get(h));
+    layer.sort((a, b) => a[0] - b[0]); // stable, like `sort_by_key`
+    result = [...layer.map(([, c]) => ({ ...c })), ...result];
+  }
+  return result;
+}
+
+/** Fixed identity for the synthetic commits (replay.rs `SYNTHETIC_ENV`). */
+const COMBINED_SYNTHETIC_ENV = {
+  GIT_AUTHOR_NAME: "GitWand",
+  GIT_AUTHOR_EMAIL: "combined-diff@gitwand.local",
+  GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+  GIT_COMMITTER_NAME: "GitWand",
+  GIT_COMMITTER_EMAIL: "combined-diff@gitwand.local",
+  GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+};
+
+/** Pins of replay.rs `Repo::git()`. */
+const COMBINED_GIT_PINS = [
+  "-c", "diff.noprefix=false",
+  "-c", "diff.mnemonicPrefix=false",
+  "-c", "core.quotePath=false",
+  "-c", "diff.renameLimit=7000",
+];
+
+/** git/cmd.rs `PATCH_CONFIG`: global options for a git call whose patch is
+ *  parsed — literal names, `a/` `b/` prefixes whatever the user's config. */
+const PATCH_CONFIG = [
+  "-c", "core.quotePath=false",
+  "-c", "diff.noprefix=false",
+  "-c", "diff.mnemonicPrefix=false",
+  "-c", "diff.srcPrefix=a/",
+  "-c", "diff.dstPrefix=b/",
+  "-c", "diff.submodule=short",
+];
+
+/** git/cmd.rs `PATCH_FLAGS`: no colour codes, no external diff tool. */
+const PATCH_FLAGS = ["--no-color", "--no-ext-diff"];
+
+/** replay.rs `PATHSPEC_BATCH_BYTES`: the argv stays under 8 KB. */
+const COMBINED_PATHSPEC_BATCH_BYTES = 7 * 1024;
+
+/** replay.rs `pathspec_batches`: units (a name, or a rename's two names) never
+ *  split, at most `max` UTF-8 bytes (name + NUL each) per batch, in order. */
+function combinedPathspecBatches(units, max) {
+  const batches = [];
+  let cur = [];
+  let size = 0;
+  for (const unit of units) {
+    const n = unit.reduce((a, p) => a + Buffer.byteLength(p, "utf8") + 1, 0);
+    if (cur.length > 0 && size + n > max) {
+      batches.push(cur);
+      cur = [];
+      size = 0;
+    }
+    size += n;
+    cur.push(...unit);
+  }
+  if (cur.length > 0) batches.push(cur);
+  return batches;
+}
+
+/** replay.rs `Repo`. */
+class CombinedRepo {
+  constructor(cwd, paths, core) {
+    this.cwd = cwd;
+    /** null = whole repository. */
+    this.paths = paths;
+    this.core = core;
+    this.emptyTreeId = null;
+  }
+
+  async output(args, what, opts = {}) {
+    try {
+      return await gitSpawnInput([...COMBINED_GIT_PINS, ...args], this.cwd, opts);
+    } catch (e) {
+      throw new Error(`Failed to run git ${what}: ${e.message}`);
+    }
+  }
+
+  async stdout(args, what, opts = {}) {
+    const out = await this.output(args, what, opts);
+    if (out.code !== 0) throw new Error(`git ${what} failed: ${out.stderr.trim()}`);
+    return out.stdout;
+  }
+
+  /** `-- <paths>` (literal pathspecs). */
+  pathspec() {
+    return ["--", ...(this.paths ?? [])];
+  }
+
+  inPaths(path) {
+    if (this.paths === null) return true;
+    return this.paths.some((q) => combinedCovers(q, path));
+  }
+
+  async emptyTree() {
+    if (this.emptyTreeId !== null) return this.emptyTreeId;
+    this.emptyTreeId = (await this.stdout(["hash-object", "-t", "tree", "-w", "--stdin"], "hash-object")).trim();
+    return this.emptyTreeId;
+  }
+
+  /** `hash → [tree, first parent | null]`. */
+  async treesAndParents(hashes) {
+    const out = await this.stdout(
+      ["log", "--no-walk=unsorted", "--no-show-signature", "--no-color", "--format=%H%x00%T%x00%P", "--end-of-options", ...hashes],
+      "log",
+    );
+    const map = new Map();
+    for (const line of rustLines(out)) {
+      const f = line.split("\0");
+      if (f.length !== 3) continue;
+      const parent = f[2].split(" ").find((p) => p !== "") ?? null;
+      map.set(f[0], [f[1], parent]);
+    }
+    for (const h of hashes) {
+      if (!map.has(h)) throw new Error(`Could not read commit metadata: ${h}`);
+    }
+    return map;
+  }
+
+  async commitTree(tree, parent) {
+    const args = ["-c", "commit.gpgSign=false", "commit-tree", tree];
+    if (parent !== null) args.push("-p", parent);
+    args.push("-m", "GitWand combined diff");
+    return (await this.stdout(args, "commit-tree", { env: COMBINED_SYNTHETIC_ENV })).trim();
+  }
+
+  /** `[result tree, conflicted paths | null]`. */
+  async merge(base, ours, theirs) {
+    const p = await this.commitTree(base, null);
+    const b1 = await this.commitTree(ours, p);
+    const b2 = await this.commitTree(theirs, p);
+    const out = await this.output(
+      [
+        "-c", "merge.renames=true",
+        "-c", "merge.directoryRenames=conflict",
+        "-c", "merge.renameLimit=7000",
+        "-c", "merge.renormalize=false",
+        "-c", "merge.default=text",
+        "merge-tree", "--write-tree", "--name-only", "-z", b1, b2,
+      ],
+      "merge-tree",
+    );
+    if (out.code !== 0 && out.code !== 1) throw new Error(`git merge-tree failed: ${out.stderr.trim()}`);
+    // Only the tree and the paths (up to the first empty field) are checked:
+    // the messages are not read.
+    const end = out.stdoutBytes.indexOf("\0\0");
+    const fields = combinedUtf8Names(end === -1 ? out.stdoutBytes : out.stdoutBytes.subarray(0, end)).split("\0");
+    const tree = (fields[0] ?? "").trim();
+    if (tree === "") throw new Error("git merge-tree returned no tree");
+    if (out.code === 0) return [tree, null];
+    const paths = [];
+    for (const f of fields.slice(1)) {
+      if (f === "") break;
+      if (!paths.includes(f)) paths.push(f);
+    }
+    return [tree, paths];
+  }
+
+  /** replay.rs `diff`: the patch, its names checked against `touched`. */
+  async diff(a, b, unified0) {
+    return (await this.diffListed(a, b, unified0, await this.touched(a, b)))[0];
+  }
+
+  /** replay.rs `step_diff`: `[diffs, opaque names]` of a replay step. */
+  async stepDiff(a, b) {
+    return this.diffListed(a, b, true, await this.touched(a, b));
+  }
+
+  /** replay.rs `diff_listed`: `[diffs, opaque names]`. */
+  async diffListed(a, b, unified0, listed) {
+    const args = ["diff-tree", "-r", "-p", "-M", "--no-color", "--no-ext-diff", "--no-relative"];
+    if (unified0) args.push("-U0");
+    args.push(a, b, ...this.pathspec());
+    const out = await this.stdout(args, "diff-tree", { env: { GIT_LITERAL_PATHSPECS: "1" } });
+    const diffs = devParseMultiFileDiff(this.core, out, DIFF_TRUNCATE_BYTES);
+    combinedCheckNames(diffs, listed);
+    return [diffs, combinedOpaqueNames(this.core, out)];
+  }
+
+  /** `[old path of a rename | null, path]` per change. */
+  async touched(a, b) {
+    const res = await this.output(
+      ["diff-tree", "-r", "-M", "--name-status", "-z", "--no-relative", a, b, ...this.pathspec()],
+      "diff-tree",
+      { env: { GIT_LITERAL_PATHSPECS: "1" } },
+    );
+    if (res.code !== 0) throw new Error(`git diff-tree failed: ${res.stderr.trim()}`);
+    const out = combinedUtf8Names(res.stdoutBytes);
+    const fields = out.split("\0").filter((f) => f !== "");
+    const changes = [];
+    for (let i = 0; i < fields.length; ) {
+      const status = fields[i++];
+      const first = i < fields.length ? fields[i++] : null;
+      if (status.startsWith("R") || status.startsWith("C")) {
+        if (i < fields.length) changes.push([first, fields[i++]]);
+      } else if (first !== null) {
+        changes.push([null, first]);
+      }
+    }
+    return changes;
+  }
+
+  /** Paths whose `merge` attribute is not `unspecified`, `set` or `text` (the built-in text merge). */
+  async mergeDriven(paths) {
+    const out = new Set();
+    if (paths.length === 0) return out;
+    const stdout = await this.stdout(["check-attr", "--stdin", "-z", "merge"], "check-attr", {
+      input: paths.map((p) => `${p}\0`).join(""),
+    });
+    const fields = stdout.split("\0");
+    for (let i = 0; i + 3 <= fields.length; i += 3) {
+      const value = fields[i + 2];
+      if (value !== "unspecified" && value !== "set" && value !== "text") out.add(fields[i]);
+    }
+    return out;
+  }
+
+  /**
+   * replay.rs `blockers`: per path of `paths`, the commits outside the
+   * selection touching it (`--full-history`) on either side between the
+   * replay base and `parent` (`parent...base`), newest first, at most 5 — one unbounded `git log` walk per
+   * argv-sized pathspec batch, the `selected` hashes dropped afterwards (an
+   * earlier selected commit's ancestors stay: their changes are not in the
+   * replayed tree). A merge counts when it changed the path itself.
+   */
+  async blockers(parent, base, selected, paths) {
+    // A printed name is a path or under one: none starts with the record
+    // marker unless a path does (see `combinedParseLogNames`).
+    const marked = paths.find((p) => p.startsWith(COMBINED_LOG_RECORD_MARK));
+    if (marked !== undefined) throw new Error(`Combined diffs do not support the file name: ${marked}`);
+    const found = new Map();
+    for (const batch of combinedPathspecBatches(paths.map((p) => [p]), COMBINED_PATHSPEC_BATCH_BYTES)) {
+      const args = [
+        "-c", "log.follow=false",
+        "log", "--no-color", "--no-show-signature", "--no-renames", "--no-relative",
+        "--ignore-submodules=none", "--full-history", "--root", "--diff-merges=combined",
+        "--name-only", "-z", "--format=%x00%x01%H",
+        // `Ci^...<base>`: both sides, in one date-ordered walk.
+        base !== null ? `${parent}...${base}` : parent,
+      ];
+      args.push("--", ...batch);
+      const commits = combinedParseLogNames(await this.stdout(args, "log", { env: { GIT_LITERAL_PATHSPECS: "1" } }));
+      for (const path of batch) {
+        found.set(
+          path,
+          commits
+            .filter(([h, names]) => !selected.has(h) && names.some((n) => combinedCovers(path, n)))
+            .slice(0, 5)
+            .map(([h]) => h),
+        );
+      }
+    }
+    return found;
+  }
+}
+
+/**
+ * replay.rs `opaque_names`: names (new and old) of the sections with no hunk
+ * whose content changed — binary (`binary`), or any other hunkless section
+ * with an `index` line that is not an empty file's creation or deletion (fail
+ * closed). A pure rename or a mode change keeps its blob (no `index` line).
+ * Each such section is parsed alone.
+ */
+function combinedOpaqueNames(core, out) {
+  const sections = [];
+  for (const line of rustLines(out)) {
+    if (line.startsWith("diff --git ")) sections.push([line]);
+    else if (sections.length > 0) sections[sections.length - 1].push(line);
+  }
+  const names = [];
+  for (const section of sections) {
+    const headers = section.slice(1);
+    if (headers.some((l) => l.startsWith("@@"))) continue;
+    const indexed = headers.some((l) => l.startsWith("index "));
+    for (const d of devParseMultiFileDiff(core, section.join("\n"))) {
+      const emptyFile = d.status === "added" || d.status === "deleted";
+      if (!(d.binary === true || (indexed && !emptyFile))) continue;
+      if (d.oldPath !== undefined) names.push(d.oldPath);
+      names.push(d.path);
+    }
+  }
+  return names;
+}
+
+/** replay.rs `covers`: the literal pathspec `spec` matches `path` or a path under it. */
+function combinedCovers(spec, path) {
+  // `spec` is canonical (`combinedValidatePaths`): no empty or `.` component.
+  return path === spec || (path.startsWith(spec) && path.slice(spec.length).startsWith("/"));
+}
+
+/** replay.rs `LOG_RECORD_MARK`: the byte after the NUL opening each record. */
+const COMBINED_LOG_RECORD_MARK = "\x01";
+
+/**
+ * replay.rs `parse_log_names`: `[hash, names]` in walk order, from
+ * `--format=%x00%x01%H --name-only -z`. Records split on `\0\x01`; a
+ * commit's names follow `\n`, a merge's an empty field.
+ */
+function combinedParseLogNames(out) {
+  const commits = [];
+  const records = out.split("\0\x01");
+  if (records[0] !== "") throw new Error("Unexpected git log output");
+  for (const record of records.slice(1)) {
+    const fields = record.split("\0");
+    const hash = fields[0];
+    if (!/^[0-9a-fA-F]+$/.test(hash)) throw new Error(`Unexpected git log output: ${hash}`);
+    const names = [];
+    if (fields.length > 1) {
+      const first = fields[1];
+      if (first.startsWith("\n")) names.push(first.slice(1));
+      else if (first !== "") throw new Error(`Unexpected git log output: ${first}`);
+    }
+    for (const f of fields.slice(2)) if (f !== "") names.push(f);
+    commits.push([hash, names]);
+  }
+  return commits;
+}
+
+/**
+ * replay.rs `utf8_names`: NUL-separated names as text; the first name that is
+ * not valid UTF-8 is refused (decoded lossily it would vanish from both
+ * views), its invalid bytes shown as `\xNN`.
+ */
+function combinedUtf8Names(bytes) {
+  if (isUtf8(bytes)) return bytes.toString("utf-8");
+  let name = bytes;
+  for (let start = 0; start <= bytes.length; ) {
+    let end = bytes.indexOf(0, start);
+    if (end === -1) end = bytes.length;
+    const field = bytes.subarray(start, end);
+    if (!isUtf8(field)) {
+      name = field;
+      break;
+    }
+    start = end + 1;
+  }
+  throw new Error(`Combined diffs do not support the file name: ${combinedEscapeInvalidUtf8(name)}`);
+}
+
+/** Length of the valid UTF-8 sequence starting at `b[i]` (Unicode table 3-7), 0 if none. */
+function combinedUtf8SeqLen(b, i) {
+  const c = b[i];
+  if (c < 0x80) return 1;
+  let n;
+  let lo = 0x80;
+  let hi = 0xbf;
+  if (c >= 0xc2 && c <= 0xdf) n = 2;
+  else if (c === 0xe0) [n, lo] = [3, 0xa0];
+  else if (c === 0xed) [n, hi] = [3, 0x9f];
+  else if (c >= 0xe1 && c <= 0xef) n = 3;
+  else if (c === 0xf0) [n, lo] = [4, 0x90];
+  else if (c === 0xf4) [n, hi] = [4, 0x8f];
+  else if (c >= 0xf1 && c <= 0xf3) n = 4;
+  else return 0;
+  if (i + n > b.length || b[i + 1] < lo || b[i + 1] > hi) return 0;
+  for (let k = 2; k < n; k++) if (b[i + k] < 0x80 || b[i + k] > 0xbf) return 0;
+  return n;
+}
+
+/** replay.rs `escape_invalid_utf8`: each byte outside a valid sequence as `\xNN`. */
+function combinedEscapeInvalidUtf8(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; ) {
+    const n = combinedUtf8SeqLen(bytes, i);
+    if (n > 0) {
+      out += bytes.subarray(i, i + n).toString("utf-8");
+      i += n;
+    } else {
+      out += `\\x${bytes[i].toString(16).padStart(2, "0")}`;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * replay.rs `check_names`: the parsed names (`path`, `oldPath`) must be
+ * exactly the names of the `-z` listing; the first difference, in code-point
+ * order, is refused.
+ */
+function combinedCheckNames(diffs, listed) {
+  const parsed = new Set();
+  for (const d of diffs) {
+    parsed.add(d.path);
+    if (d.oldPath !== undefined) parsed.add(d.oldPath);
+  }
+  const exact = new Set();
+  for (const [old, path] of listed) {
+    if (old !== null) exact.add(old);
+    exact.add(path);
+  }
+  const diff = [...parsed].filter((n) => !exact.has(n)).concat([...exact].filter((n) => !parsed.has(n)));
+  if (diff.length > 0) {
+    const name = diff.sort(cmpCodePoints)[0];
+    throw new Error(`Combined diffs do not support the file name: ${name}`);
+  }
+}
+
+/**
+ * replay.rs `join_pairs`. `fallback`: Map path → `{ conflicted, source }`,
+ * `source` = `[step, conflicted path]` (blockers computed after the replay).
+ */
+function combinedJoinPairs(fallback, pairs) {
+  for (;;) {
+    let joined = false;
+    for (const [a, b] of pairs) {
+      for (const [from, to] of [[a, b], [b, a]]) {
+        const src = fallback.get(from);
+        if (src === undefined) continue;
+        const dst = fallback.get(to);
+        if (dst === undefined || (src.conflicted && !dst.conflicted)) {
+          fallback.set(to, { conflicted: src.conflicted, source: src.source });
+          joined = true;
+        }
+      }
+    }
+    if (!joined) return;
+  }
+}
+
+function combinedAddCompanion(fallback, path) {
+  if (!fallback.has(path)) fallback.set(path, { conflicted: false, source: null });
+}
+
+function combinedRenamePairs(diffs) {
+  return diffs.filter((d) => d.oldPath !== undefined).map((d) => [d.oldPath, d.path]);
+}
+
+function combinedTouches(d, set) {
+  return set.has(d.path) || (d.oldPath !== undefined && set.has(d.oldPath));
+}
+
+/** replay.rs `toplevel`: the working tree's toplevel of the repository `cwd` is in. */
+async function combinedToplevel(cwd) {
+  let out;
+  try {
+    out = await gitSpawnInput(["rev-parse", "--show-toplevel"], cwd);
+  } catch (e) {
+    throw new Error(`Failed to run git rev-parse: ${e.message}`);
+  }
+  if (out.code !== 0) throw new Error(`git rev-parse failed: ${out.stderr.trim()}`);
+  const top = out.stdout.endsWith("\n") ? out.stdout.slice(0, -1) : out.stdout;
+  if (top === "") throw new Error("git rev-parse failed: no working tree");
+  return top;
+}
+
+/**
+ * replay.rs `validate_paths`: each root-relative path passes the lexical
+ * pathspec check (not empty, no NUL, not absolute, no `..`; then no empty or
+ * `.` component, trailing `/` included), then its
+ * directory goes through `safeRepoPath` against the toplevel (a missing tail
+ * is accepted, a symlinked directory leading out refused). The last component
+ * is not resolved: a tracked symlink is a blob to git. Refused input (400).
+ */
+function combinedValidatePaths(toplevel, paths) {
+  for (const p of paths) {
+    try {
+      validateUntrackPathspec(p);
+      // `combinedCovers` compares names textually; git normalises `./f`,
+      // `d//f`, `d/./f` and `d/`. Refused, so the two never disagree.
+      if (p.split("/").some((c) => c === "" || c === ".")) {
+        throw new Error(`path must not have an empty or \`.\` component (got: ${p})`);
+      }
+      const i = p.lastIndexOf("/");
+      safeRepoPath(toplevel, i > 0 ? p.slice(0, i) : ".");
+    } catch (e) {
+      throw new CombinedInputError(e.message);
+    }
+  }
+}
+
+/** lineage.rs `MAX_LINEAGE`. */
+const COMBINED_MAX_LINEAGE = 200_000;
+
+/**
+ * lineage.rs `file_lineage`: the `--follow` history of `pathIn` (root-relative,
+ * validated as the combined diff's `paths`), newest first, as `{ hash, path? }`
+ * (no `path` for a merge). Refused input throws `CombinedInputError` (400).
+ */
+async function devFileLineage(cwdIn, pathIn) {
+  const top = await combinedToplevel(cwdIn);
+  combinedValidatePaths(top, [pathIn]);
+  let out;
+  try {
+    out = await gitSpawnInput(
+      [
+        ...COMBINED_GIT_PINS,
+        "-c", "diff.relative=false",
+        "log", "--follow", "--no-show-signature", "--no-color", "--name-only", "-z",
+        "-n", String(COMBINED_MAX_LINEAGE + 1), "--format=%x00%x01%H", "--", pathIn,
+      ],
+      top,
+      { env: { GIT_LITERAL_PATHSPECS: "1" } },
+    );
+  } catch (e) {
+    throw new Error(`Failed to run git log: ${e.message}`);
+  }
+  if (out.code !== 0) throw new Error(`git log failed: ${out.stderr.trim()}`);
+  const records = combinedParseLogNames(combinedUtf8Names(out.stdoutBytes));
+  if (records.length > COMBINED_MAX_LINEAGE) {
+    throw new Error(`File history too long: more than ${COMBINED_MAX_LINEAGE} commits.`);
+  }
+  return records.map(([hash, names]) => (names.length > 0 ? { hash, path: names[0] } : { hash }));
+}
+
+const COMBINED_CANCELLED = "Combined diff cancelled.";
+
+/** replay.rs `generations`: toplevel → the generation of its latest request. */
+const combinedGenerations = new Map();
+
+/**
+ * replay.rs `Ticket`: each request supersedes the earlier ones of the same
+ * repository; `check()` throws once a later one started. Closing the view
+ * without a new request lets the current replay finish.
+ */
+function combinedTakeTicket(toplevel) {
+  const mine = (combinedGenerations.get(toplevel) ?? 0) + 1;
+  combinedGenerations.set(toplevel, mine);
+  return {
+    check() {
+      if (combinedGenerations.get(toplevel) !== mine) throw new Error(COMBINED_CANCELLED);
+    },
+  };
+}
+
+/** replay.rs `combined_diff`. `pathsIn`: repository-root-relative. */
+async function devCombinedDiff(cwdIn, hashesIn, pathsIn) {
+  const version = await combinedGitVersion();
+  if (!(version !== null && (version[0] > 2 || (version[0] === 2 && version[1] >= 38)))) {
+    const found = version !== null ? `${version[0]}.${version[1]}` : "unknown";
+    throw new Error(`Combined diffs need git 2.38 or later (found ${found}).`);
+  }
+  const hashes = combinedValidateHashes(hashesIn);
+  // Every command runs from the toplevel (replay.rs): `check-attr --stdin`
+  // and pathspecs are cwd-relative, printed names and `paths` root-relative.
+  const cwd = await combinedToplevel(cwdIn);
+  if (pathsIn) combinedValidatePaths(cwd, pathsIn);
+  const ticket = combinedTakeTicket(cwd);
+  const commits = await combinedResolveAndOrder(cwd, hashes);
+  const core = await loadDevCore();
+  const repo = new CombinedRepo(cwd, pathsIn && pathsIn.length > 0 ? pathsIn : null, core);
+
+  // 1. Trees and first parents of the selection and of those parents.
+  const selected = commits.map((c) => c.hash);
+  const meta = await repo.treesAndParents(selected);
+  const parents = [];
+  for (const h of selected) {
+    const p = meta.get(h)[1];
+    if (p !== null && !parents.includes(p) && !meta.has(p)) parents.push(p);
+  }
+  const parentMeta = parents.length === 0 ? new Map() : await repo.treesAndParents(parents);
+  const treeOf = (h) => (meta.get(h) ?? parentMeta.get(h))?.[0] ?? "";
+  const replayed = selected.map((h) => {
+    const [tree, parent] = meta.get(h);
+    return { hash: h, tree, parent, parentTree: parent !== null ? treeOf(parent) : null };
+  });
+
+  const base = replayed[0].parent;
+  const baseTree = replayed[0].parentTree ?? (await repo.emptyTree());
+
+  // 2. Replay, recording each step and growing the fallback set.
+  let acc = baseTree;
+  const fallback = new Map();
+  const steps = [];
+  // Names of the opaque (binary) step entries: their file loses every step.
+  const opaque = [];
+  for (let i = 0; i < replayed.length; i++) {
+    ticket.check();
+    const c = replayed[i];
+    const parentTree = c.parentTree ?? (await repo.emptyTree());
+    const merged = acc !== parentTree;
+    const [result, conflicted] = merged ? await repo.merge(parentTree, acc, c.tree) : [c.tree, null];
+    const [step, stepOpaque] = await repo.stepDiff(acc, result);
+    opaque.push(...stepOpaque);
+    const ciChanges = merged ? await repo.touched(parentTree, c.tree) : [];
+    // Rename pairs of this step (step diff, `Ci` itself); with a filter, also
+    // the pairs crossing it once the fallback holds an out-of-filter path.
+    const pairs = combinedRenamePairs(step);
+    for (const [old, path] of ciChanges) if (old !== null) pairs.push([old, path]);
+    const crossing = async () => {
+      if (repo.paths === null || ![...fallback.keys()].some((p) => !repo.inPaths(p))) return;
+      const whole = new CombinedRepo(cwd, null, core);
+      const listed = await whole.touched(acc, result);
+      if (merged) listed.push(...(await whole.touched(parentTree, c.tree)));
+      for (const [old, path] of listed) {
+        if (old !== null && repo.inPaths(old) !== repo.inPaths(path)) pairs.push([old, path]);
+      }
+    };
+    if (conflicted !== null) {
+      // (a) conflicted, blockers computed later; out-of-filter paths kept
+      //     (never shown) for their in-filter rename partners.
+      const direct = conflicted.some((p) => repo.inPaths(p));
+      for (const path of conflicted) {
+        if (fallback.get(path)?.conflicted) continue;
+        fallback.set(path, { conflicted: true, source: [i, path] });
+      }
+      await crossing();
+      combinedJoinPairs(fallback, pairs);
+      // (b), (c) companions — only when the conflict reaches the filter.
+      const reaches =
+        direct ||
+        [...fallback.entries()].some(([p, f]) => f.conflicted && f.source !== null && f.source[0] === i && repo.inPaths(p));
+      if (reaches) {
+        for (const d of step) {
+          combinedAddCompanion(fallback, d.path);
+          if (d.oldPath !== undefined) combinedAddCompanion(fallback, d.oldPath);
+        }
+        for (const [old, path] of ciChanges) {
+          if (old !== null) combinedAddCompanion(fallback, old);
+          combinedAddCompanion(fallback, path);
+        }
+      }
+    } else {
+      await crossing();
+    }
+    if (merged) {
+      // Every merged step, conflicted ones too: a merge is only trusted for
+      // the built-in text driver (replay.rs).
+      const candidates = [];
+      for (const d of step) {
+        candidates.push(d.path);
+        if (d.oldPath !== undefined) candidates.push(d.oldPath);
+      }
+      for (const [old, path] of ciChanges) {
+        if (old !== null) candidates.push(old);
+        candidates.push(path);
+      }
+      const unique = [...new Set(candidates)].filter((p) => !fallback.has(p)).sort(cmpCodePoints);
+      for (const path of await repo.mergeDriven(unique)) combinedAddCompanion(fallback, path);
+    }
+    // After every step: the fallback set is closed under renames.
+    if (fallback.size > 0) combinedJoinPairs(fallback, pairs);
+    steps.push(step);
+    acc = result;
+  }
+
+  // 3. Net diff. A rename pair touching the fallback goes there whole (with a
+  //    filter, a pair crossing it too); then only in-filter fallback paths stay.
+  let diffs = await repo.diff(baseTree, acc, false);
+  const netPairs = combinedRenamePairs(diffs);
+  if (repo.paths !== null && [...fallback.keys()].some((p) => !repo.inPaths(p))) {
+    for (const [old, path] of await new CombinedRepo(cwd, null, core).touched(baseTree, acc)) {
+      if (old !== null && repo.inPaths(old) !== repo.inPaths(path)) netPairs.push([old, path]);
+    }
+  }
+  combinedJoinPairs(fallback, netPairs);
+  for (const p of [...fallback.keys()]) if (!repo.inPaths(p)) fallback.delete(p);
+  diffs = diffs.filter((d) => !combinedTouches(d, fallback));
+
+  // Blockers of the conflicted paths shown: one batched walk per step.
+  ticket.check();
+  const sources = new Map();
+  for (const fb of fallback.values()) {
+    if (fb.source === null) continue;
+    const [i, path] = fb.source;
+    if (!sources.has(i)) sources.set(i, new Set());
+    sources.get(i).add(path);
+  }
+  const blockers = new Map();
+  const chosen = new Set(replayed.map((r) => r.hash));
+  for (const [i, paths] of sources) {
+    const parent = replayed[i].parent;
+    if (parent === null) continue;
+    const found = await repo.blockers(parent, base, chosen, [...paths].sort(cmpCodePoints));
+    for (const [path, list] of found) blockers.set(`${i}\0${path}`, list);
+  }
+
+  // 5. Steps: no fallback file, no file with any truncated or opaque entry — a file
+  //    being every name its entries link by renames (replay.rs).
+  const truncated = combinedTruncatedNames(diffs, steps, opaque);
+  const keptSteps = steps.map((step) =>
+    step.filter(
+      (d) =>
+        !combinedTouches(d, fallback) &&
+        !truncated.has(d.path) &&
+        !(d.oldPath !== undefined && truncated.has(d.oldPath)),
+    ),
+  );
+
+  // 4. Per-commit diffs of the fallback files, in replay order. Only the
+  //    fallback's names are diffed (never the whole commit), as pathspecs in
+  //    argv-sized batches; a rename's two names share a batch (replay.rs).
+  const perPath = new Map();
+  if (fallback.size > 0) {
+    const whole = new CombinedRepo(cwd, null, core);
+    for (const c of replayed) {
+      ticket.check();
+      const parentTree = c.parentTree ?? (await repo.emptyTree());
+      const listed = await whole.touched(parentTree, c.tree);
+      const units = listed
+        .filter(([old, path]) => fallback.has(path) || (old !== null && fallback.has(old)))
+        .map(([old, path]) => (old !== null ? [old, path] : [path]));
+      for (const batch of combinedPathspecBatches(units, COMBINED_PATHSPEC_BATCH_BYTES)) {
+        // `diff` re-lists the batch with `-z`: the name cross-check runs per batch.
+        for (const d of await new CombinedRepo(cwd, batch, core).diff(parentTree, c.tree, false)) {
+          const owner = fallback.has(d.path)
+            ? d.path
+            : d.oldPath !== undefined && fallback.has(d.oldPath)
+              ? d.oldPath
+              : null;
+          if (owner === null) continue;
+          if (!perPath.has(owner)) perPath.set(owner, []);
+          perPath.get(owner).push({ hash: c.hash, diff: d });
+        }
+      }
+    }
+  }
+  // Fallback paths no selected commit touches are conflict artefacts.
+  const fallbackOut = [];
+  for (const [path, fb] of [...fallback.entries()].sort(([a], [b]) => cmpCodePoints(a, b))) {
+    const perCommit = perPath.get(path);
+    if (perCommit === undefined) continue;
+    const list = fb.source !== null ? blockers.get(`${fb.source[0]}\0${fb.source[1]}`) : undefined;
+    fallbackOut.push({ path, conflicted: fb.conflicted, perCommit, blockers: list ?? [] });
+  }
+
+  // 6. Total payload budget: steps first, then header-only entries.
+  const cut = combinedApplyBudget(diffs, keptSteps, fallbackOut, combinedBudget());
+  return {
+    base, commits, diffs, steps: keptSteps, fallback: fallbackOut,
+    truncated: cut.truncated, budgetOmitted: cut.omitted,
+  };
 }
 
 /**
@@ -261,7 +2305,7 @@ function resolveDefaultBranchName(resolvedCwd, configured) {
 let _mockGithubPolls = 0;
 
 // ── Terminal PTY state (dev:web only) ────────────────────────────────────────
-const devPtys = new Map(); // id -> { proc }
+const devPtys = new Map(); // id -> { proc, cwd (real path) }
 let devPtyNextId = 1;
 
 // ── Live Repo watcher state (dev:web only, v3.10.0) ──────────────────────────
@@ -320,7 +2364,10 @@ function devClassifyPath(rel) {
     if (inner === "index") return "index";
     if (inner === "config") return "config";
     if (inner.startsWith("refs/") || inner === "packed-refs") return "refs";
-    if (["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG"].includes(inner)
+    if (["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG",
+      // As in watcher.rs `classify_path`: the bisect's own files.
+      "BISECT_LOG", "BISECT_START", "BISECT_EXPECTED_REV", "BISECT_ANCESTORS_OK", "BISECT_NAMES",
+      "BISECT_TERMS", "BISECT_RUN", "BISECT_HEAD", "BISECT_FIRST_PARENT"].includes(inner)
       || inner.startsWith("rebase-merge/") || inner.startsWith("rebase-apply/")) return "mergeState";
     return null;
   }
@@ -357,6 +2404,9 @@ function devCoalesceRepoPaths(batch) {
   };
 }
 
+/** `/api/gh-gitwand-writable`'s last answer and when (#301). */
+let devGitwandWritable = null;
+
 /**
  * Get a GitHub OAuth token — tries in order:
  *  1. GH_TOKEN / GITHUB_TOKEN env vars
@@ -381,9 +2431,54 @@ function getGithubToken() {
   return null;
 }
 
+/** `HostName` that `ssh` connects to for `host` (`ssh -G` reads the config
+ *  without connecting); null when `ssh` can't be asked. A positive answer is
+ *  kept, a negative one asked again after a minute. `ssh` gets only what it
+ *  needs to read its config, no token. Mirrors `ssh_resolved_host` in
+ *  `commands/gh.rs`. */
+const sshHostCache = new Map();
+const SSH_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SystemRoot", "windir", "TMPDIR", "TEMP", "TMP"];
+function sshResolvedHost(host) {
+  if (!/^[A-Za-z0-9._-]+$/.test(host) || host.startsWith("-")) return null;
+  const hit = sshHostCache.get(host);
+  if (hit && (hit.resolved || Date.now() - hit.at < 60_000)) return hit.resolved;
+  const env = Object.fromEntries(SSH_ENV_KEYS.filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]]));
+  const r = spawnSync("ssh", ["-G", host], { encoding: "utf-8", env, timeout: 5000 });
+  const line = r.status === 0 ? (r.stdout || "").split("\n").find((l) => l.startsWith("hostname ")) : null;
+  const resolved = line ? line.slice("hostname ".length).trim() || null : null;
+  sshHostCache.set(host, { resolved, at: Date.now() });
+  return resolved;
+}
+
+const isGithubCom = (host) => host === "github.com" || host.endsWith(".github.com");
+
+/** `owner/repo` from a github.com remote URL, or null. Same reading as
+ *  `gh_repo_from_remote_url` in `commands/gh.rs` (scp-style with any user or
+ *  none, ports skipped, an SSH host resolved through `ssh -G`), restricted to
+ *  github.com: the dev-server's REST routes only talk to api.github.com, so a
+ *  GitHub Enterprise origin gives null here and `gh` picks the repo itself. */
+function githubNwoFromUrl(rawUrl) {
+  const url = rawUrl.trim();
+  let host, path;
+  const scheme = url.match(/^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?\/(.*)$/i);
+  if (scheme) {
+    [, host, path] = scheme;
+  } else {
+    const scp = url.match(/^(?:[^@\s/\\]+@)?([^:/\\\s]+):(.*)$/);
+    if (!scp) return null;
+    [, host, path] = scp;
+  }
+  host = host.toLowerCase();
+  const isSsh = scheme ? /ssh/i.test(url.slice(0, url.indexOf("://"))) : true;
+  if (isSsh && !isGithubCom(host)) host = sshResolvedHost(host)?.toLowerCase() ?? host;
+  if (!isGithubCom(host)) return null;
+  const m = path.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "").match(/^([^/]+)\/([^/]+)$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
 /**
- * Return "owner/repo" from the git remote origin URL in `cwd`.
- * Handles both https://github.com/owner/repo.git and git@github.com:owner/repo.git
+ * Return "owner/repo" from the git remote origin URL in `cwd` (see
+ * `githubNwoFromUrl`), or null when origin is not a github.com remote.
  */
 function getRepoNwo(cwd) {
   // Strategy 1: read .git/config directly — no binary needed
@@ -391,73 +2486,164 @@ function getRepoNwo(cwd) {
     const gitConfig = readFileSync(join(cwd, ".git", "config"), "utf-8");
     const m = gitConfig.match(/\[remote\s+"origin"\][\s\S]*?url\s*=\s*(.+)/);
     if (m) {
-      const url = m[1].trim();
-      const rm = url.match(/github\.com[:/](.+?)\/(.+?)(?:\.git)?$/);
-      if (rm) return `${rm[1]}/${rm[2]}`;
+      const nwo = githubNwoFromUrl(m[1]);
+      if (nwo) return nwo;
     }
   } catch { /* ignore */ }
   // Strategy 2: git binary fallback
   const r = spawnSync(GIT, ["remote", "get-url", "origin"], { cwd, encoding: "utf-8" });
   if (r.status !== 0) return null;
-  const url = r.stdout.trim();
-  const m = url.match(/github\.com[:/](.+?)\/(.+?)(?:\.git)?$/);
-  return m ? `${m[1]}/${m[2]}` : null;
+  return githubNwoFromUrl(r.stdout);
 }
 
-/** Cache of resolved PR repo nwo, keyed by `<origin>#<number>`. The repo a PR
- *  lives in is stable for the PR's lifetime, so one resolution per dev-server
- *  process is enough — without this the 3 per-PR endpoints each re-resolve
- *  (up to ~9 redundant API roundtrips when a PR detail opens). */
-const prNwoCache = new Map();
+/** The repo a `gh` command about PR `number` must target in the dev-server:
+ *  where that number comes from, the base repo (`gh_base_repo` in
+ *  commands/gh.rs) — through REST with a token, through `gh` without. A
+ *  failed lookup throws. null without a github.com origin: `gh` chooses. */
+async function ghPrNwo(cwd, number) {
+  const token = getGithubToken();
+  return token ? resolvePrNwo(cwd, number, token) : devGhBaseNwo(cwd);
+}
 
-/**
- * Resolve the repo where PR `number` actually lives. Mirrors the Rust
- * `get_pr_json` resolution: try origin first; if the PR isn't there, fall back
- * to the fork's upstream parent. Without this, cross-fork PRs (branch pushed to
- * a fork, PR opened against the upstream repo) resolve to the fork — where the
- * PR number doesn't exist — and per-PR endpoints 404.
- *
- * Only a *definitive* answer (origin or parent confirmed) is cached; a transient
- * failure (5xx / rate limit / network) falls back to origin for this request but
- * stays uncached so a later call can re-resolve instead of pinning the wrong repo.
- */
+/** `GH_REPO` (and `GH_HOST`, so a user's `GH_HOST` cannot redirect it) for a
+ *  github.com repo — `gh_cmd` in `commands/gh.rs`. `GH_REPO` rather than
+ *  `--repo`: `gh pr merge` skips deleting the local branch whenever `--repo` is
+ *  given. Left to itself, `gh` picks an `upstream` remote over `origin`, even
+ *  an unrelated one (#298). */
+function ghRepoEnv(nwo) {
+  return nwo ? { ...process.env, GH_REPO: nwo, GH_HOST: "github.com" } : process.env;
+}
+
+async function ghPrEnv(cwd, number) {
+  return ghRepoEnv(await ghPrNwo(cwd, number));
+}
+
+/** `{ args, env }` for `gh pr merge …` — `gh_merge_cmd` in `commands/gh.rs`.
+ *  `GH_REPO` keeps gh's local cleanup, but that cleanup needs a remote for
+ *  the target repo (looked up after the merge, so its absence fails an already
+ *  merged PR); for a target that is not a remote, `--repo`, which skips it.
+ *  Remotes are read from `git remote -v`, which applies `insteadOf`. */
+async function ghMergeSpawn(cwd, number, args) {
+  const nwo = await ghPrNwo(cwd, number);
+  if (!nwo) return { args, env: process.env };
+  const r = spawnSync(GIT, ["remote", "-v"], { cwd, encoding: "utf-8" });
+  const isRemote = (r.stdout || "").split("\n").some((line) => {
+    const url = line.split("\t")[1]?.replace(/ \((fetch|push)\)$/, "");
+    return url && githubNwoFromUrl(url)?.toLowerCase() === nwo.toLowerCase();
+  });
+  return isRemote
+    ? { args, env: ghRepoEnv(nwo) }
+    : { args: [...args, "--repo", nwo], env: { ...process.env, GH_HOST: "github.com" } };
+}
+
+/** The repo PR `number` lives in: the base repo — `get_pr_json` in
+ *  commands/github_api.rs. Every number the app shows comes from the base
+ *  repo's list (the fork parent for a fork), so asking origin would read, or
+ *  write on, the fork's own same-numbered PR (#262). A failed fork lookup is
+ *  an error (thrown), never a guess. */
 async function resolvePrNwo(cwd, number, token) {
+  return devRestBaseNwo(cwd, token);
+}
+
+/** `rest_fork_info` + `base_repo_of` (commands/github_api.rs): the repo PRs
+ *  are listed from and act on — the fork parent when origin is a fork, else
+ *  origin. Shares `devForkParentCache` (10 minutes) with `devGhBaseNwo`, so
+ *  the REST and `gh` routes agree; a failed lookup throws, like it. null
+ *  without a github.com origin. */
+async function devRestBaseNwo(cwd, token) {
   const origin = getRepoNwo(cwd);
   if (!origin) return null;
-  const cacheKey = `${origin}#${number}`;
-  if (prNwoCache.has(cacheKey)) return prNwoCache.get(cacheKey);
-  try {
-    const resp = await githubFetch(`/repos/${origin}/pulls/${number}`, token);
-    if (resp.ok) {
-      prNwoCache.set(cacheKey, origin);
-      return origin;
-    }
-    // PR not visible on origin (404 missing / 403 private / 410 gone) → try the
-    // fork's upstream parent. Other statuses are treated as transient.
-    if ([403, 404, 410].includes(resp.status)) {
-      const info = await githubFetch(`/repos/${origin}`, token);
-      const parent = info.ok ? (await info.json()).parent?.full_name : null;
-      if (parent) {
-        const r2 = await githubFetch(`/repos/${parent}/pulls/${number}`, token);
-        if (r2.ok) {
-          prNwoCache.set(cacheKey, parent);
-          return parent;
-        }
-      }
-    }
-  } catch { /* transient — fall through without caching */ }
-  return origin;
+  const hit = devForkParentCache.get(origin);
+  if (hit && Date.now() - hit.at < 600_000) return hit.parent ?? origin;
+  const info = await githubFetch(`/repos/${origin}`, token);
+  if (!info.ok) throw new Error(`${devGithubError(info.status, await info.json().catch(() => ({})))} (looking up ${origin})`);
+  const j = await info.json();
+  const parent = j.fork && j.parent?.full_name ? j.parent.full_name : null;
+  devForkParentCache.set(origin, { parent, at: Date.now() });
+  return parent ?? origin;
 }
 
 /** Fetch from GitHub REST API with auth. `accept` overrides the default JSON accept header. */
-async function githubFetch(path, token, accept = "application/vnd.github+json") {
+async function githubFetch(path, token, accept = "application/vnd.github+json", init = {}) {
   return fetch(`https://api.github.com${path}`, {
+    ...init,
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: accept,
       "X-GitHub-Api-Version": "2022-11-28",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
     },
   });
+}
+
+// ─── Issue creation (#301) — mirrors `commands/gh_issues.rs` ────────────────
+
+/** Issue targets per `cwd` + origin, for 5 minutes, as `issue_targets_inner`. */
+const devIssueTargetsCache = new Map();
+
+/**
+ * Same rules as `targets_from`: origin, then its parent when it is a fork.
+ * `fresh` (the form opening) reads GitHub; the picker and create routes take
+ * the cached answer, as the Rust commands do.
+ */
+async function devIssueTargets(cwd, token, fresh = false) {
+  const nwo = getRepoNwo(cwd);
+  if (!nwo) return { targets: [], defaultRepo: null };
+  const key = `${cwd}\u0000${nwo}`;
+  const hit = devIssueTargetsCache.get(key);
+  if (!fresh && hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.targets;
+  const targets = await devIssueTargetsRead(nwo, token);
+  devIssueTargetsCache.set(key, { targets, at: Date.now() });
+  return targets;
+}
+
+async function devIssueTargetsRead(nwo, token) {
+  const resp = await githubFetch(`/repos/${nwo}`, token);
+  if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+  const origin = await resp.json();
+  // As in Rust: the embedded parent may lack the viewer's permissions.
+  if (origin.fork === true && origin.parent?.full_name) {
+    // As in Rust, a failed parent read keeps the copy embedded in origin's answer.
+    const p = await githubFetch(`/repos/${origin.parent.full_name}`, token).catch(() => null);
+    if (p?.ok) {
+      const parent = await p.json().catch(() => null);
+      if (parent) origin.parent = parent;
+    }
+  }
+  // `targets_from`, from core (shared with the MCP tool). Checked here, not
+  // in DEV_CORE_HELPERS: an older dist must not take the diff routes down too.
+  const core = await loadDevCore();
+  if (typeof core.issueTargetsFrom !== "function") {
+    throw new Error("@gitwand/core is out of date (missing issueTargetsFrom): run `pnpm --filter @gitwand/core build`, then restart the dev-server");
+  }
+  return core.issueTargetsFrom(origin);
+}
+
+/** Up to `maxPages` pages of 100 of the array at `path` (`query` ends with `&`). */
+async function devGithubPages(path, query, token, maxPages) {
+  const all = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const resp = await githubFetch(`${path}?${query}per_page=100&page=${page}`, token);
+    if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+    const arr = await resp.json();
+    if (!Array.isArray(arr)) break;
+    all.push(...arr);
+    if (arr.length < 100) break;
+  }
+  return all;
+}
+
+/** Run a GitHub GraphQL operation; returns `data`, throws on the first `errors[]` entry. */
+async function githubGraphql(token, query, variables) {
+  const resp = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+  if (json.errors?.length) throw new Error(`GraphQL error: ${json.errors[0].message}`);
+  return json.data;
 }
 
 const PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--port") ?? "3001", 10);
@@ -654,6 +2840,163 @@ function devBuild3WayPreview(cwd, ancestor, oursRef, theirsRef) {
   return results;
 }
 
+/** `force_with_lease_arg` (commands/ops.rs): the remote branch must still
+ *  sit exactly on `sha`, a full hex object name; the branch is free of what
+ *  git forbids in ref names and of a leading `-`. */
+function devForceWithLeaseArg(branch, sha) {
+  const s = String(sha ?? "");
+  if (!/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(s)) throw new Error("invalid lease sha");
+  const b = String(branch);
+  const branchOk =
+    b !== "" && !/^[-/]/.test(b) && !/[/.]$/.test(b) && !b.includes("..") && !b.includes("//") &&
+    !b.includes("@{") && !/[\p{Cc}\p{White_Space}~^:?*[\\]/u.test(b);
+  if (!branchOk) throw new Error("invalid lease branch");
+  return `--force-with-lease=refs/heads/${b}:${s}`;
+}
+
+/** `push_destination` (commands/ops.rs): the remote branch a plain push from
+ *  `branch` updates, from `%(push)` minus `refs/remotes/<%(push:remotename)>/`;
+ *  null when git names none or it maps back to no branch. */
+function devPushDestination(cwd, branch) {
+  const refname = `refs/heads/${branch}`;
+  const r = spawnSync(
+    GIT,
+    ["for-each-ref", "--format=%(refname) %(push:remotename) %(push)", refname],
+    { cwd, encoding: "utf-8" },
+  );
+  if (r.error || r.status !== 0) return { kind: "none" };
+  const line = (r.stdout || "").split("\n").find((l) => l.startsWith(`${refname} `));
+  if (line === undefined) return { kind: "none" };
+  const rest = line.slice(refname.length + 1);
+  const sp = rest.indexOf(" ");
+  if (sp < 0) return { kind: "none" };
+  const remote = rest.slice(0, sp);
+  const tracking = rest.slice(sp + 1);
+  if (tracking === "") return { kind: "none" };
+  if (remote === "" || remote.startsWith("-")) return { kind: "unmapped" };
+  // `remote_branch_of`: the tracking ref read back through the fetch refspecs.
+  const fetch = spawnSync(GIT, ["config", "--get-all", `remote.${remote}.fetch`], { cwd, encoding: "utf-8" });
+  const name = devRemoteBranchOf(fetch.stdout || "", tracking);
+  return name !== null ? { kind: "branch", name } : { kind: "unmapped" };
+}
+
+/** ops.rs `remote_branch_of` (src/utils/refspec.ts `remoteBranchOf`). */
+function devRemoteBranchOf(refspecs, tracking) {
+  const excluded = (full) =>
+    refspecs.split("\n").some((l) => {
+      const t = l.trim();
+      if (!t.startsWith("^")) return false;
+      const neg = t.slice(1);
+      const star = neg.indexOf("*");
+      if (star < 0) return neg === full;
+      const pre = neg.slice(0, star);
+      const suf = neg.slice(star + 1);
+      return full.length >= pre.length + suf.length && full.startsWith(pre) && full.endsWith(suf);
+    });
+  for (const line of refspecs.split("\n")) {
+    const spec = line.trim().replace(/^\+/, "");
+    if (spec === "" || spec.startsWith("^")) continue;
+    const colon = spec.indexOf(":");
+    if (colon < 0) continue;
+    const src = spec.slice(0, colon);
+    const dst = spec.slice(colon + 1);
+    const srcStar = src.indexOf("*");
+    const dstStar = dst.indexOf("*");
+    let full = null;
+    if (srcStar >= 0 && dstStar >= 0) {
+      const dstPre = dst.slice(0, dstStar);
+      const dstSuf = dst.slice(dstStar + 1);
+      if (tracking.length >= dstPre.length + dstSuf.length && tracking.startsWith(dstPre) && tracking.endsWith(dstSuf)) {
+        full = src.slice(0, srcStar) + tracking.slice(dstPre.length, tracking.length - dstSuf.length) + src.slice(srcStar + 1);
+      }
+    } else if (srcStar < 0 && dstStar < 0 && dst === tracking) {
+      full = src;
+    }
+    if (full !== null) {
+      if (excluded(full)) return null;
+      if (full.startsWith("refs/heads/") && full.length > "refs/heads/".length) return full.slice("refs/heads/".length);
+      return null;
+    }
+  }
+  return null;
+}
+
+/** ops.rs `UNMAPPED_PUSH_DEST`. */
+const UNMAPPED_PUSH_DEST =
+  "force push refused: the remote branch this push updates cannot be read (a custom fetch refspec), " +
+  "so it cannot be leased; force push from a terminal";
+
+/** `gh_fork_parent` (commands/gh.rs) answers, by origin, for ten minutes. */
+const devForkParentCache = new Map();
+
+/** `gh_base_repo` (commands/gh.rs): the repo PRs are listed from and act on —
+ *  origin's fork parent when origin is a fork, else origin; null without a
+ *  github.com origin (gh chooses). A failed fork lookup is an error, never a
+ *  guess: a PR number sent to the wrong repo names another pull request. */
+function devGhBaseNwo(cwd) {
+  const origin = getRepoNwo(cwd);
+  if (!origin) return null;
+  const hit = devForkParentCache.get(origin);
+  if (hit && Date.now() - hit.at < 600_000) return hit.parent ?? origin;
+  const r = spawnSync(GH, ["repo", "view", origin, "--json", "isFork,parent"], {
+    cwd, encoding: "utf-8", env: { ...process.env, GH_HOST: "github.com" }, timeout: 20_000,
+  });
+  if (r.error) throw new Error(`Failed to run gh repo view (is GitHub CLI installed?): ${r.error.message}`);
+  if (r.status !== 0) throw new Error(`gh repo view ${origin} failed: ${(r.stderr || "").trim()}`);
+  let v;
+  try { v = JSON.parse(r.stdout || ""); }
+  catch (e) { throw new Error(`Failed to parse gh repo view output: ${e.message}`); }
+  const parent = devForkParentNwo(v);
+  devForkParentCache.set(origin, { parent, at: Date.now() });
+  return parent ?? origin;
+}
+
+/** `gh_api_failure` (commands/gh.rs): GitHub's own message when gh relayed a
+ *  JSON answer with an HTTP status, else `<what>: <stderr>`. */
+function devGhApiFailure(what, stderr, stdout) {
+  let answer = null;
+  try { answer = JSON.parse(stdout.trim()); } catch { /* not JSON */ }
+  const m = stderr.lastIndexOf("(HTTP ");
+  const code = m >= 0 ? Number.parseInt(stderr.slice(m + 6).split(")")[0].trim(), 10) : NaN;
+  if (answer && typeof answer === "object" && "message" in answer && Number.isInteger(code)) {
+    return devGithubError(code, answer);
+  }
+  return `${what}: ${stderr.trim()}`;
+}
+
+/**
+ * The replay core shared by `/api/preview-rebase` and `/api/preview-restack`
+ * — `replay_preview` in commands/read.rs. Replays each commit of
+ * `upstreamSha..tipSha` (oldest first) onto `ontoSha`: ancestor = the commit's
+ * parent, ours = onto, theirs = the commit. Root commits have no parent to
+ * diff against and are skipped. One entry per file, keeping the strongest
+ * conflict signal (add/delete > conflicted > clean), conflicts first, then
+ * by path. Throws the Rust error text.
+ */
+function devReplayPreview(cwd, ontoSha, upstreamSha, tipSha) {
+  const rl = spawnSync(GIT, ["rev-list", "--reverse", `${upstreamSha}..${tipSha}`], { cwd, encoding: "utf-8" });
+  if (rl.error) throw new Error(`rev-list failed: ${rl.error.message}`);
+  if (rl.status !== 0) throw new Error(`rev-list failed: ${(rl.stderr || "").trim()}`);
+  const commits = (rl.stdout || "").split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const all = [];
+  for (const commit of commits) {
+    let parent;
+    try { parent = devRevParseVerify(cwd, `${commit}^`); } catch { continue; }
+    all.push(...devBuild3WayPreview(cwd, parent, ontoSha, commit));
+  }
+
+  const score = (p) => (p.is_add_delete ? 2 : p.has_conflicts ? 1 : 0);
+  const byFile = new Map();
+  for (const p of all) {
+    const existing = byFile.get(p.file_path);
+    if (!existing || score(p) > score(existing)) byFile.set(p.file_path, p);
+  }
+  const results = [...byFile.values()];
+  results.sort((a, b) => (Number(b.has_conflicts) - Number(a.has_conflicts)) || (a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0));
+  return results;
+}
+
 function parseFileLog(raw) {
   const entries = [];
   for (const block of raw.split("---END---")) {
@@ -673,6 +3016,73 @@ function parseFileLog(raw) {
   return entries;
 }
 
+/**
+ * Mirrors `historical_path` in src-tauri/src/commands/read.rs: a file's name
+ * at a past commit, read by git as `<commit>:<path>`, so checked lexically
+ * rather than against today's filesystem. Throws with Rust's messages.
+ */
+function historicalPath(name, p) {
+  if (p.includes("\0")) throw new Error(`${name} must not contain NUL`);
+  if (p.startsWith("/") || p.startsWith("\\") || /^[A-Za-z]:/.test(p)) {
+    throw new Error(`${name} must be relative to the repository root`);
+  }
+  const parts = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") throw new Error(`${name} must not contain \`..\``);
+    parts.push(seg);
+  }
+  if (!parts.length) throw new Error(`${name} must not be the repository root`);
+  return parts.join("/");
+}
+
+/** Mirrors `FILE_LOG_NAMED_FORMAT` in src-tauri/src/git/parse.rs. */
+const FILE_LOG_NAMED_FORMAT = "--format=%x01%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1e";
+
+/**
+ * Mirrors `parse_file_log_named` (src-tauri/src/git/parse.rs): `git log
+ * --follow -z --name-only` with FILE_LOG_NAMED_FORMAT. Each entry also gets
+ * `path`, the file's root-relative name at that commit (absent for a merge).
+ */
+function parseFileLogNamed(raw) {
+  const entries = [];
+  for (const record of raw.split("\x01")) {
+    // The header ends at the first `\x1e` after the five field separators
+    // (the name that follows may itself hold a `\x1e`).
+    let bodyStart = -1;
+    for (let k = 0, at = -1; k < 5; k++) {
+      at = record.indexOf("\x1f", at + 1);
+      if (at === -1) break;
+      if (k === 4) bodyStart = at;
+    }
+    if (bodyStart === -1) continue;
+    const end = record.indexOf("\x1e", bodyStart);
+    if (end === -1) continue;
+    const head = record.slice(0, end).split("\x1f");
+    // Rust's splitn(6): anything past the fifth separator belongs to the body.
+    const body = head.slice(5).join("\x1f");
+    // Then git writes NUL, one `\n`, and the name up to NUL — exactly that, so
+    // a name that itself starts with `\n` survives. A merge lists no name.
+    let rest = record.slice(end + 1);
+    if (rest.startsWith("\0")) rest = rest.slice(1);
+    if (rest.startsWith("\n")) rest = rest.slice(1);
+    const cut = rest.indexOf("\0");
+    const name = (cut === -1 ? rest : rest.slice(0, cut)) || undefined;
+    const entry = {};
+    if (name !== undefined) entry.path = name;
+    Object.assign(entry, {
+      hashFull: head[0].trim(),
+      hash: head[1].trim(),
+      author: head[2].trim(),
+      date: head[3].trim(),
+      message: head[4].trim(),
+      body: body.trim(),
+    });
+    entries.push(entry);
+  }
+  return entries;
+}
+
 // ─── Snapshot helpers (v3.8 Time Machine) ────────────────────
 //
 // Node port of `src-tauri/src/git/snapshot.rs`. Both implementations read and
@@ -684,9 +3094,11 @@ function snapshotGitDir(cwd) {
   return execFileSync(GIT, ["rev-parse", "--absolute-git-dir"], { cwd, encoding: "utf-8" }).trim();
 }
 
-function createSnapshot(cwd, kind, label) {
+function createSnapshot(cwd, kind, label, worktree = null, worktreeBase = null) {
+  // No output cap, like snapshot.rs: `ls-files -s` on a large repo runs
+  // past Node's 1 MB default and fails with ENOBUFS.
   const g = (args, opts = {}) =>
-    execFileSync(GIT, args, { cwd, encoding: "utf-8", ...opts }).trim();
+    execFileSync(GIT, args, { cwd, encoding: "utf-8", maxBuffer: Infinity, ...opts }).trim();
 
   let headSha;
   try {
@@ -729,6 +3141,9 @@ function createSnapshot(cwd, kind, label) {
 
     const timestampMs = snapshotStampMs();
     const meta = { id: "", commit: "", kind, label, timestampMs, headSha, headRef, mergeHead };
+    // v3.13 — written only when set, like `skip_serializing_if` in snapshot.rs.
+    if (worktree) meta.worktree = worktree;
+    if (worktreeBase) meta.worktreeBase = worktreeBase;
     const commit = g([
       "commit-tree", worktreeTree, "-p", headSha, "-p", metaCommit, "-m", JSON.stringify(meta),
     ]);
@@ -775,26 +3190,12 @@ function listSnapshots(cwd) {
   return out;
 }
 
-function restoreSnapshot(cwd, id) {
+/** Mirror of `snapshot::apply_snapshot_state`: tree, exact index, merge state. */
+function applySnapshotState(cwd, target) {
+  // No output cap, like snapshot.rs: `ls-files -s` on a large repo runs
+  // past Node's 1 MB default and fails with ENOBUFS.
   const g = (args, opts = {}) =>
-    execFileSync(GIT, args, { cwd, encoding: "utf-8", ...opts }).trim();
-  const target = listSnapshots(cwd).find((s) => s.id === id);
-  if (!target) throw new Error(`snapshot ${id} not found`);
-
-  const redo = createSnapshot(cwd, "pre-restore", `before restoring ${id}`);
-
-  // Plumbing, not `checkout`: a checkout would refuse on a dirty tree, which
-  // is exactly the state an undo has to recover from. `-m` on every ref move:
-  // without it git writes an empty reflog message (see snapshot.rs).
-  const reason = `gitwand: restore snapshot ${id}`;
-  if (target.headRef) {
-    const full = `refs/heads/${target.headRef}`;
-    g(["update-ref", "-m", reason, full, target.headSha]);
-    g(["symbolic-ref", "-m", reason, "HEAD", full]);
-  } else {
-    g(["update-ref", "-m", reason, "--no-deref", "HEAD", target.headSha]);
-  }
-
+    execFileSync(GIT, args, { cwd, encoding: "utf-8", maxBuffer: Infinity, ...opts }).trim();
   g(["read-tree", "-u", "--reset", `${target.commit}^{tree}`]);
 
   // Staged into a scratch index and moved into place only on success — see
@@ -831,6 +3232,31 @@ function restoreSnapshot(cwd, id) {
     const mergeMsgPath = join(dir, "MERGE_MSG");
     if (existsSync(mergeMsgPath)) unlinkSync(mergeMsgPath);
   }
+}
+
+function restoreSnapshot(cwd, id) {
+  // No output cap, like snapshot.rs: `ls-files -s` on a large repo runs
+  // past Node's 1 MB default and fails with ENOBUFS.
+  const g = (args, opts = {}) =>
+    execFileSync(GIT, args, { cwd, encoding: "utf-8", maxBuffer: Infinity, ...opts }).trim();
+  const target = listSnapshots(cwd).find((s) => s.id === id);
+  if (!target) throw new Error(`snapshot ${id} not found`);
+
+  const redo = createSnapshot(cwd, "pre-restore", `before restoring ${id}`);
+
+  // Plumbing, not `checkout`: a checkout would refuse on a dirty tree, which
+  // is exactly the state an undo has to recover from. `-m` on every ref move:
+  // without it git writes an empty reflog message (see snapshot.rs).
+  const reason = `gitwand: restore snapshot ${id}`;
+  if (target.headRef) {
+    const full = `refs/heads/${target.headRef}`;
+    g(["update-ref", "-m", reason, full, target.headSha]);
+    g(["symbolic-ref", "-m", reason, "HEAD", full]);
+  } else {
+    g(["update-ref", "-m", reason, "--no-deref", "HEAD", target.headSha]);
+  }
+
+  applySnapshotState(cwd, target);
   return redo;
 }
 
@@ -851,6 +3277,29 @@ function pruneSnapshots(cwd, maxAgeDays, maxCount) {
     deleted += 1;
   });
   return deleted;
+}
+
+/**
+ * Paths named when `reset --keep` refused, or null when the failure is
+ * something else. Mirrors `reset_keep_blocked_files` in commands/ops.rs.
+ */
+function resetKeepBlockedFiles(stderr) {
+  const files = [];
+  let blocked = false;
+  let inList = false;
+  for (const line of stderr.split("\n")) {
+    const m = /^error: Entry '(.*)' /.exec(line);
+    if (m) { blocked = true; inList = false; files.push(m[1]); continue; }
+    if (
+      line.startsWith("error: Your local changes to the following files would be overwritten") ||
+      line.startsWith("error: The following untracked working tree files would be overwritten")
+    ) { blocked = true; inList = true; continue; }
+    if (inList) {
+      if (line.startsWith("\t")) files.push(line.slice(1));
+      else inList = false;
+    }
+  }
+  return blocked ? files : null;
 }
 
 /**
@@ -1068,6 +3517,7 @@ function giteaMapStatus(v) {
     state: s.status ?? "",
     conclusion: s.status ?? "",
     details_url: s.target_url ?? "",
+    commit_sha: v?.sha ?? "",
   }));
 }
 
@@ -1686,33 +4136,28 @@ async function handleRequest(req, res) {
         if (!mergeBase) {
           return jsonResponse(req, res, { error: `No common ancestor between HEAD and ${onto}` }, 400);
         }
+        return jsonResponse(req, res, devReplayPreview(resolvedCwd, ontoSha, mergeBase, headSha));
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
 
-        const rl = spawnSync(GIT, ["rev-list", "--reverse", `${mergeBase}..${headSha}`], { cwd: resolvedCwd, encoding: "utf-8" });
-        if (rl.status !== 0) {
-          return jsonResponse(req, res, { error: `rev-list failed: ${(rl.stderr || "").trim()}` }, 400);
+    // POST /api/preview-restack  { cwd, onto, upstream, branch }  → FileMergePreview[]
+    // Mirrors `preview_restack` (commands/read.rs): only the layer's own
+    // commits, `upstream..branch`, replayed onto `onto`.
+    if (url.pathname === "/api/preview-restack" && req.method === "POST") {
+      const { cwd, onto, upstream, branch } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const resolvedCwd = resolve(cwd);
+      try {
+        for (const r of [onto, upstream, branch]) {
+          if (typeof r !== "string") throw new Error("Missing onto, upstream or branch");
+          if (r.startsWith("-")) throw new Error(`invalid ref: ${r}`);
         }
-        const commits = (rl.stdout || "").split("\n").map((l) => l.trim()).filter(Boolean);
-
-        // Replay each commit: ours = onto, theirs = commit. Root commits have
-        // no parent to diff against and are skipped, as in Rust.
-        const all = [];
-        for (const commit of commits) {
-          let parent;
-          try { parent = devRevParseVerify(resolvedCwd, `${commit}^`); } catch { continue; }
-          all.push(...devBuild3WayPreview(resolvedCwd, parent, ontoSha, commit));
-        }
-
-        // Deduplicate per file, keeping the strongest conflict signal:
-        // is_add_delete (2) > has_conflicts (1) > clean (0).
-        const score = (p) => (p.is_add_delete ? 2 : p.has_conflicts ? 1 : 0);
-        const byFile = new Map();
-        for (const p of all) {
-          const existing = byFile.get(p.file_path);
-          if (!existing || score(p) > score(existing)) byFile.set(p.file_path, p);
-        }
-        const results = [...byFile.values()];
-        results.sort((a, b) => (Number(b.has_conflicts) - Number(a.has_conflicts)) || (a.file_path < b.file_path ? -1 : a.file_path > b.file_path ? 1 : 0));
-        return jsonResponse(req, res, results);
+        const ontoSha = devRevParseVerify(resolvedCwd, onto);
+        const upstreamSha = devRevParseVerify(resolvedCwd, upstream);
+        const tipSha = devRevParseVerify(resolvedCwd, branch);
+        return jsonResponse(req, res, devReplayPreview(resolvedCwd, ontoSha, upstreamSha, tipSha));
       } catch (e) {
         return jsonResponse(req, res, { error: e.message }, 400);
       }
@@ -1744,7 +4189,7 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/read-file" && req.method === "POST") {
       const { cwd, path } = await readBody(req);
       let fullPath;
-      try { fullPath = safeRepoPath(cwd, path); }
+      try { fullPath = safeRepoPath(cwd, path); requireGitWorktree(cwd); }
       catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
       // Read bytes and decode strictly, mirroring the Rust `read_file`, which is
       // `std::fs::read_to_string` and rejects anything that is not valid UTF-8.
@@ -1771,9 +4216,18 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/write-file" && req.method === "POST") {
       const { cwd, path, content } = await readBody(req);
       let fullPath;
-      try { fullPath = safeRepoPath(cwd, path); }
+      try { fullPath = safeRepoPath(cwd, path); requireGitWorktree(cwd); }
       catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
-      writeFileSync(fullPath, content, "utf-8");
+      // The guard resolves a symlink that leads somewhere real, so `fullPath`
+      // is only still a symlink when it dangles (or loops). Writing through it
+      // would create its target, wherever that is. Mirrors Rust's write_file.
+      let isLink = false;
+      try { isLink = lstatSync(fullPath).isSymbolicLink(); } catch { /* absent */ }
+      if (isLink) {
+        return jsonResponse(req, res, { error: `refusing to write through a symlink that does not resolve: ${path}` }, 400);
+      }
+      try { writeFileSync(fullPath, content, "utf-8"); }
+      catch (e) { return jsonResponse(req, res, { error: `Failed to write ${path}: ${e.message}` }, 500); }
       return jsonResponse(req, res, { ok: true });
     }
 
@@ -2052,6 +4506,37 @@ async function handleRequest(req, res) {
       return jsonResponse(req, res, { root, truncated });
     }
 
+    // POST /api/list-repo-dir  { cwd, dir, includeIgnored }
+    //
+    // Mirrors the Tauri `list_repo_dir` command (Files view, v3.11.2) through
+    // devListRepoDir() above. Response: { entries, truncated }, camelCase like
+    // the Rust struct's `rename_all = "camelCase"`.
+    if (url.pathname === "/api/list-repo-dir" && req.method === "POST") {
+      const { cwd, dir = "", includeIgnored = false } = await readBody(req);
+      try {
+        return jsonResponse(req, res, devListRepoDir(cwd, dir, includeIgnored === true));
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
+    // POST /api/reveal-in-file-manager  { cwd, path }
+    //
+    // Stands in for the Tauri `reveal_in_file_manager` (v3.11.2), which opens
+    // the OS file manager: only the packaged app on the user's desktop session
+    // can do that. The route validates the path exactly as the Rust command
+    // does (safe_repo_path, then existence), so a bad path fails the same way
+    // under `pnpm dev:web`, and then it only logs.
+    if (url.pathname === "/api/reveal-in-file-manager" && req.method === "POST") {
+      const { cwd, path } = await readBody(req);
+      let full;
+      try { full = safeRepoPath(cwd, path); }
+      catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+      if (!existsSync(full)) return jsonResponse(req, res, { error: `Path not found: ${path}` }, 400);
+      console.info(`[dev] revealInFileManager: ${full}`);
+      return jsonResponse(req, res, { ok: true });
+    }
+
     // GET /api/list-dir?path=/some/dir  — list directories for folder picker
     if (url.pathname === "/api/list-dir" && req.method === "GET") {
       const dirPath = resolve(url.searchParams.get("path") || homedir());
@@ -2324,6 +4809,19 @@ async function handleRequest(req, res) {
 
       if (!cwd || !path) return jsonResponse(req, res, { error: "Missing cwd or path param" }, 400);
 
+      // Every branch below hands `path` to git, and the untracked fallback
+      // runs `git diff --no-index`, which reads whatever file it names. Refuse
+      // anything resolving outside the repo first, like Rust's `git_diff`.
+      let gitPath;
+      try {
+        const guarded = safeRepoPath(cwd, path);
+        const root = realpathSync.native(cwd);
+        if (guarded === root) throw new Error("path must not be the repository root");
+        gitPath = repoRelativePath(cwd, root, path, guarded);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+
       try {
         const resolvedCwd = resolve(cwd);
 
@@ -2352,12 +4850,17 @@ async function handleRequest(req, res) {
           });
         }
 
-        const args = staged ? ["diff", "--cached", "--", path] : ["diff", "--", path];
+        // git_diff's CLI fallback: raw content, user patch config pinned away.
+        const args = [
+          ...PATCH_CONFIG, "diff", ...(staged ? ["--cached"] : []), "--no-textconv", ...PATCH_FLAGS,
+          "--", gitPath,
+        ];
         let stdout;
+        let truncatedFromBytes;
         try {
           // Stream via spawn — execSync's default 1 MB cap blows up on large files
           // (lockfiles, generated assets, big migrations…).
-          stdout = await gitSpawn(args, resolvedCwd);
+          ({ text: stdout, truncatedFromBytes } = truncateDiffOutput(await gitSpawnBytes(args, resolvedCwd)));
         } catch { stdout = ""; }
 
         // ── New untracked file: fall back to --no-index diff (all lines green) ──
@@ -2368,87 +4871,37 @@ async function handleRequest(req, res) {
         // renders the entire file as an addition instead of showing no
         // unstaged change. Drift found by tests/parity/git-diff (issue #183).
         if (!stdout.trim() && !staged) {
-          const absFile = join(resolvedCwd, path);
+          const absFile = join(resolvedCwd, gitPath);
           const tracked =
-            spawnSync(GIT, ["ls-files", "--error-unmatch", "--", path], {
+            spawnSync(GIT, ["ls-files", "--error-unmatch", "--", gitPath], {
               cwd: resolvedCwd,
               encoding: "utf-8",
             }).status === 0;
           if (!tracked && existsSync(absFile) && !statSync(absFile).isDirectory()) {
-            const r = spawnSync("git", ["diff", "--no-index", "--", "/dev/null", absFile], {
-              cwd: resolvedCwd, encoding: "utf-8",
+            // Raw bytes, no maxBuffer cap: like the Rust side, read it all,
+            // then truncate the same way as the plain diff. The repo-relative
+            // path (as in Rust) keeps the header, hence the byte count and the
+            // cut, identical on both sides.
+            const r = spawnSync(GIT, [...PATCH_CONFIG, "diff", "--no-index", "--no-textconv", ...PATCH_FLAGS, "--", "/dev/null", gitPath], {
+              cwd: resolvedCwd, maxBuffer: Infinity,
             });
-            stdout = r.stdout || "";
+            ({ text: stdout, truncatedFromBytes } = truncateDiffOutput(r.stdout || Buffer.alloc(0)));
           }
         }
 
-        const hunks = [];
-        let currentHunk = null;
-        let oldLineNo = 0;
-        let newLineNo = 0;
-        // Mirrors Rust's parse_diff_hunks: a "new file mode" line marks the
-        // diff as an addition. Matches the Rust GitDiff shape, which omits
-        // `status` entirely when not detected (skip_serializing_if).
-        let status;
+        // Mirrors Rust's parse_diff_hunks. A "new file mode" line marks the
+        // diff as an addition; like the Rust GitDiff shape, `status` is
+        // omitted entirely when not detected (skip_serializing_if). The
+        // phantom-context gotcha of issue #183 (AGENTS.md) is handled by the
+        // bounded hunk body in devParseDiffHunks.
+        const { hunks, status } = devParseDiffHunks(await loadDevCore(), stdout);
 
-        const lines = stdout.split("\n");
-        for (const line of lines) {
-          if (line.startsWith("new file mode")) {
-            status = "added";
-          } else if (line.startsWith("@@")) {
-            if (currentHunk) hunks.push(currentHunk);
-
-            const header = line;
-            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-            const oldStart = match ? parseInt(match[1]) : 0;
-            const oldCount = match ? parseInt(match[2] || "1") : 1;
-            const newStart = match ? parseInt(match[3]) : 0;
-            const newCount = match ? parseInt(match[4] || "1") : 1;
-
-            oldLineNo = oldStart;
-            newLineNo = newStart;
-
-            currentHunk = { header, oldStart, oldCount, newStart, newCount, lines: [] };
-          } else if (currentHunk) {
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              currentHunk.lines.push({
-                type: "add",
-                content: line.substring(1),
-                oldLineNo: null,
-                newLineNo,
-              });
-              newLineNo++;
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              currentHunk.lines.push({
-                type: "delete",
-                content: line.substring(1),
-                oldLineNo,
-                newLineNo: null,
-              });
-              oldLineNo++;
-              // Context lines start with a single space. Testing
-              // `!startsWith("\\")` instead lets the empty string that
-              // `split("\n")` leaves after the trailing newline through, which
-              // appended a phantom context line to every diff, and the Rust
-              // parser (`strip_prefix(' ')`) never did. This is the gotcha
-              // AGENTS.md documents; drift found by tests/parity/git-diff
-              // (issue #183).
-            } else if (line.startsWith(" ")) {
-              currentHunk.lines.push({
-                type: "context",
-                content: line.substring(1),
-                oldLineNo,
-                newLineNo,
-              });
-              oldLineNo++;
-              newLineNo++;
-            }
-          }
-        }
-
-        if (currentHunk) hunks.push(currentHunk);
-
-        return jsonResponse(req, res, { path, hunks, ...(status ? { status } : {}) });
+        return jsonResponse(req, res, {
+          path,
+          hunks,
+          ...(status ? { status } : {}),
+          ...(truncatedFromBytes !== undefined ? { truncatedFromBytes } : {}),
+        });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -2478,7 +4931,10 @@ async function handleRequest(req, res) {
         const resolvedCwd = resolve(cwd);
         let stdout;
         try {
-          stdout = await gitSpawn(["diff", "--cached", "--unified=0", "--no-color", "--", "."], resolvedCwd);
+          stdout = await gitSpawn(
+            [...PATCH_CONFIG, "diff", "--cached", "--unified=0", "--no-textconv", ...PATCH_FLAGS, "--", "."],
+            resolvedCwd,
+          );
         } catch {
           stdout = "";
         }
@@ -2496,24 +4952,36 @@ async function handleRequest(req, res) {
           currentLines = [];
         };
 
+        const { classifyHunkLine, diffFileLineName, hunkBodyFromHeader, noHunkBody, parseHunkHeader, scanSecrets } =
+          await loadDevCore();
+
+        // Remaining body of the current hunk (core's hunk-body helpers, the twin of Rust's
+        // HunkBody): inside it an added `++ token` is the line `+++ token`, a hunk line —
+        // neither dropped nor read as a `+++ b/<path>` header (AGENTS.md diff-parsing gotcha).
+        let body = noHunkBody();
         for (const line of stdout.split("\n")) {
-          if (line.startsWith("diff --git ")) {
+          const kind = classifyHunkLine(body, line);
+          if (kind) {
+            if (kind === "add") {
+              if (currentPath !== null) {
+                currentLines.push({ line: newLineNo, text: line.slice(1) });
+              }
+              newLineNo++;
+            }
+            // `-`-prefixed removed lines are irrelevant for the added-lines-only scan surface.
+          } else if (line.startsWith("diff --git ")) {
+            body = noHunkBody();
             flush();
           } else if (line.startsWith("+++ ")) {
             const rest = line.slice("+++ ".length);
-            currentPath = rest === "/dev/null" ? null : rest.replace(/^b\//, "");
+            // core's `diffFileLineName` (Rust `file_line_name`): trailing tab
+            // and C-quoting handled.
+            const raw = rest.endsWith("\t") ? rest.slice(0, -1) : rest;
+            currentPath = diffFileLineName(rest, "b/") ?? (raw === "/dev/null" ? null : raw);
           } else if (line.startsWith("@@")) {
-            const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-            newLineNo = match ? parseInt(match[1], 10) : 0;
-          } else if (line.startsWith("+") && !line.startsWith("+++")) {
-            // A content added line starts with a single `+`; the `+++` file header is handled
-            // above by parsing state, never by this check alone (AGENTS.md diff-parsing gotcha).
-            if (currentPath !== null) {
-              currentLines.push({ line: newLineNo, text: line.slice(1) });
-            }
-            newLineNo++;
+            newLineNo = parseHunkHeader(line)?.newStart ?? 0;
+            body = hunkBodyFromHeader(line);
           }
-          // `-`-prefixed removed lines are irrelevant for the added-lines-only scan surface.
         }
         flush();
 
@@ -2524,7 +4992,6 @@ async function handleRequest(req, res) {
           entropyThreshold: typeof config.entropyThreshold === "number" ? config.entropyThreshold : 0,
         };
 
-        const { scanSecrets } = await import("@gitwand/core");
         const findings = scanSecrets(files, scanConfig);
         return jsonResponse(req, res, findings);
       } catch (err) {
@@ -2643,6 +5110,41 @@ async function handleRequest(req, res) {
       }
     }
 
+    // GET /api/git-refs-fingerprint?cwd=<path>
+    // Mirrors git_refs_fingerprint (read.rs): every ref but the Time Machine
+    // snapshots, every worktree's HEAD and branch, the stash entries. Only
+    // compared for equality.
+    if (url.pathname === "/api/git-refs-fingerprint" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd param" }, 400);
+      try {
+        const resolvedCwd = resolve(cwd);
+        // Thousands of tags exceed the default 1 MiB output buffer.
+        const big = { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 };
+        const refs = execFileSync(GIT, ["for-each-ref", "--format=%(objectname) %(refname) %(symref)"], big)
+          .split("\n")
+          .filter((line) => line && !line.split(" ").slice(1).join(" ").startsWith("refs/gitwand/snapshots/"));
+        const worktrees = execFileSync(GIT, ["worktree", "list", "--porcelain"], big);
+        let stashes = "";
+        try {
+          stashes = execFileSync(GIT, ["stash", "list", "--format=%H"], { ...big, stdio: ["ignore", "pipe", "ignore"] });
+        } catch (_) {
+          // As in the Rust command: no stash list, nothing to add.
+        }
+        const fp = createHash("sha256")
+          .update(refs.join("\n"))
+          .update("\0")
+          .update(worktrees)
+          .update("\0")
+          .update(stashes)
+          .digest("hex")
+          .slice(0, 16);
+        return jsonResponse(req, res, fp);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
     // GET /api/path-exists?cwd=<path>&rel=<relpath>
     // v2.21.0 monorepo scope — validate a persisted scope path still exists.
     if (url.pathname === "/api/path-exists" && req.method === "GET") {
@@ -2703,6 +5205,59 @@ async function handleRequest(req, res) {
       }
     }
 
+    // GET /api/git-tracked-ignored?cwd=<path>
+    // Mirrors git_tracked_ignored (tracked_ignored.rs): tracked paths that match
+    // an ignore rule, capped at 500, with the uncapped total.
+    if (url.pathname === "/api/git-tracked-ignored" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        const out = execFileSync(
+          GIT,
+          ["ls-files", "-z", "-c", "-i", "--exclude-standard"],
+          { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 },
+        );
+        const all = out.split("\0").filter(Boolean);
+        const CAP = 500;
+        return jsonResponse(req, res, {
+          paths: all.slice(0, CAP),
+          total: all.length,
+          truncated: all.length > CAP,
+        });
+      } catch (err) {
+        const detail = err.stderr?.toString().trim() || err.message;
+        return jsonResponse(req, res, { error: `git ls-files failed: ${detail}` }, 500);
+      }
+    }
+
+    // POST /api/git-untrack-paths  { cwd, paths }
+    // Mirrors git_untrack_paths (tracked_ignored.rs): `git rm --cached` with the
+    // pathspecs on stdin, literal, tolerant of paths that are no longer tracked.
+    if (url.pathname === "/api/git-untrack-paths" && req.method === "POST") {
+      const { cwd, paths } = await readBody(req);
+      if (!cwd || !Array.isArray(paths)) return jsonResponse(req, res, { error: "Missing cwd or paths" }, 400);
+      if (paths.length === 0) return jsonResponse(req, res, { ok: true });
+      try {
+        const resolvedCwd = resolve(cwd);
+        // The repo itself goes through the shared guard; the pathspecs get the
+        // lexical check only (see validateUntrackPathspec).
+        safeRepoPath(resolvedCwd, ".");
+        for (const p of paths) validateUntrackPathspec(p);
+        execFileSync(
+          GIT,
+          [
+            "--literal-pathspecs", "rm", "--cached", "--quiet", "--ignore-unmatch",
+            "--pathspec-from-file=-", "--pathspec-file-nul",
+          ],
+          { cwd: resolvedCwd, input: paths.map((p) => `${p}\0`).join(""), encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+        );
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        const detail = err.stderr?.toString().trim() || err.message;
+        return jsonResponse(req, res, { error: `git rm --cached failed: ${detail}` }, 500);
+      }
+    }
+
     // POST /api/git-stage-patch  { cwd, patch }
     if (url.pathname === "/api/git-stage-patch" && req.method === "POST") {
       const { cwd, patch } = await readBody(req);
@@ -2739,11 +5294,19 @@ async function handleRequest(req, res) {
 
     // POST /api/git-commit  { cwd, message }
     if (url.pathname === "/api/git-commit" && req.method === "POST") {
-      const { cwd, message } = await readBody(req);
+      const { cwd, message, identityName, identityEmail, identitySigningKey } = await readBody(req);
       if (!cwd || !message) return jsonResponse(req, res, { error: "Missing cwd or message" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        execFileSync("git", ["commit", "-m", message], {
+        // Mirrors git_commit (ops.rs): a per-commit identity override, only
+        // when both name and email are present.
+        const name = (identityName ?? "").trim();
+        const email = (identityEmail ?? "").trim();
+        const key = (identitySigningKey ?? "").trim();
+        const identityArgs = name && email
+          ? ["-c", `user.name=${name}`, "-c", `user.email=${email}`, ...(key ? ["-c", `user.signingkey=${key}`] : [])]
+          : [];
+        execFileSync("git", [...identityArgs, "commit", "-m", message], {
           cwd: resolvedCwd,
           encoding: "utf-8",
         });
@@ -2929,20 +5492,58 @@ async function handleRequest(req, res) {
 
     // POST /api/git-push  { cwd, setUpstream?, force? }
     if (url.pathname === "/api/git-push" && req.method === "POST") {
-      const { cwd, setUpstream, force } = await readBody(req);
+      const { cwd, setUpstream, force, leaseBranch, leaseSha } = await readBody(req);
       if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        let cmd = "git push";
-        if (setUpstream) cmd += " --set-upstream origin HEAD";
-        if (force) cmd += " --force-with-lease";
-        cmd += " 2>&1";
-        const stdout = execSync(cmd, {
-          cwd: resolvedCwd,
-          encoding: "utf-8",
-          shell: true,
-        });
-        return jsonResponse(req, res, { success: true, message: stdout.trim() });
+        const args = ["push"];
+        if (setUpstream) args.push("--set-upstream", "origin", "HEAD");
+        // `git_push` validates the lease before anything runs, forced or not.
+        const hasBranch = leaseBranch != null;
+        const hasSha = leaseSha != null;
+        if (hasBranch !== hasSha) {
+          return jsonResponse(req, res, { error: "lease_branch and lease_sha must be given together" }, 400);
+        }
+        if (hasBranch) {
+          try { devForceWithLeaseArg(leaseBranch, leaseSha); }
+          catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+        }
+        if (force) {
+          if (hasBranch) {
+            // force_with_lease_arg() in src-tauri/src/commands/ops.rs, on the
+            // branch the push updates (`push_destination`).
+            try {
+              devForceWithLeaseArg(leaseBranch, leaseSha);
+              // A publish pushes `HEAD` to origin under the local name.
+              const dest = setUpstream ? { kind: "none" } : devPushDestination(resolvedCwd, String(leaseBranch));
+              if (dest.kind === "unmapped") return jsonResponse(req, res, { error: UNMAPPED_PUSH_DEST }, 400);
+              args.push(devForceWithLeaseArg(dest.kind === "branch" ? dest.name : leaseBranch, leaseSha));
+            } catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+          } else {
+            // `git_push`: the tip must also have been integrated locally —
+            // except for a branch pushed under another name, whose reflog git
+            // would not find.
+            args.push("--force-with-lease");
+            const head = spawnSync(GIT, ["symbolic-ref", "-q", "HEAD"], {
+              cwd: resolvedCwd,
+              encoding: "utf-8",
+            });
+            const headRef = head.status === 0 ? (head.stdout || "").trim() : "";
+            const headName = headRef.startsWith("refs/heads/") ? headRef.slice("refs/heads/".length) : "";
+            const dest = headName ? devPushDestination(resolvedCwd, headName) : { kind: "none" };
+            // `git_push`: an unreadable destination is refused, not pushed on a bare lease.
+            if (dest.kind === "unmapped") return jsonResponse(req, res, { error: UNMAPPED_PUSH_DEST }, 400);
+            const renamed = dest.kind === "branch" && dest.name !== headName;
+            const v = await combinedGitVersion();
+            const hasIfIncludes = v && (v[0] > 2 || (v[0] === 2 && v[1] >= 30));
+            // `push.useForceIfIncludes=true` would bring the check back: negate it.
+            if (hasIfIncludes) args.push(renamed ? "--no-force-if-includes" : "--force-if-includes");
+          }
+        }
+        const r = spawnSync(GIT, args, { cwd: resolvedCwd, encoding: "utf-8" });
+        const out = ((r.stdout || "") + (r.stderr || "")).trim();
+        if (r.error) return jsonResponse(req, res, { success: false, message: r.error.message });
+        return jsonResponse(req, res, { success: r.status === 0, message: out });
       } catch (err) {
         return jsonResponse(req, res, { success: false, message: ((err.stdout || "") + (err.stderr || "")).toString().trim() || err.message });
       }
@@ -2976,6 +5577,11 @@ async function handleRequest(req, res) {
       if (rejectCrossOrigin(req, res)) return;
       const cwd = url.searchParams.get("cwd");
       if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      // `git_fetch`'s `remote`: one remote instead of the default.
+      const remote = url.searchParams.get("remote");
+      if (remote !== null && (remote === "" || remote.startsWith("-"))) {
+        return jsonResponse(req, res, { error: "invalid remote" }, 400);
+      }
       const resolvedCwd = resolve(cwd);
       const sseOrigin = req.headers.origin;
       const sseAllowOrigin = sseOrigin && ALLOWED_ORIGINS.has(sseOrigin) ? sseOrigin : "";
@@ -2985,7 +5591,10 @@ async function handleRequest(req, res) {
         Connection: "keep-alive",
         ...(sseAllowOrigin ? { "Access-Control-Allow-Origin": sseAllowOrigin, Vary: "Origin" } : {}),
       });
-      const proc = spawn(GIT, ["fetch", "--prune", "--progress"], {
+      // Mirrors git_fetch's `refs_changed` (#287): compare every ref before
+      // and after, so the frontend only forces a log reload when one moved.
+      const refsBefore = devRefFingerprint(resolvedCwd);
+      const proc = spawn(GIT, ["fetch", "--prune", "--progress", ...(remote !== null ? [remote] : [])], {
         cwd: resolvedCwd,
         stdio: ["ignore", "ignore", "pipe"],
       });
@@ -3017,7 +5626,9 @@ async function handleRequest(req, res) {
         if (prog) res.write(`data: ${JSON.stringify(prog)}\n\n`);
         const success = code === 0;
         if (success) res.write(`data: ${JSON.stringify({ stage: "done", percent: 100, message: "Fetch complete" })}\n\n`);
+        const refsAfter = devRefFingerprint(resolvedCwd);
         const result = { success, message: success ? "" : allStderr.trim() };
+        if (refsBefore !== null && refsAfter !== null) result.refsChanged = refsBefore !== refsAfter;
         res.write(`data: ${JSON.stringify({ result })}\n\n`);
         res.end();
       });
@@ -3057,15 +5668,15 @@ async function handleRequest(req, res) {
 
     // POST /api/git-merge-abort  { cwd }
 
-    // POST /api/git-cherry-pick  { cwd, hashes }
+    // POST /api/git-cherry-pick  { cwd, hashes, noCommit? }
     if (url.pathname === "/api/git-cherry-pick" && req.method === "POST") {
-      const { cwd, hashes } = await readBody(req);
+      const { cwd, hashes, noCommit } = await readBody(req);
       if (!cwd || !Array.isArray(hashes) || hashes.length === 0)
         return jsonResponse(req, res, { success: false, message: "Missing cwd or hashes" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
         const { spawnSync } = await import("child_process");
-        const result = spawnSync("git", ["cherry-pick", ...hashes], {
+        const result = spawnSync("git", ["cherry-pick", ...(noCommit ? ["--no-commit"] : []), ...hashes], {
           cwd: resolvedCwd,
           encoding: "utf-8",
         });
@@ -3110,6 +5721,106 @@ async function handleRequest(req, res) {
       }
     }
 
+    // POST /api/git-fast-forward-to-upstream  { cwd }
+    // Mirror of the Rust `git_fast_forward_to_upstream`: re-check every repo-side
+    // condition in the same order, then `merge --ff-only --no-stat @{upstream}`.
+    // A refusal is a normal result ({ fastForwarded: false, reason }), not an error.
+    if (url.pathname === "/api/git-fast-forward-to-upstream" && req.method === "POST") {
+      const { cwd } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        const resolvedCwd = resolve(cwd);
+        const g = (args) => spawnSync(GIT, args, { cwd: resolvedCwd, encoding: "utf-8" });
+        const refused = (reason, behind = 0) => jsonResponse(req, res, { fastForwarded: false, reason, behind });
+
+        const gd = g(["rev-parse", "--git-dir"]);
+        if (gd.status !== 0) return jsonResponse(req, res, { error: (gd.stderr || "").trim() || "not a git repository" }, 500);
+        const gitDir = isAbsolute(gd.stdout.trim()) ? gd.stdout.trim() : join(resolvedCwd, gd.stdout.trim());
+        if (["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"]
+          .some((f) => existsSync(join(gitDir, f)))) return refused("operation");
+
+        if (g(["symbolic-ref", "-q", "HEAD"]).status !== 0) return refused("detached");
+        const up = g(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+        if (up.status !== 0 || !up.stdout.trim()) return refused("noUpstream");
+
+        const counts = g(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
+        let ahead = 0, behind = 0;
+        if (counts.status === 0) {
+          const [a, b] = counts.stdout.trim().split(/\s+/).map((n) => parseInt(n, 10) || 0);
+          ahead = a ?? 0;
+          behind = b ?? 0;
+        }
+        if (behind === 0) return refused("upToDate");
+
+        const st = g(["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=no"]);
+        let trackedEdits = st.status !== 0;
+        let conflicts = false;
+        for (const line of (st.stdout || "").split("\n")) {
+          if (line.length < 3) continue;
+          trackedEdits = true;
+          if (["DD", "AU", "UD", "UA", "DU", "AA", "UU"].includes(line.slice(0, 2))) conflicts = true;
+        }
+        if (conflicts) return refused("conflicts", behind);
+        if (ahead > 0) return refused("localCommits", behind);
+        if (trackedEdits) return refused("trackedEdits", behind);
+
+        const br = g(["symbolic-ref", "--short", "-q", "HEAD"]).stdout.trim() || null;
+        const m = g(["merge", "--ff-only", "--no-stat", "@{upstream}"]);
+        if (m.status === 0) return jsonResponse(req, res, { fastForwarded: true, behind, branch: br });
+        return jsonResponse(req, res, {
+          fastForwarded: false,
+          reason: "gitRefused",
+          stderr: ((m.stderr || "").trim() || (m.stdout || "").trim()),
+          behind,
+          branch: br,
+        });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // ── Guided bisect — logic in dev-bisect.mjs (mirror of commands/bisect.rs).
+    // Errors → `{ error }`, 400.
+    if (url.pathname === "/api/git-bisect-status" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        return jsonResponse(req, res, devBisectStatus(resolve(cwd)));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 400);
+      }
+    }
+    if (url.pathname === "/api/git-bisect-start" && req.method === "POST") {
+      const body = await readBody(req);
+      const cwd = body.cwd;
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        return jsonResponse(req, res, devBisectStart(resolve(cwd), body.bad, body.good, body.keepOrder === true));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 400);
+      }
+    }
+    if (url.pathname === "/api/git-bisect-mark" && req.method === "POST") {
+      const body = await readBody(req);
+      const cwd = body.cwd;
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        return jsonResponse(req, res, devBisectMark(resolve(cwd), body.verdict, body.expected ?? null));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 400);
+      }
+    }
+    if (url.pathname === "/api/git-bisect-reset" && req.method === "POST") {
+      const body = await readBody(req);
+      const cwd = body.cwd;
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        return jsonResponse(req, res, (devBisectReset(resolve(cwd), body.stay === true), null));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 400);
+      }
+    }
+
     // POST /api/git-repo-state  { cwd }
     if (url.pathname === "/api/git-repo-state" && req.method === "POST") {
       const { cwd } = await readBody(req);
@@ -3129,7 +5840,7 @@ async function handleRequest(req, res) {
         const hasConflict = () => {
           try {
             const out = es("git status --porcelain", { cwd: resolvedCwd, encoding: "utf-8" });
-            return out.split("\n").some(l => ["UU","AA","UD","DU","AU","UA"].includes(l.slice(0,2)));
+            return out.split("\n").some(l => ["DD","AU","UD","UA","DU","AA","UU"].includes(l.slice(0,2)));
           } catch { return false; }
         };
 
@@ -3162,9 +5873,76 @@ async function handleRequest(req, res) {
             return jsonResponse(req, res, { state, hasConflict: hasConflict(), operationHead: readTrimmed(headFile), targetBranch: null, step: 0, total: 0 });
           }
         }
+        const bisect = devBisectRepoState(resolvedCwd, gitDir);
+        if (bisect) return jsonResponse(req, res, bisect);
         return jsonResponse(req, res, { state: "clean", hasConflict: false, operationHead: null, targetBranch: null, step: 0, total: 0 });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // ── Stacked branches (v3.14.0) ──────────────────────────────────────────
+    // The logic lives in dev-stack-service.mjs, the mirror of
+    // src-tauri/src/stack/. Bodies carry the wrappers' camelCase argument
+    // names; results and nested arguments are in serde's snake_case, as
+    // Tauri sends them. Errors → `{ error }`, 400.
+    const STACK_ROUTES = {
+      "/api/stack-status": (b) => devStackStatus(b.cwd, b.configuredTrunk, b.mergedParents),
+      "/api/stack-set-parent": (b) => devStackSetParent(b.cwd, b.branch, b.parent, b.configuredTrunk),
+      "/api/stack-unset": (b) => devStackUnset(b.cwd, b.branch),
+      "/api/stack-delete-merged-parent": (b) => devStackDeleteMergedParent(b.cwd, b.branch, b.tip),
+      "/api/stack-restack-plan": (b) => devStackRestackPlan(b.cwd, b.branch, b.configuredTrunk, b.mergedParents),
+      "/api/git-restack": (b) => devGitRestack(b.cwd, b.branch, b.configuredTrunk, b.mergedParents, b.previewed),
+    };
+    if (Object.hasOwn(STACK_ROUTES, url.pathname) && req.method === "POST") {
+      const body = await readBody(req);
+      if (typeof body.cwd !== "string" || !body.cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        return jsonResponse(req, res, STACK_ROUTES[url.pathname]({ ...body, cwd: resolve(body.cwd) }) ?? null);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
+    // POST /api/git-push-branch  { cwd, branch, leaseSha }  -> { success, message }
+    // Mirrors `git_push_branch` (commands/ops.rs): force-push one local branch
+    // to its configured upstream under `--force-with-lease`, without checking
+    // it out. Refusals are errors (400); a push git rejects is `success: false`.
+    if (url.pathname === "/api/git-push-branch" && req.method === "POST") {
+      const { cwd, branch, leaseSha } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const resolvedCwd = resolve(cwd);
+      try {
+        devValidateBranchName(branch);
+        const config = (v) => {
+          const k = `branch.${branch}.${v}`;
+          const r = spawnSync(GIT, ["config", "--get", k], { cwd: resolvedCwd, encoding: "utf-8" });
+          if (r.error) throw new Error(`Failed to read ${k}: ${r.error.message}`);
+          // Exit 1: not set. Anything else cannot be evaluated, which must not
+          // read as "no upstream".
+          if (r.status === 0) return (r.stdout || "").trim() || null;
+          if (r.status === 1) return null;
+          throw new Error(`git config ${k}: ${(r.stderr || "").trim()}`);
+        };
+        const remote = config("remote");
+        const merge = config("merge");
+        if (remote === null || merge === null) throw new Error(`${branch} has no upstream`);
+        if (remote.startsWith("-")) throw new Error(`invalid remote: ${remote}`);
+        if (!merge.startsWith("refs/heads/")) throw new Error(`${branch} has no upstream branch under refs/heads/`);
+        const remoteBranch = merge.slice("refs/heads/".length);
+        // C-1: never onto a local branch or a remote branch of another name.
+        const block = devPushBlock(branch, remote, merge);
+        if (block !== null) throw new Error(block);
+        const lease = devForceWithLeaseArg(remoteBranch, leaseSha);
+        const refspec = `refs/heads/${branch}:refs/heads/${remoteBranch}`;
+        const r = spawnSync(GIT, ["push", lease, remote, refspec], { cwd: resolvedCwd, encoding: "utf-8" });
+        if (r.error) throw new Error(`Failed to run git push: ${r.error.message}`);
+        const stderr = (r.stderr || "").trim();
+        const stdout = (r.stdout || "").trim();
+        const success = r.status === 0;
+        return jsonResponse(req, res, { success, message: success && stdout ? stdout : stderr });
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
       }
     }
 
@@ -3249,9 +6027,33 @@ async function handleRequest(req, res) {
       if (r.status !== 0) return jsonResponse(req, res, { path: null });
       const raw = (r.stdout || "").trim();
       if (!raw) return jsonResponse(req, res, { path: null });
-      const home = process.env.HOME || process.env.USERPROFILE || "";
+      // As Rust's `var("HOME").or_else(USERPROFILE)`: a set but empty HOME is used.
+      const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
       const expanded = raw.startsWith("~") ? home + raw.slice(1) : raw;
       return jsonResponse(req, res, { path: expanded });
+    }
+
+    // POST /api/read-commit-template  { cwd } -> { content: string | null }
+    // Mirrors commands::read::read_commit_template: the path comes from git
+    // config, never from the client, and only a small regular file is read.
+    if (url.pathname === "/api/read-commit-template" && req.method === "POST") {
+      const { cwd } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const r = spawnSync(GIT, ["config", "commit.template"], { cwd: resolve(cwd), encoding: "utf-8" });
+      const raw = r.status === 0 ? (r.stdout || "").trim() : "";
+      if (!raw) return jsonResponse(req, res, { content: null });
+      // As Rust's `var("HOME").or_else(USERPROFILE)`: a set but empty HOME is used.
+      const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+      const path = raw.startsWith("~") ? home + raw.slice(1) : raw;
+      try {
+        const st = statSync(path);
+        if (!st.isFile() || st.size > 64 * 1024) {
+          return jsonResponse(req, res, { error: `Commit template is not a small regular file: ${path}` }, 400);
+        }
+        return jsonResponse(req, res, { content: readFileSync(path, "utf-8") });
+      } catch (e) {
+        return jsonResponse(req, res, { error: `Failed to read commit template ${path}: ${e.message}` }, 400);
+      }
     }
 
     // POST /api/git-config-identity  { cwd } -> [name, email]
@@ -3282,66 +6084,110 @@ async function handleRequest(req, res) {
       const filePath = url.searchParams.get("path");
       const fromHash = url.searchParams.get("from");
       const toHash = url.searchParams.get("to");
-      if (!cwd || !filePath || !fromHash || !toHash) return jsonResponse(req, res, { error: "Missing params" }, 400);
+      if (!cwd || !filePath) return jsonResponse(req, res, { error: "Missing params" }, 400);
+      // Step for step `git_file_diff` (src-tauri/src/commands/read.rs), same
+      // messages: an empty revision, one starting with `-` (git would read it
+      // as an option) or holding a control character (it would split the
+      // batch request below) is refused.
+      for (const [name, rev] of [["fromHash", fromHash], ["toHash", toHash]]) {
+        if (!rev || rev.trim() === "") return jsonResponse(req, res, { error: `${name} must not be empty` }, 400);
+        if (rev.startsWith("-") || /[\u0000-\u001f\u007f-\u009f]/.test(rev)) {
+          return jsonResponse(req, res, { error: `invalid ${name}: ${rev}` }, 400);
+        }
+      }
+      let gitPath;
+      let fromName = null;
+      let toName = null;
+      try {
+        const guarded = safeRepoPath(cwd, filePath);
+        const root = realpathSync.native(cwd);
+        if (guarded === root) throw new Error("path must not be the repository root");
+        gitPath = repoRelativePath(cwd, root, filePath, guarded);
+        const fp = url.searchParams.get("fromPath");
+        const tp = url.searchParams.get("toPath");
+        if (fp !== null) fromName = historicalPath("fromPath", fp);
+        if (tp !== null) toName = historicalPath("toPath", tp);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+      const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
       try {
         const resolvedCwd = resolve(cwd);
-        // Stream via spawn — explicit 10 MB cap can still be exceeded on
-        // large file rewrites between two distant commits.
-        const stdout = await gitSpawn(
-          ["diff", fromHash, toHash, "--", filePath],
-          resolvedCwd,
+        // `path` is relative to `cwd`, the log's names to the top level, where
+        // everything below runs — from the path git prints, not a resolved one.
+        const shown = spawnSync(GIT, ["rev-parse", "--show-toplevel", "--show-prefix"], {
+          cwd: resolvedCwd, encoding: "utf-8",
+        });
+        if (shown.status !== 0) throw new Error(`not a git repository: ${(shown.stderr || "").trim()}`);
+        const [top = "", prefix = ""] = (shown.stdout || "").split("\n");
+        const ownPath = prefix + gitPath;
+        fromName ??= ownPath;
+        toName ??= ownPath;
+
+        // Both revisions and both names in one `cat-file --batch-check`; a
+        // name holding a newline cannot travel in that line-based request and
+        // is looked up on its own.
+        const names = [fromName, toName];
+        const revs = [fromHash, toHash];
+        const request =
+          revs.map((r) => `${r}^{commit}\n`).join("") +
+          names.map((n, i) => (n.includes("\n") ? "" : `${revs[i]}^{commit}:${n}\n`)).join("");
+        const batch = spawnSync(GIT, ["cat-file", "--batch-check"], { cwd: top, encoding: "utf-8", input: request });
+        if (batch.status !== 0) throw new Error(`git cat-file failed: ${(batch.stderr || "").trim()}`);
+        const lines = (batch.stdout || "").split("\n");
+        let li = 0;
+        // `(oid, type)`, or null for `missing` / `ambiguous`.
+        const checkLine = (line) => {
+          if (line === undefined || line.endsWith(" missing") || line.endsWith(" ambiguous")) return null;
+          const [oid, kind] = line.split(" ");
+          return kind === undefined ? null : { oid, kind };
+        };
+        const commits = revs.map((r) => {
+          const found = checkLine(lines[li++]);
+          if (!found || found.kind !== "commit") throw badRequest(`unknown revision: ${r}`);
+          return found.oid;
+        });
+        const [fromType, toType] = names.map((n, i) => {
+          if (n.includes("\n")) {
+            const r = spawnSync(GIT, ["cat-file", "-t", `${commits[i]}:${n}`], { cwd: top, encoding: "utf-8" });
+            return r.status === 0 ? (r.stdout || "").trim() : null;
+          }
+          return checkLine(lines[li++])?.kind ?? null;
+        });
+        const [from, to] = commits;
+        if (fromType === null && toType === null) throw badRequest(`${filePath} not found at either commit`);
+        if (fromType === "tree" || toType === "tree") {
+          throw badRequest(`${filePath} is a directory, not a file`);
+        }
+        // Literal pathspecs; external diff, colour and textconv off — the
+        // output is parsed, never shown as is.
+        const args = [...PATCH_CONFIG, "--literal-pathspecs", "diff", "--no-textconv", ...PATCH_FLAGS];
+        if (fromName !== toName && fromType !== null && toType !== null) {
+          // Renamed in between: blob to blob, so the hunks are the content change.
+          args.push(`${from}:${fromName}`, `${to}:${toName}`);
+        } else {
+          // One name, or only one side holds the file: a plain pathspec diff.
+          args.push(from, to, "--", fromType !== null ? fromName : toName);
+        }
+        // Stream via spawn, then cap like the Rust side: a whole-file rewrite
+        // between two distant commits can be large.
+        const { text: stdout, truncatedFromBytes } = truncateDiffOutput(
+          await gitSpawnBytes(args, top),
         );
 
-        const hunks = [];
-        let currentHunk = null;
-        let oldLineNo = 0;
-        let newLineNo = 0;
+        // Bounded hunk bodies: `--- x`/`+++ x` inside a hunk is content, and a
+        // "" past the counts never becomes a phantom context line (which would
+        // make `git apply` reject the patch). See devParseDiffHunks.
+        const { hunks } = devParseDiffHunks(await loadDevCore(), stdout);
 
-        const diffLines = stdout.split("\n");
-        for (const line of diffLines) {
-          if (line.startsWith("@@")) {
-            if (currentHunk) hunks.push(currentHunk);
-            const header = line;
-            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-            const oldStart = match ? parseInt(match[1]) : 0;
-            const oldCount = match ? parseInt(match[2] || "1") : 1;
-            const newStart = match ? parseInt(match[3]) : 0;
-            const newCount = match ? parseInt(match[4] || "1") : 1;
-            oldLineNo = oldStart;
-            newLineNo = newStart;
-            currentHunk = { header, oldStart, oldCount, newStart, newCount, lines: [] };
-          } else if (currentHunk) {
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              currentHunk.lines.push({ type: "add", content: line.substring(1), oldLineNo: null, newLineNo });
-              newLineNo++;
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              currentHunk.lines.push({ type: "delete", content: line.substring(1), oldLineNo, newLineNo: null });
-              oldLineNo++;
-            } else if (line.startsWith(" ")) {
-              // Real context line: space + content (possibly empty). An empty
-              // source-line renders as " " (length 1), not "" (length 0) — the
-              // truly-empty strings produced by split("\n") on the blank
-              // separator between diff sections are NOT context. Treating them
-              // as context adds a phantom line that corrupts the hunk counts
-              // and makes `git apply` reject the patch (with e.g. "new file X
-              // depends on old contents" for a purely-additive hunk).
-              currentHunk.lines.push({ type: "context", content: line.substring(1), oldLineNo, newLineNo });
-              oldLineNo++;
-              newLineNo++;
-            }
-            // else: skip. Covers "" blank separators, "\ No newline at end of
-            // file" markers, and anything else that isn't a real hunk line.
-          }
-        }
-        if (currentHunk) hunks.push(currentHunk);
-
-        return jsonResponse(req, res, { path: filePath, hunks });
+        const body = { path: filePath, hunks };
+        if (truncatedFromBytes !== undefined) body.truncatedFromBytes = truncatedFromBytes;
+        return jsonResponse(req, res, body);
       } catch (err) {
-        // Empty diff if identical
-        if (err.status === 0 || (err.stdout && err.stdout.trim() === "")) {
-          return jsonResponse(req, res, { path: filePath, hunks: [] });
-        }
-        return jsonResponse(req, res, { path: filePath, hunks: [] });
+        // Identical revisions exit 0 with no output and never land here. Report
+        // a failure (400 for a revision git cannot resolve), as the Rust command
+        // does, rather than an empty diff that reads as "no changes".
+        return jsonResponse(req, res, { error: err.message }, err.status ?? 500);
       }
     }
 
@@ -3438,6 +6284,11 @@ async function handleRequest(req, res) {
       const cwd = url.searchParams.get("cwd");
       const hash = url.searchParams.get("hash");
       if (!cwd || !hash) return jsonResponse(req, res, { error: "Missing cwd or hash param" }, 400);
+      // Rust's `validate_revision("hash", …)`.
+      if (!hash.trim()) return jsonResponse(req, res, { error: "hash must not be empty" }, 400);
+      if (hash.startsWith("-") || /\p{Cc}/u.test(hash)) {
+        return jsonResponse(req, res, { error: `invalid hash: ${hash}` }, 400);
+      }
 
       try {
         const resolvedCwd = resolve(cwd);
@@ -3445,98 +6296,53 @@ async function handleRequest(req, res) {
         // Stream stdout via spawn — execSync's maxBuffer (10 MB) is exceeded by large
         // merge commits in monorepos and causes a 500.
         const stdout = await gitSpawn(
-          ["show", "-m", "--first-parent", "--format=", hash],
+          [
+            ...PATCH_CONFIG,
+            "-c", "log.diffMerges=first-parent",
+            "-c", "log.showRoot=true",
+            "show", "-m", "--first-parent", "--format=", "--no-show-signature", "--no-textconv",
+            ...PATCH_FLAGS,
+            hash,
+          ],
           resolvedCwd,
         );
 
-        const diffs = [];
-        let currentPath = null;
-        let currentHunk = null;
-        let currentHunks = [];
-        let oldLineNo = 0;
-        let newLineNo = 0;
-        // File-level extended header state — see Rust `git_show` for rationale.
-        // The frontend's patchBuilder needs to know whether a file was added
-        // (uses /dev/null as source) or deleted (uses /dev/null as target) or
-        // the `git apply --cached` during a split will fail.
-        let currentStatus = null;
-        let currentOldPath = null;
-
-        for (const line of stdout.split("\n")) {
-          if (line.startsWith("diff --git ")) {
-            if (currentHunk) currentHunks.push(currentHunk);
-            currentHunk = null;
-            if (currentPath) {
-              diffs.push({
-                path: currentPath,
-                hunks: currentHunks,
-                ...(currentStatus ? { status: currentStatus } : {}),
-                ...(currentOldPath ? { oldPath: currentOldPath } : {}),
-              });
-              currentHunks = [];
-            }
-            currentStatus = null;
-            currentOldPath = null;
-            const parts = line.split(" b/");
-            currentPath = parts.length >= 2 ? parts[1] : null;
-          } else if (line.startsWith("new file mode")) {
-            currentStatus = "added";
-          } else if (line.startsWith("deleted file mode")) {
-            currentStatus = "deleted";
-          } else if (line.startsWith("rename from ")) {
-            currentStatus = "renamed";
-            currentOldPath = line.substring("rename from ".length);
-          } else if (line.startsWith("rename to ") && !currentStatus) {
-            currentStatus = "renamed";
-          } else if (line.startsWith("@@")) {
-            if (currentHunk) currentHunks.push(currentHunk);
-
-            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-            const oldStart = match ? parseInt(match[1]) : 0;
-            const oldCount = match ? parseInt(match[2] || "1") : 1;
-            const newStart = match ? parseInt(match[3]) : 0;
-            const newCount = match ? parseInt(match[4] || "1") : 1;
-            oldLineNo = oldStart;
-            newLineNo = newStart;
-
-            currentHunk = { header: line, oldStart, oldCount, newStart, newCount, lines: [] };
-          } else if (currentHunk) {
-            if (line.startsWith("+") && !line.startsWith("+++")) {
-              currentHunk.lines.push({ type: "add", content: line.substring(1), oldLineNo: null, newLineNo });
-              newLineNo++;
-            } else if (line.startsWith("-") && !line.startsWith("---")) {
-              currentHunk.lines.push({ type: "delete", content: line.substring(1), oldLineNo, newLineNo: null });
-              oldLineNo++;
-            } else if (line.startsWith(" ")) {
-              // Real context line: space + content (possibly empty). An empty
-              // source-line renders as " " (length 1), not "" (length 0) — the
-              // truly-empty strings produced by split("\n") on the blank
-              // separator between diff sections are NOT context. Treating them
-              // as context adds a phantom line that corrupts the hunk counts
-              // and makes `git apply` reject the patch (with e.g. "new file X
-              // depends on old contents" for a purely-additive hunk).
-              currentHunk.lines.push({ type: "context", content: line.substring(1), oldLineNo, newLineNo });
-              oldLineNo++;
-              newLineNo++;
-            }
-            // else: skip. Covers "" blank separators, "\ No newline at end of
-            // file" markers, and anything else that isn't a real hunk line.
-          }
-        }
-
-        if (currentHunk) currentHunks.push(currentHunk);
-        if (currentPath) {
-          diffs.push({
-            path: currentPath,
-            hunks: currentHunks,
-            ...(currentStatus ? { status: currentStatus } : {}),
-            ...(currentOldPath ? { oldPath: currentOldPath } : {}),
-          });
-        }
+        // Rust's `git_show` parses with `parse_multi_file_diff`, no cap.
+        const diffs = devParseMultiFileDiff(await loadDevCore(), stdout);
 
         return jsonResponse(req, res, diffs);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/git-combined-diff  { cwd, hashes, paths? }  → CombinedDiff
+    // Mirrors `git_combined_diff` (commands/combined.rs + combined/): see
+    // `devCombinedDiff`. Refused input → 400, any other failure → 500.
+    if (url.pathname === "/api/git-combined-diff" && req.method === "POST") {
+      const { cwd, hashes, paths } = await readBody(req);
+      const strings = (v) => Array.isArray(v) && v.every((x) => typeof x === "string");
+      if (typeof cwd !== "string" || !cwd || !strings(hashes) || (paths != null && !strings(paths))) {
+        return jsonResponse(req, res, { error: "Missing cwd or hashes" }, 400);
+      }
+      try {
+        return jsonResponse(req, res, await devCombinedDiff(resolve(cwd), hashes, paths ?? null));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, err instanceof CombinedInputError ? 400 : 500);
+      }
+    }
+
+    // GET /api/git-file-lineage?cwd=<path>&path=<root-relative file>
+    // Mirrors `git_file_lineage` (commands/combined.rs + combined/lineage.rs):
+    // see `devFileLineage`. Refused input → 400, any other failure → 500.
+    if (url.pathname === "/api/git-file-lineage" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      const path = url.searchParams.get("path");
+      if (!cwd || path === null) return jsonResponse(req, res, { error: "Missing cwd or path" }, 400);
+      try {
+        return jsonResponse(req, res, await devFileLineage(resolve(cwd), path));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, err instanceof CombinedInputError ? 400 : 500);
       }
     }
 
@@ -3554,7 +6360,7 @@ async function handleRequest(req, res) {
         // Passed as a single argv element (no shell) — `mainName` can come
         // from a user-configured setting, so it must never be interpolated
         // into a shell string.
-        const format = `%(HEAD)%(refname:short)\x1f%(upstream:short)\x1f%(upstream:track,nobracket)\x1f%(objectname:short) %(subject)\x1f%(committerdate:iso-strict)\x1f%(ahead-behind:${mainName})`;
+        const format = `%(HEAD)%(refname)\x1f%(upstream:short)\x1f%(upstream:track,nobracket)\x1f%(objectname:short) %(subject)\x1f%(committerdate:iso-strict)\x1f%(ahead-behind:${mainName})\x1f%(symref)`;
         const branchResult = spawnSync(GIT, ["branch", "-a", `--format=${format}`], {
           cwd: resolvedCwd,
           encoding: "utf-8",
@@ -3575,14 +6381,16 @@ async function handleRequest(req, res) {
           const parts = rest.split("\x1f");
           if (parts.length < 4) continue;
 
-          const name = parts[0];
+          const fullRef = parts[0];
           const upstream = parts[1] || null;
           const trackInfo = parts[2] || "";
           const lastCommit = parts[3] || "";
           const lastCommitDate = parts[4] || "";
           const mainCount = parseInt((parts[5] || "0").split(/\s+/)[0], 10) || 0;
 
-          if (name.includes("HEAD ->") || name === "origin/HEAD") continue;
+          // Skip symbolic refs (`refs/remotes/<remote>/HEAD`) — not branches.
+          // KEEP IN SYNC with ops.rs.
+          if (parts[6]) continue;
 
           let ahead = 0, behind = 0;
           for (const part of trackInfo.split(", ")) {
@@ -3590,8 +6398,12 @@ async function handleRequest(req, res) {
             if (part.startsWith("behind ")) behind = parseInt(part.substring(7)) || 0;
           }
 
-          const isRemote = name.startsWith("origin/") || name.startsWith("remotes/");
-          const cleanName = name.startsWith("remotes/") ? name.slice(8) : name;
+          // Classify from the full refname (any remote, not only "origin") and
+          // strip it to the display name: refs/heads/x → x, refs/remotes/o/x → o/x.
+          const isRemote = fullRef.startsWith("refs/remotes/");
+          const cleanName = isRemote
+            ? fullRef.slice("refs/remotes/".length)
+            : fullRef.replace(/^refs\/heads\//, "");
 
           mainCounts.set(cleanName, mainCount);
 
@@ -3847,10 +6659,13 @@ async function handleRequest(req, res) {
       }
       try {
         const resolvedCwd = resolve(cwd);
-        const out = execFileSync(
-          "git",
-          ["stash", "show", "-p", `stash@{${parseInt(idx, 10)}}`],
-          { cwd: resolvedCwd, encoding: "utf-8" },
+        // The resolved GIT, streamed (no 1 MB maxBuffer), like /api/git-show.
+        const out = await gitSpawn(
+          [
+            ...PATCH_CONFIG, "-c", "stash.showIncludeUntracked=true",
+            "stash", "show", "-p", "--no-textconv", ...PATCH_FLAGS, `stash@{${parseInt(idx, 10)}}`,
+          ],
+          resolvedCwd,
         );
         return jsonResponse(req, res, { diff: out });
       } catch (err) {
@@ -3922,10 +6737,15 @@ async function handleRequest(req, res) {
       if (!cwd || !filePath) return jsonResponse(req, res, { error: "cwd and path required" }, 400);
       try {
         const resolvedCwd = resolve(cwd);
-        const fmt = "%H\n%h\n%an\n%aI\n%s\n%b\n---END---";
-        const out = spawnSync(GIT, ["log", "--follow", "-n", String(count), `--format=${fmt}`, "--", filePath],
-          { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-        return jsonResponse(req, res, parseFileLog(out.stdout || ""));
+        // Mirrors `git_file_log`: names included (`--name-only -z`), literal pathspec.
+        const out = spawnSync(GIT, [
+          "-c", "diff.relative=false", "--literal-pathspecs", "log", "--follow", "--name-only", "-z", "-n", String(count),
+          FILE_LOG_NAMED_FORMAT, "--", filePath,
+        ], { cwd: resolvedCwd, encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 }); // as git-author-line-stats: Rust has no cap
+        // Same failure as the Rust command, never an empty history.
+        if (out.error) return jsonResponse(req, res, { error: `git log failed: ${out.error.message}` }, 500);
+        if (out.status !== 0) return jsonResponse(req, res, { error: `git log failed: ${out.stderr || ""}` }, 500);
+        return jsonResponse(req, res, parseFileLogNamed(out.stdout || ""));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -3939,10 +6759,15 @@ async function handleRequest(req, res) {
       const mode = url.searchParams.get("mode") === "G" ? "-G" : "-S";
       if (!cwd || !filePath || !search) return jsonResponse(req, res, { error: "cwd, path, search required" }, 400);
       try {
-        const fmt = "%H\n%h\n%an\n%aI\n%s\n%b\n---END---";
-        const out = spawnSync(GIT, ["log", "--follow", mode, search, `--format=${fmt}`, "--", filePath],
-          { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-        return jsonResponse(req, res, parseFileLog(out.stdout || ""));
+        // Mirrors `git_file_log_pickaxe`: same named output as the file log.
+        const out = spawnSync(GIT, [
+          "-c", "diff.relative=false", "--literal-pathspecs", "log", "--follow", "--name-only", "-z", mode, search,
+          FILE_LOG_NAMED_FORMAT, "--", filePath,
+        ], { cwd: resolve(cwd), encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 });
+        // Same failure as the Rust command, never an empty history.
+        if (out.error) return jsonResponse(req, res, { error: `git log pickaxe failed: ${out.error.message}` }, 500);
+        if (out.status !== 0) return jsonResponse(req, res, { error: `git log pickaxe failed: ${out.stderr || ""}` }, 500);
+        return jsonResponse(req, res, parseFileLogNamed(out.stdout || ""));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -4024,23 +6849,71 @@ async function handleRequest(req, res) {
       const cwd = url.searchParams.get("cwd");
       const state = url.searchParams.get("state") || "open";
       if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      // `rest_list_prs`: one page of `limit + offset` (at most 100), then the
+      // slice — the per-PR enrichment below runs for `limit` PRs at most, not
+      // for a whole (parent) repo's list.
+      // `gh_list_prs`: `limit.unwrap_or(10)`.
+      const limit = Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "", 10) || 10);
+      const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "", 10) || 0);
+      const perPage = Math.min(100, Math.max(1, limit + offset));
+      const apiState = state === "closed" || state === "merged" ? "closed" : state === "all" ? "all" : "open";
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token found. Run: gh auth login" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `rest_list_prs`: the base repo (the fork parent for a fork), or the
+        // fork lookup's error — a list built from origin would show numbers
+        // every per-PR route then resolves in the parent.
+        const nwo = await devRestBaseNwo(resolve(cwd), token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo from git remote origin" }, 400);
-        // Paginate up to 300 PRs (3 pages × 100)
-        let raw = [];
-        for (let page = 1; page <= 3; page++) {
-          const resp = await githubFetch(`/repos/${nwo}/pulls?state=${state}&per_page=100&page=${page}`, token);
-          if (!resp.ok) {
-            const text = await resp.text();
-            return jsonResponse(req, res, { error: `GitHub API ${resp.status}: ${text}` }, 500);
+        // `list_page_plan`: start at the page holding `offset`.
+        const merged = state === "merged";
+        const firstPage = Math.floor(offset / perPage) + 1;
+        const skipped = (firstPage - 1) * perPage;
+        let fetched = [];
+        if (merged) {
+          // `merged_prs_page`: the search API pages merged PRs directly; each
+          // number is then read as a pull request.
+          const numbers = [];
+          // The search API serves its first 1 000 results only.
+          for (let page = firstPage; (page - 1) * perPage < 1000; page++) {
+            const resp = await githubFetch(
+              `/search/issues?q=${encodeURIComponent(`repo:${nwo} type:pr is:merged`)}&sort=updated&order=desc&per_page=${perPage}&page=${page}`,
+              token,
+            );
+            if (!resp.ok) {
+              const text = await resp.text();
+              return jsonResponse(req, res, { error: `GitHub API ${resp.status}: ${text}` }, 500);
+            }
+            const items = (await resp.json())?.items ?? [];
+            numbers.push(...items.map((i) => i.number));
+            if (items.length < perPage || skipped + numbers.length >= limit + offset) break;
           }
-          const page_data = await resp.json();
-          raw = raw.concat(page_data);
-          if (page_data.length < 100) break; // last page
+          // Only the numbers the slice keeps are read as pull requests.
+          for (const n of numbers.slice(offset - skipped, offset - skipped + limit)) {
+            const resp = await githubFetch(`/repos/${nwo}/pulls/${n}`, token);
+            if (!resp.ok) {
+              const text = await resp.text();
+              return jsonResponse(req, res, { error: `GitHub API ${resp.status}: ${text}` }, 500);
+            }
+            fetched.push(await resp.json());
+          }
+        } else {
+          for (let page = firstPage; page < firstPage + 10; page++) {
+            const resp = await githubFetch(
+              `/repos/${nwo}/pulls?state=${apiState}&per_page=${perPage}&page=${page}&sort=updated&direction=desc`,
+              token,
+            );
+            if (!resp.ok) {
+              const text = await resp.text();
+              return jsonResponse(req, res, { error: `GitHub API ${resp.status}: ${text}` }, 500);
+            }
+            const chunk = (await resp.json()) ?? [];
+            fetched = fetched.concat(chunk);
+            if (chunk.length < perPage || skipped + fetched.length >= limit + offset) break;
+          }
         }
+        const from = merged ? 0 : Math.max(0, offset - skipped);
+        const raw = fetched.slice(from, from + limit);
         const prs = raw.map((pr) => ({
           number: pr.number,
           title: pr.title,
@@ -4137,7 +7010,12 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, 0);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `rest_pr_count`: the base repo, like the list — and its error when
+        // the fork lookup fails, as Rust returns it (`ghPrCount` shows 0 for
+        // any failure, on both backends).
+        let nwo;
+        try { nwo = await devRestBaseNwo(resolve(cwd), token); }
+        catch (e) { return jsonResponse(req, res, { error: e.message }, 500); }
         if (!nwo) return jsonResponse(req, res, 0);
         const resp = await githubFetch(`/repos/${nwo}/pulls?state=${state}&per_page=1`, token);
         if (!resp.ok) return jsonResponse(req, res, 0);
@@ -4168,7 +7046,12 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, null);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `rest_pr_freshness_signal`: the base repo, like the list — and its
+        // error when the fork lookup fails, as Rust returns it
+        // (`ghPrFreshnessSignal` reads any failure as "no signal").
+        let nwo;
+        try { nwo = await devRestBaseNwo(resolve(cwd), token); }
+        catch (e) { return jsonResponse(req, res, { error: e.message }, 500); }
         if (!nwo) return jsonResponse(req, res, null);
         const topResp = await githubFetch(`/repos/${nwo}/pulls?state=open&per_page=1&page=1&sort=updated&direction=desc`, token);
         if (!topResp.ok) return jsonResponse(req, res, null);
@@ -4311,6 +7194,157 @@ async function handleRequest(req, res) {
       }
     }
 
+    // GET /api/gh-issue-available?cwd=<path> — mirrors `gh_issue_available`:
+    // a local check (origin is a GitHub remote), no request.
+    if (url.pathname === "/api/gh-issue-available" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      return jsonResponse(req, res, getRepoNwo(resolve(cwd)) !== null);
+    }
+
+    // GET /api/gh-issue-targets?cwd=<path> — mirrors `gh_issue_targets`.
+    if (url.pathname === "/api/gh-issue-targets" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        return jsonResponse(req, res, await devIssueTargets(resolve(cwd), token, true));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // POST /api/gh-create-issue { cwd, input } — mirrors `gh_create_issue`.
+    if (url.pathname === "/api/gh-create-issue" && req.method === "POST") {
+      const { cwd, input } = await readBody(req);
+      if (!cwd || !input) return jsonResponse(req, res, { error: "Missing cwd or input" }, 400);
+      // Checked before any call, as in Rust: a blank title costs no request.
+      const built = devIssuePayload(input);
+      if (built.error) return jsonResponse(req, res, { error: built.error }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const target = devResolveIssueTarget(await devIssueTargets(resolve(cwd), token), input.repo);
+        if (target.error) return jsonResponse(req, res, { error: target.error }, 400);
+        let resp;
+        try {
+          resp = await githubFetch(`/repos/${target.repo}/issues`, token, undefined, {
+            method: "POST",
+            body: JSON.stringify(built.payload),
+          });
+        } catch (err) {
+          // The request may have left before the failure: as in Rust, say so.
+          return jsonResponse(req, res, { error: MAY_HAVE_BEEN_CREATED + err.message }, 502);
+        }
+        const created = await resp.json().catch(() => ({}));
+        if (!resp.ok) return jsonResponse(req, res, { error: devCreateFailure(resp.status, created) }, resp.status);
+        return jsonResponse(req, res, { number: created.number, url: created.html_url || "" });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // GET /api/gh-gitwand-writable — mirrors `gh_gitwand_writable`: the
+    // dev-server writes with the `gh` token, so a token is enough.
+    if (url.pathname === "/api/gh-gitwand-writable" && req.method === "GET") {
+      // getGithubToken() spawns `gh auth token` synchronously: reused for
+      // 30 s, as the Rust side does, so tab switches don't block the server.
+      const now = Date.now();
+      if (!devGitwandWritable || now - devGitwandWritable.at > 30_000) {
+        devGitwandWritable = { ok: !!getGithubToken(), at: now };
+      }
+      return jsonResponse(req, res, devGitwandWritable.ok);
+    }
+
+    // POST /api/gh-create-gitwand-issue { input } — mirrors
+    // `gh_create_gitwand_issue` (#301), on GITWAND_DEV_REPORT_REPO when set.
+    if (url.pathname === "/api/gh-create-gitwand-issue" && req.method === "POST") {
+      const { input } = await readBody(req);
+      const built = devGitwandReport(input, process.env);
+      if (built.error) return jsonResponse(req, res, { error: built.error }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        let resp;
+        try {
+          resp = await githubFetch(`/repos/${built.repo}/issues`, token, undefined, {
+            method: "POST",
+            body: JSON.stringify(built.payload),
+          });
+        } catch (err) {
+          return jsonResponse(req, res, { error: MAY_HAVE_BEEN_CREATED + err.message }, 502);
+        }
+        const created = await resp.json().catch(() => ({}));
+        if (!resp.ok) return jsonResponse(req, res, { error: devCreateFailure(resp.status, created) }, resp.status);
+        return jsonResponse(req, res, { number: created.number, url: created.html_url || "" });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // GET /api/gh-list-{labels,milestones,assignees}?cwd=<path>&repo=<owner/repo>
+    // — mirror `gh_list_labels` / `gh_list_milestones` / `gh_list_assignees`.
+    // (The condition below names each route literally: commandRegistry.test
+    // reads the served routes from `url.pathname === "…"` comparisons.)
+    if (
+      (url.pathname === "/api/gh-list-labels" ||
+        url.pathname === "/api/gh-list-milestones" ||
+        url.pathname === "/api/gh-list-assignees") &&
+      req.method === "GET"
+    ) {
+      const issuePicker = {
+        "/api/gh-list-labels": { suffix: "labels", query: "", pages: 3, map: devLabelsFrom },
+        "/api/gh-list-milestones": { suffix: "milestones", query: "state=open&", pages: 1, map: devMilestonesFrom },
+        "/api/gh-list-assignees": { suffix: "assignees", query: "", pages: 3, map: devAssigneesFrom },
+      }[url.pathname];
+      const cwd = url.searchParams.get("cwd");
+      const repo = url.searchParams.get("repo");
+      if (!cwd || !repo) return jsonResponse(req, res, { error: "Missing cwd or repo" }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const target = devResolveIssueTarget(await devIssueTargets(resolve(cwd), token), repo);
+        if (target.error) return jsonResponse(req, res, { error: target.error }, 400);
+        const items = await devGithubPages(`/repos/${target.repo}/${issuePicker.suffix}`, issuePicker.query, token, issuePicker.pages);
+        return jsonResponse(req, res, issuePicker.map(items));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // GET /api/gh-issue-templates?cwd=<path>&repo=<owner/repo> — mirrors
+    // `gh_issue_templates` (#301): the target's template files. github.com
+    // only, like every issue route of this server (Rust reads Enterprise).
+    if (url.pathname === "/api/gh-issue-templates" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      const repo = url.searchParams.get("repo");
+      if (!cwd || !repo) return jsonResponse(req, res, { error: "Missing cwd or repo" }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const target = devResolveIssueTarget(await devIssueTargets(resolve(cwd), token), repo);
+        if (target.error) return jsonResponse(req, res, { error: target.error }, 400);
+        // Each read bounded at 30 s, as Rust's.
+        const bounded = () => ({ signal: AbortSignal.timeout(30_000) });
+        const get = async (nwo, path) => {
+          const resp = await githubFetch(path ? `/repos/${nwo}/contents/${path}` : `/repos/${nwo}/contents`, token, undefined, bounded());
+          if (resp.status === 404) return null;
+          if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+          return resp.json();
+        };
+        const isPublic = async (nwo) => {
+          const resp = await githubFetch(`/repos/${nwo}`, token, undefined, bounded());
+          if (resp.status === 404) return false;
+          if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+          return (await resp.json())?.private === false;
+        };
+        return jsonResponse(req, res, await devTemplateFiles(target.repo, isPublic, get));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
     // GET /api/gh-reviewer-candidates?cwd=<path>
     // Lists assignees (users with push access) for autocomplete.
     if (url.pathname === "/api/gh-reviewer-candidates" && req.method === "GET") {
@@ -4319,29 +7353,23 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
-        if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        // Paginate up to 3 pages of 100 = 300 candidates.
-        const all = [];
-        const seen = new Set();
-        for (let page = 1; page <= 3; page++) {
-          const resp = await githubFetch(`/repos/${nwo}/assignees?per_page=100&page=${page}`, token);
-          if (!resp.ok) break;
-          const raw = await resp.json();
-          if (!Array.isArray(raw) || raw.length === 0) break;
-          for (const u of raw) {
-            if (!u.login || seen.has(u.login)) continue;
-            seen.add(u.login);
-            all.push({
-              login: u.login,
-              name: u.name ?? null,
-              avatar_url: u.avatar_url ?? null,
-            });
-          }
-          if (raw.length < 100) break;
+        // `gh_list_reviewer_candidates` / `reviewer_candidates_repo`: the
+        // target named by the create form (origin or the base repo), else
+        // the base repo, whose PRs the detail requests reviewers on.
+        const base = await devRestBaseNwo(resolve(cwd), token);
+        if (!base) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
+        const origin = getRepoNwo(resolve(cwd));
+        // "origin": the create form's default target (`ORIGIN_TARGET`).
+        const target = url.searchParams.get("repo") === "origin" ? origin : url.searchParams.get("repo");
+        const same = (a, b) => a && b && a.toLowerCase() === b.toLowerCase();
+        if (target && !same(target, origin) && !same(target, base)) {
+          return jsonResponse(req, res, { error: `${target} is neither this repository nor its parent` }, 400);
         }
-        all.sort((a, b) => a.login.toLowerCase().localeCompare(b.login.toLowerCase()));
-        return jsonResponse(req, res, all);
+        const nwo = target || base;
+        // Up to 3 pages of 100, read like the Rust `api_get_pages` (an error
+        // page fails the call instead of returning partial data).
+        const items = await devGithubPages(`/repos/${nwo}/assignees`, "", token, 3);
+        return jsonResponse(req, res, devAssigneesFrom(items));
       } catch (err) {
         console.error("[gh-reviewer-candidates]", err.message);
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
@@ -4356,9 +7384,12 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        const resp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token);
+        const resp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token);
         if (!resp.ok) return jsonResponse(req, res, { error: `GitHub API ${resp.status}` }, 500);
         const pr = await resp.json();
         return jsonResponse(req, res, {
@@ -4398,9 +7429,12 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        const resp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token, "application/vnd.github.v3.diff");
+        const resp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token, "application/vnd.github.v3.diff");
         if (!resp.ok) return jsonResponse(req, res, { error: `GitHub API ${resp.status}` }, 500);
         const diff = await resp.text();
         return jsonResponse(req, res, { diff });
@@ -4417,23 +7451,41 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         // Get PR head SHA first
-        const prResp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token);
+        const prResp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token);
         if (!prResp.ok) return jsonResponse(req, res, { error: `GitHub API ${prResp.status}` }, 500);
         const pr = await prResp.json();
         const sha = pr.head?.sha;
         if (!sha) return jsonResponse(req, res, []);
         // Get check runs for that commit
         const checksResp = await githubFetch(`/repos/${nwo}/commits/${sha}/check-runs?per_page=100`, token);
-        if (!checksResp.ok) return jsonResponse(req, res, { error: `GitHub API ${checksResp.status}` }, 500);
+        if (!checksResp.ok) {
+          // Same split as the Rust `checks_unavailable`: a 403/404 that is
+          // neither a rate limit nor an org's OAuth app restriction means the
+          // checks are not visible (fine-grained token without Checks: read) →
+          // no checks; anything else is a failure. (GitLab, Bitbucket and Azure
+          // checks have no dev-server route: see commandRegistry.ts.)
+          const body = await checksResp.text();
+          if (
+            (checksResp.status === 403 || checksResp.status === 404) &&
+            !/rate limit|OAuth App access restrictions/i.test(body)
+          ) {
+            return jsonResponse(req, res, []);
+          }
+          return jsonResponse(req, res, { error: `GitHub API ${checksResp.status}` }, 500);
+        }
         const data = await checksResp.json();
         return jsonResponse(req, res, (data.check_runs ?? []).map((c) => ({
           name: c.name,
           state: c.status === "completed" ? c.conclusion : c.status,
           conclusion: c.conclusion ?? "",
           details_url: c.html_url ?? "",
+          commit_sha: sha,
         })));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
@@ -4448,10 +7500,13 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         // PR head SHA
-        const prResp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token);
+        const prResp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token);
         if (!prResp.ok) return jsonResponse(req, res, { error: `GitHub API ${prResp.status}` }, 500);
         const pr = await prResp.json();
         const sha = pr.head?.sha;
@@ -4497,10 +7552,12 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = await resolvePrNwo(resolve(cwd), number, token);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         // Fetch all review comments (paginated — up to 200)
-        const resp = await githubFetch(`/repos/${nwo}/pulls/${number}/comments?per_page=100`, token);
+        const resp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}/comments?per_page=100`, token);
         if (!resp.ok) return jsonResponse(req, res, { error: `GitHub API ${resp.status}` }, 500);
         const raw = await resp.json();
         return jsonResponse(req, res, raw.map((c) => ({
@@ -4533,9 +7590,11 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = await resolvePrNwo(resolve(cwd), number, token);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        const resp = await githubFetch(`/repos/${nwo}/issues/${number}/comments?per_page=100`, token);
+        const resp = await githubFetch(`/repos/${nwo}/issues/${prNumber}/comments?per_page=100`, token);
         if (!resp.ok) return jsonResponse(req, res, { error: `GitHub API ${resp.status}` }, 500);
         const raw = await resp.json();
         return jsonResponse(req, res, raw.map((c) => ({
@@ -4556,6 +7615,75 @@ async function handleRequest(req, res) {
         })));
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // GET /api/gh-pr-attachment-urls?cwd=<path>&number=<n>
+    // Signed URLs of the PR's uploaded files, from `body_html` (#302) —
+    // mirrors `gh_pr_attachment_urls` / `signed_attachment_urls` in Rust.
+    if (url.pathname === "/api/gh-pr-attachment-urls" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      const number = url.searchParams.get("number");
+      if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+      // The Rust command takes an i64: refuse here what it cannot receive.
+      if (!/^\d+$/.test(number)) return jsonResponse(req, res, { error: "Invalid number" }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
+        if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
+        const paths = [
+          `/repos/${nwo}/issues/${prNumber}`,
+          `/repos/${nwo}/issues/${prNumber}/comments?per_page=100`,
+          `/repos/${nwo}/pulls/${prNumber}/comments?per_page=100`,
+          `/repos/${nwo}/pulls/${prNumber}/reviews?per_page=100`,
+        ];
+        // Best effort, like `signed_urls_from_fetches`: one failed endpoint
+        // does not cost the others' URLs; all failing is the error.
+        const htmls = [];
+        let firstError = null;
+        let anyOk = false;
+        // Visibility alongside the bodies, best effort (null when unreadable),
+        // read from the PR's base repository as the Rust command does.
+        const [repoResult, ...fetches] = await Promise.allSettled([
+          githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token).then((r) => (r.ok ? r.json() : null)),
+          ...paths.map(async (p) => {
+            const resp = await githubFetch(p, token, "application/vnd.github.html+json");
+            if (!resp.ok) throw new Error(`GitHub API ${resp.status}`);
+            return resp.json();
+          }),
+        ]);
+        const priv = repoResult.status === "fulfilled" ? repoResult.value?.base?.repo?.private : undefined;
+        const isPrivate = typeof priv === "boolean" ? priv : null;
+        for (const f of fetches) {
+          if (f.status === "rejected") {
+            firstError ??= f.reason?.message ?? String(f.reason);
+            continue;
+          }
+          anyOk = true;
+          const v = f.value;
+          for (const item of Array.isArray(v) ? v : [v]) if (typeof item?.body_html === "string") htmls.push(item.body_html);
+        }
+        if (!anyOk) return jsonResponse(req, res, { error: firstError }, 500);
+        const urls = [];
+        for (const html of htmls) {
+          for (const m of html.matchAll(/\ssrc="([^"]*)"/g)) {
+            if (!m[1].startsWith("https://private-user-images.githubusercontent.com/")) continue;
+            // Same references as `decode_html_entities` in Rust.
+            const u = m[1].replace(/&(#x[0-9a-f]+|#[0-9]+|amp|quot|apos|lt|gt);/gi, (all, n) => {
+              const named = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">" }[n.toLowerCase()];
+              if (named) return named;
+              const code = n[1] === "x" || n[1] === "X" ? parseInt(n.slice(2), 16) : parseInt(n.slice(1), 10);
+              return Number.isFinite(code) && code <= 0x10ffff ? String.fromCodePoint(code) : all;
+            });
+            if (!urls.includes(u)) urls.push(u);
+          }
+        }
+        return jsonResponse(req, res, { private: isPrivate, urls, complete: firstError === null });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
       }
     }
 
@@ -4621,12 +7749,25 @@ async function handleRequest(req, res) {
     // POST /api/gh-issue-comment  { cwd, number, body }
     if (url.pathname === "/api/gh-issue-comment" && req.method === "POST") {
       const body = await readBody(req);
-      const { cwd, number, body: commentBody } = body;
+      const { cwd, number, body: commentBody, pr } = body;
       if (!cwd || !number || !commentBody) return jsonResponse(req, res, { error: "Missing required fields" }, 400);
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `gh_issue_add_comment` with `pr`: the PR's repo (the base repo),
+        // after reading the PR there, as `rest_pr_add_conversation_comment`.
+        let nwo;
+        if (pr) {
+          const prNumber = devPrNumber(number);
+          if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+          nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
+          const prResp = nwo ? await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token) : null;
+          if (prResp && !prResp.ok) {
+            return jsonResponse(req, res, { error: `GitHub API ${prResp.status} (fetching PR #${prNumber})` }, prResp.status);
+          }
+        } else {
+          nwo = getRepoNwo(resolve(cwd));
+        }
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         const resp = await fetch(`https://api.github.com/repos/${nwo}/issues/${number}/comments`, {
           method: "POST",
@@ -4691,18 +7832,21 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `gh_pr_create_comment`: the repo the PR lives in (`get_pr_json`).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         // Get PR head commit SHA
-        const prResp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token);
+        const prResp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token);
         if (!prResp.ok) return jsonResponse(req, res, { error: `GitHub API ${prResp.status}` }, 500);
         const pr = await prResp.json();
         const commit_id = pr.head?.sha;
         const payload = in_reply_to_id
-          ? { body: commentBody, in_reply_to_id }
+          ? { body: commentBody, in_reply_to: in_reply_to_id }
           : { body: commentBody, commit_id, path: filePath, line: line ?? 1, side: side ?? "RIGHT",
               ...(start_line ? { start_line, start_side: start_side ?? "RIGHT" } : {}) };
-        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${number}/comments`, {
+        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${prNumber}/comments`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${token}`,
@@ -4734,12 +7878,16 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/gh-pr-comment" && req.method === "PATCH") {
       const id = url.searchParams.get("id");
       const body = await readBody(req);
-      const { cwd, body: newBody } = body;
+      const { cwd, body: newBody, number } = body;
       if (!id || !cwd || !newBody) return jsonResponse(req, res, { error: "Missing id, cwd or body" }, 400);
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `gh_pr_update_comment`: the repo the PR lives in (`get_pr_json`).
+        // `gh_pr_update_comment` takes the PR number (the wrapper requires it).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/comments/${id}`, {
           method: "PATCH",
@@ -4763,11 +7911,16 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/gh-pr-comment" && req.method === "DELETE") {
       const cwd = url.searchParams.get("cwd");
       const id = url.searchParams.get("id");
+      const number = url.searchParams.get("number");
       if (!cwd || !id) return jsonResponse(req, res, { error: "Missing cwd or id" }, 400);
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // `gh_pr_delete_comment`: the repo the PR lives in (`get_pr_json`).
+        // `gh_pr_delete_comment` takes the PR number (the wrapper requires it).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
         const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/comments/${id}`, {
           method: "DELETE",
@@ -4794,9 +7947,11 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = await resolvePrNwo(resolve(cwd), number, token);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        const resp = await githubFetch(`/repos/${nwo}/pulls/${number}/reviews?per_page=100`, token);
+        const resp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}/reviews?per_page=100`, token);
         if (!resp.ok) return jsonResponse(req, res, { error: `GitHub API ${resp.status}` }, 500);
         const raw = await resp.json();
         // Map to the frontend `PrReview` shape (parity with the Tauri
@@ -4825,11 +7980,14 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
 
         // Get PR head SHA (required by GitHub API)
-        const prResp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token);
+        const prResp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token);
         if (!prResp.ok) return jsonResponse(req, res, { error: `GitHub API ${prResp.status}` }, 500);
         const pr = await prResp.json();
         const commitId = pr.head.sha;
@@ -4838,7 +7996,7 @@ async function handleRequest(req, res) {
         if (reviewBody) payload.body = reviewBody;
         if (comments.length > 0) payload.comments = comments;
 
-        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${number}/reviews`, {
+        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${prNumber}/reviews`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${token}`,
@@ -4883,35 +8041,75 @@ async function handleRequest(req, res) {
       try {
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
 
         // Get PR base branch + head SHA from GitHub API
-        const prResp = await githubFetch(`/repos/${nwo}/pulls/${number}`, token);
+        const prResp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}`, token);
         if (!prResp.ok) return jsonResponse(req, res, { error: `GitHub API ${prResp.status}` }, 500);
         const pr = await prResp.json();
         const baseBranch = pr.base.ref;
         const headSha = pr.head.sha;
         const absPath = resolve(cwd);
 
-        // Fetch PR head ref so we have it locally
-        const fetchRes = spawnSync(GIT, ["fetch", "--quiet", "origin", `refs/pull/${number}/head:refs/pr/${number}`], {
+        // The PR's head and base come from the repo it lives in: for a fork,
+        // its parent — fetched by URL, as `rest_checkout_pr` does — not origin,
+        // whose same-numbered `pull/<n>/head` is another PR (#262).
+        const origin = getRepoNwo(absPath);
+        const remote = nwo === origin ? "origin" : `https://github.com/${nwo}.git`;
+        // Scratch refs named per request: two previews of the same PR at once
+        // must not delete each other's. Forced (`+`): a PR head is
+        // force-pushed.
+        const scratch = `${prNumber}-${process.hrtime.bigint()}`;
+        const fetchRes = spawnSync(GIT, ["fetch", "--quiet", remote, `+refs/pull/${prNumber}/head:refs/pr-preview/head-${scratch}`], {
           cwd: absPath, encoding: "utf-8",
         });
         // If fetch fails (e.g., no network access to remote), fall back to using headSha directly
-        const prRef = fetchRes.status === 0 ? `refs/pr/${number}` : headSha;
+        const prRef = fetchRes.status === 0 ? `refs/pr-preview/head-${scratch}` : headSha;
+        // The two fetched refs are scratch: deleted once merge-tree has run,
+        // so a fork's parent history does not stay in the user's repo (and in
+        // every `--all` walk, the Git Tree's included).
+        const dropScratchRefs = () => {
+          for (const ref of [`refs/pr-preview/head-${scratch}`, `refs/pr-preview/base-${scratch}`]) {
+            spawnSync(GIT, ["update-ref", "-d", ref], { cwd: absPath, encoding: "utf-8" });
+          }
+        };
 
         // Fetch base branch too (may already be current)
-        spawnSync(GIT, ["fetch", "--quiet", "origin", baseBranch], { cwd: absPath, encoding: "utf-8" });
-        const baseRef = `origin/${baseBranch}`;
+        let baseRef = `origin/${baseBranch}`;
+        if (remote === "origin") {
+          spawnSync(GIT, ["fetch", "--quiet", "origin", baseBranch], { cwd: absPath, encoding: "utf-8" });
+        } else {
+          // The parent's base branch, never origin's same-named one (another
+          // history); its fetch failing is the answer.
+          const baseFetch = spawnSync(
+            GIT,
+            ["fetch", "--quiet", remote, `+refs/heads/${baseBranch}:refs/pr-preview/base-${scratch}`],
+            { cwd: absPath, encoding: "utf-8" },
+          );
+          if (baseFetch.status !== 0) {
+            dropScratchRefs();
+            return jsonResponse(req, res, {
+              error: `Could not fetch ${baseBranch} from ${nwo}: ${(baseFetch.stderr || "").trim()}`,
+            }, 500);
+          }
+          baseRef = `refs/pr-preview/base-${scratch}`;
+        }
 
         // Find merge base
         const mbRes = spawnSync(GIT, ["merge-base", baseRef, prRef], { cwd: absPath, encoding: "utf-8" });
-        if (mbRes.status !== 0) return jsonResponse(req, res, { error: "Cannot find merge-base" }, 500);
+        if (mbRes.status !== 0) {
+          dropScratchRefs();
+          return jsonResponse(req, res, { error: "Cannot find merge-base" }, 500);
+        }
         const mergeBase = mbRes.stdout.trim();
 
         // Run git merge-tree (read-only)
         const mtRes = spawnSync(GIT, ["merge-tree", mergeBase, baseRef, prRef], { cwd: absPath, encoding: "utf-8" });
+        dropScratchRefs();
         const output = mtRes.stdout || "";
 
         // Parse output: lines starting with "changed in both" or conflict markers
@@ -4943,7 +8141,7 @@ async function handleRequest(req, res) {
         const mergeState = pr.mergeable_state;
 
         // Get the list of files changed in this PR
-        const prFilesResp = await githubFetch(`/repos/${nwo}/pulls/${number}/files?per_page=100`, token);
+        const prFilesResp = await githubFetch(`/repos/${nwo}/pulls/${prNumber}/files?per_page=100`, token);
         const prFiles = prFilesResp.ok ? await prFilesResp.json() : [];
 
         // For each file, check if it also has local changes on base (potential conflict)
@@ -5093,6 +8291,213 @@ async function handleRequest(req, res) {
     // OAuth. Mirrors the Rust commands `detect_claude_cli`, `claude_cli_prompt`
     // and `claude_cli_login`.
 
+    // GET/POST /api/ai-api-key — mirrors ai_api_key_hint / ai_api_key_set.
+    // The Rust backend keeps the key in the OS keychain; dev:web keeps it in
+    // this process's memory only, and likewise never returns it — just a hint.
+    if (url.pathname === "/api/ai-api-key") {
+      if (req.method === "GET") return jsonResponse(req, res, { info: devAiKeyInfo() });
+      if (req.method === "POST") {
+        const { key, endpoint } = await readBody(req);
+        const trimmed = String(key ?? "").trim();
+        if (!trimmed) {
+          devAiApiKey = "";
+          devAiApiKeyOrigin = null;
+          return jsonResponse(req, res, { info: null });
+        }
+        // Bound to the endpoint's origin, like `ai_api_key_set`.
+        if (!String(endpoint ?? "").trim()) {
+          return jsonResponse(req, res, { error: "An AI endpoint is required to store the API key" }, 400);
+        }
+        let origin;
+        try { origin = parseAiEndpoint(String(endpoint).trim()).origin; }
+        catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+        devAiApiKey = trimmed;
+        devAiApiKeyOrigin = origin;
+        return jsonResponse(req, res, { info: devAiKeyInfo() });
+      }
+    }
+
+    // GET /api/image-proxy?u=<url> — mirrors the `gwimg:` scheme
+    // (commands/image_proxy.rs): http(s) only, no credentials, 5 MiB and 20 s
+    // at most, served only when the answer is an image.
+    if (url.pathname === "/api/image-proxy" && req.method === "GET") {
+      // Images of the dev page only: another site the developer has open
+      // could otherwise make this server fetch internal URLs. Browsers send
+      // Sec-Fetch-Site; a request without it (tests, curl) is not a page.
+      // A page that names itself (Origin, Referer) must be the dev page's;
+      // another localhost port is same-site, so that header alone does not
+      // tell. An image without a referrer (no-referrer, as Avatar asks) from
+      // another local site still passes: dev-only.
+      const fromPage = req.headers.origin || (() => {
+        try { return req.headers.referer ? new URL(req.headers.referer).origin : null; } catch { return null; }
+      })();
+      if (req.headers["sec-fetch-site"] === "cross-site" || (fromPage && !ALLOWED_ORIGINS.has(fromPage))) {
+        res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+        return res.end("image request from another page refused");
+      }
+      const target = url.searchParams.get("u") ?? "";
+      let u;
+      try {
+        if (/[\s\x00-\x1f\x7f]/.test(target)) throw new Error("control characters");
+        u = new URL(target);
+        if ((u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) throw new Error("not http(s)");
+        if (u.username || u.password) throw new Error("credentials");
+      } catch (e) {
+        res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8", "Content-Security-Policy": DEV_IMAGE_CSP });
+        return res.end(`bad image URL: ${e.message}`);
+      }
+      try {
+        // Redirects followed by hand: 3 at most, http(s) only, as curl's
+        // --max-redirs 3 --proto-redir =http,https in the app.
+        const signal = AbortSignal.timeout(20_000);
+        let upstream;
+        let next = u;
+        for (let hop = 0; ; hop++) {
+          upstream = await fetch(next.href, { headers: { Accept: "image/*" }, redirect: "manual", signal });
+          const location = upstream.status >= 300 && upstream.status < 400 ? upstream.headers.get("location") : null;
+          if (!location) break;
+          await upstream.body?.cancel().catch(() => {}); // the hop's body is not read
+          if (hop >= 3) throw new Error("too many redirects");
+          next = new URL(location, next);
+          if (next.protocol !== "http:" && next.protocol !== "https:") throw new Error("redirect to a non-http(s) URL");
+          if (next.username || next.password) throw new Error("redirect with credentials");
+        }
+        const type = (upstream.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+        if (!upstream.ok || !/^image\/[a-z0-9.+-]+$/.test(type)) throw new Error(`answered ${upstream.status} ${type}`);
+        // Read as it comes and stop past 5 MiB: a chunked answer announces
+        // no size. Mirrors run_curl_capped.
+        const LIMIT = 5 * 1024 * 1024;
+        const parts = [];
+        let size = 0;
+        for await (const chunk of upstream.body ?? []) {
+          size += chunk.length;
+          if (size > LIMIT) {
+            await upstream.body.cancel().catch(() => {});
+            throw new Error("image larger than 5 MiB");
+          }
+          parts.push(chunk);
+        }
+        const body = Buffer.concat(parts);
+        if (body.length === 0) throw new Error("empty image");
+        res.writeHead(200, {
+          // CORS of the dev server's allowed origins only; its JSON
+          // Content-Type is replaced by the image's.
+          ...corsHeaders(req),
+          "Content-Type": type,
+          "Cache-Control": "max-age=3600",
+          "X-Content-Type-Options": "nosniff",
+          // As gwimg: an SVG opened as a page runs nothing on this origin.
+          "Content-Security-Policy": DEV_IMAGE_CSP,
+        });
+        return res.end(body);
+      } catch (e) {
+        res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8", "Content-Security-Policy": DEV_IMAGE_CSP });
+        return res.end(`image request failed: ${e.message}`);
+      }
+    }
+
+    // GET /api/ai-allowed-endpoints -> { origins } — mirrors ai_allowed_endpoints.
+    if (url.pathname === "/api/ai-allowed-endpoints" && req.method === "GET") {
+      return jsonResponse(req, res, { origins: [...devAllowedAiOrigins].sort() });
+    }
+
+    // POST /api/ai-revoke-endpoint { origin } — mirrors ai_revoke_endpoint:
+    // any endpoint of the origin revokes it, an unknown one is not an error.
+    if (url.pathname === "/api/ai-revoke-endpoint" && req.method === "POST") {
+      const { origin } = await readBody(req);
+      let parsed;
+      try { parsed = parseAiEndpoint(String(origin ?? "").trim()); }
+      catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+      devAllowedAiOrigins.delete(parsed.origin);
+      return jsonResponse(req, res, { ok: true });
+    }
+
+    // POST /api/ai-http-request { method, url, body?, auth, timeoutSecs? }
+    // Mirrors commands::ai_http::ai_http_request: validation, key binding and
+    // error text included. Answers { status, body } whatever the upstream status.
+    // The open-endpoint gate (`check_open_endpoint_with`) passes loopback and
+    // the known providers, as in the app. The app asks about any other
+    // origin; the dev server has no dialog to show, so it refuses it unless
+    // GITWAND_DEV_AI_ORIGINS lists it (comma-separated origins).
+    if (url.pathname === "/api/ai-http-request" && req.method === "POST") {
+      const { method, url: target, body, auth, timeoutSecs } = await readBody(req);
+      let parsed;
+      try { parsed = parseAiEndpoint(target); }
+      catch (e) { return jsonResponse(req, res, { error: e.message }, 400); }
+      if (method !== "GET" && method !== "POST") {
+        return jsonResponse(req, res, { error: `Unsupported method: ${method}` }, 400);
+      }
+      if (!devAiOriginAllowed(parsed)) {
+        return jsonResponse(req, res, {
+          error: `dev:web refuses AI requests to ${parsed.origin}: the app would ask first, and this server cannot. Allow it with GITWAND_DEV_AI_ORIGINS=${parsed.origin}`,
+        }, 403);
+      }
+      const headers = { Accept: "application/json" };
+      if (auth === "anthropic" || auth === "bearer") {
+        if (!devAiApiKey) return jsonResponse(req, res, { error: "No AI API key configured" }, 400);
+        // The key goes to the origin it is bound to, nowhere else.
+        if (devAiApiKeyOrigin !== parsed.origin) {
+          return jsonResponse(req, res, {
+            error: `The stored AI API key is tied to ${devAiApiKeyOrigin}; enter it again in Settings to use it with ${parsed.origin}`,
+          }, 400);
+        }
+        if (auth === "anthropic") {
+          headers["x-api-key"] = devAiApiKey;
+          headers["anthropic-version"] = "2023-06-01";
+        } else {
+          headers.Authorization = `Bearer ${devAiApiKey}`;
+        }
+      } else if (auth !== "none") {
+        return jsonResponse(req, res, { error: `Unknown AI auth scheme: ${auth}` }, 400);
+      }
+      if (body !== undefined && body !== null) headers["Content-Type"] = "application/json";
+      // No timeout given = a completion: generous ceiling, as COMPLETION_TIMEOUT_SECS.
+      const COMPLETION_TIMEOUT_SECS = 30 * 60;
+      const secs = Math.min(COMPLETION_TIMEOUT_SECS, Math.max(1, Number(timeoutSecs) || COMPLETION_TIMEOUT_SECS));
+      try {
+        const upstream = await fetch(parsed.href, {
+          method,
+          headers,
+          body: body ?? undefined,
+          redirect: "manual",
+          signal: AbortSignal.timeout(secs * 1000),
+        });
+        return jsonResponse(req, res, { status: upstream.status, body: await upstream.text() });
+      } catch (e) {
+        return jsonResponse(req, res, { error: `AI request failed: ${e.message}` }, 502);
+      }
+    }
+
+    // GET/POST /api/telemetry-state — mirrors telemetry_get_state /
+    // telemetry_set_enabled. dev:web never sends telemetry; the toggle is
+    // kept in memory so the Settings UI can be exercised.
+    if (url.pathname === "/api/telemetry-state") {
+      if (req.method === "POST") {
+        const { enabled } = await readBody(req);
+        devTelemetryEnabled = enabled !== false;
+        return jsonResponse(req, res, { ok: true });
+      }
+      const forced = ["DO_NOT_TRACK", "GITWAND_NO_TELEMETRY"].some((k) =>
+        ["1", "true", "yes"].includes(String(process.env[k] ?? "").trim().toLowerCase()));
+      return jsonResponse(req, res, { enabled: devTelemetryEnabled, forced_off_by_env: forced });
+    }
+
+    // GET/POST /api/software-rendering — mirrors software_rendering_get_state /
+    // software_rendering_set_enabled. dev:web has no webview to switch; the
+    // toggle is kept in memory so the Settings UI can be exercised.
+    if (url.pathname === "/api/software-rendering") {
+      if (req.method === "POST") {
+        const { enabled } = await readBody(req);
+        devSoftwareRendering = enabled === true;
+        return jsonResponse(req, res, { ok: true });
+      }
+      return jsonResponse(req, res, {
+        supported: process.platform === "linux",
+        enabled: devSoftwareRendering,
+        auto_enabled: false,
+      });
+    }
+
     // GET /api/claude-cli-detect
     if (url.pathname === "/api/claude-cli-detect" && req.method === "GET") {
       try {
@@ -5166,7 +8571,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/claude-cli-prompt  { prompt, systemPrompt?, cwd?, outputFormat?, model? }
+    // POST /api/claude-cli-prompt  { prompt, systemPrompt?, outputFormat?, model?, effort? } — runs in a fresh private dir
     if (url.pathname === "/api/claude-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5176,15 +8581,22 @@ async function handleRequest(req, res) {
           : (body.prompt || "");
         const fmt = body.outputFormat || "text";
         // v2.17 — explicit per-provider model selection.
-        const claudeArgs = ["-p", fullPrompt, "--output-format", fmt];
+        // Prompt on stdin, never argv; tools that act or reach the network
+        // denied. Mirrors claude_cli_prompt_inner.
+        const claudeArgs = ["-p", "--output-format", fmt];
         if (body.model && String(body.model).trim()) {
           claudeArgs.push("--model", String(body.model).trim());
         }
-        const r = spawnSync(CLAUDE, claudeArgs, {
-          cwd: body.cwd || undefined,
+        const claudeEffort = validEffort(body.effort);
+        if (claudeEffort) claudeArgs.push("--effort", claudeEffort);
+        const claudeCapsNow = await claudeCaps(CLAUDE);
+        claudeArgs.push(...claudeLockdownArgs(claudeCapsNow));
+        // Fresh per-run directory, never the repository (spawnAiSync).
+        const r = spawnAiSync(CLAUDE, claudeArgs, {
+          input: fullPrompt.replace(/\0/g, ""),
           encoding: "utf-8",
           maxBuffer: 20 * 1024 * 1024,
-          env: claudeSpawnEnv,
+          env: aiSpawnEnv("claude"),
         });
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() || "Claude CLI a échoué sans message";
@@ -5263,7 +8675,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/codex-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // POST /api/codex-cli-prompt  { prompt, systemPrompt?, model?, effort? } — runs in a fresh private dir
     if (url.pathname === "/api/codex-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5272,16 +8684,29 @@ async function handleRequest(req, res) {
           ? `# System\n${body.systemPrompt.trim()}\n\n# User\n${(body.prompt || "").trim()}`
           : (body.prompt || "");
         // v2.17 — model flag precedes the positional prompt on `codex exec`.
-        const codexArgs = ["exec"];
+        // Read-only sandbox, prompt on stdin (`-`). Mirrors codex_cli_prompt_inner.
+        // --ignore-user-config: no MCP server or plugin from the user's
+        // config. Mirrors codex_cli_prompt_inner.
+        // Mirrors the Rust check: a Codex without --ignore-user-config is
+        // refused rather than run with the user's MCP servers.
+        const cxRefusal = devLockdownError(CODEX, ["exec", "--help"], ["--ignore-user-config"],
+          "This Codex CLI cannot run without your config.toml: update it (`npm i -g @openai/codex` or your package manager)", "codex");
+        if (cxRefusal) return jsonResponse(req, res, { error: cxRefusal }, 500);
+        const codexArgs = ["exec", "--sandbox", "read-only", "--ignore-user-config"];
         if (body.model && String(body.model).trim()) {
           codexArgs.push("--model", String(body.model).trim());
         }
-        codexArgs.push(fullPrompt);
-        const r = spawnSync(CODEX, codexArgs, {
-          cwd: body.cwd || undefined,
+        const codexEffort = validEffort(body.effort);
+        if (codexEffort) codexArgs.push("-c", `model_reasoning_effort=${codexEffort}`);
+        codexArgs.push("-");
+        // Fresh per-run git repository, never the repository (trusted
+        // projects' .codex/config.toml runs MCP servers). Mirrors codex_cli_prompt_inner.
+        const r = spawnAiSync(CODEX, codexArgs, {
+          input: fullPrompt.replace(/\0/g, ""),
+          env: aiSpawnEnv("codex"),
           encoding: "utf-8",
           maxBuffer: 20 * 1024 * 1024,
-        });
+        }, { gitRepo: true });
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() || "Codex CLI a échoué sans message";
           return jsonResponse(req, res, { error: detail }, 500);
@@ -5289,6 +8714,33 @@ async function handleRequest(req, res) {
         return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // GET /api/codex-models  → { models: { id, name, efforts }[] }
+    // `codex debug models` dumps the JSON catalog (refreshed, or bundled when
+    // offline) — same filtering and ordering as the Rust `parse_codex_models`.
+    if (url.pathname === "/api/codex-models" && req.method === "GET") {
+      try {
+        const CODEX = resolveBin("codex");
+        const r = spawnSync(CODEX, ["debug", "models"], { encoding: "utf-8", maxBuffer: 32 * 1024 * 1024, timeout: 15000 });
+        if (r.status !== 0) {
+          return jsonResponse(req, res, { models: [] });
+        }
+        const entries = JSON.parse(r.stdout || "{}").models ?? [];
+        const models = entries
+          .filter((m) => (m.visibility ?? "list") === "list" && typeof m.slug === "string" && m.slug.trim())
+          .sort((a, b) => (a.priority ?? Infinity) - (b.priority ?? Infinity))
+          .map((m) => ({
+            id: m.slug.trim(),
+            name: (m.display_name || "").trim() || m.slug.trim(),
+            efforts: (m.supported_reasoning_levels ?? [])
+              .map((l) => l?.effort)
+              .filter((e) => EFFORT_LEVELS.includes(e)),
+          }));
+        return jsonResponse(req, res, { models });
+      } catch {
+        return jsonResponse(req, res, { models: [] });
       }
     }
 
@@ -5340,7 +8792,7 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/opencode-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // POST /api/opencode-cli-prompt  { prompt, systemPrompt?, model? } — runs in a fresh private dir
     if (url.pathname === "/api/opencode-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
@@ -5352,17 +8804,39 @@ async function handleRequest(req, res) {
         if (body.model && String(body.model).trim()) {
           ocArgs.push("--model", String(body.model).trim());
         }
-        ocArgs.push(fullPrompt);
-        const r = spawnSync(OPENCODE, ocArgs, {
-          cwd: body.cwd || undefined,
+        const prompt = fullPrompt.replace(/\0/g, "");
+        // Runs via spawnAiSync in a fresh per-run directory, never the
+        // repository (opencode.json MCP servers, .opencode plugins).
+        // Mirrors opencode_cli_prompt_inner / opencode_run_cmd.
+        const ocOpts = {
+          env: {
+            ...aiSpawnEnv("opencode"),
+            OPENCODE_PERMISSION: '{"edit":"deny","bash":"deny","webfetch":"deny"}',
+            OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+            OPENCODE_CONFIG_CONTENT: devOpencodeConfigContent(OPENCODE),
+          },
           encoding: "utf-8",
           maxBuffer: 20 * 1024 * 1024,
-        });
-        if (r.status !== 0) {
-          const detail = (r.stderr || r.stdout || "").trim() || "opencode CLI a échoué sans message";
-          return jsonResponse(req, res, { error: detail }, 500);
+        };
+        // Prompt on stdin, off argv, no argv fallback. Mirrors `opencode_result`:
+        // a refused or empty answer is an error.
+        const r = spawnAiSync(OPENCODE, ocArgs, { ...ocOpts, input: prompt });
+        const ocStdout = String(r.stdout || "");
+        const ocStderr = String(r.stderr || "").trim();
+        const STDIN_HINT = "opencode n'a pas lu le prompt sur stdin (version trop ancienne ?) — mettez opencode à jour";
+        // Same order as opencode_result (ai.rs).
+        if (r.status === 0 && ocStdout.trim()) {
+          return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(ocStdout);
         }
-        return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
+        let ocError;
+        if (`${ocStderr}${ocStdout}`.includes("You must provide a message")) ocError = STDIN_HINT;
+        else if (r.status !== 0) ocError = ocStderr || ocStdout.trim() || "opencode CLI a échoué sans message";
+        else if (stderrLooksLikeError(ocStderr)) ocError = ocStderr;
+        else {
+          const tail = ocStderr ? ocStderr.split("\n").slice(-5).join("\n") : "";
+          ocError = tail ? `${STDIN_HINT}\n${tail}` : STDIN_HINT;
+        }
+        return jsonResponse(req, res, { error: ocError }, 500);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -5433,28 +8907,38 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/copilot-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // POST /api/copilot-cli-prompt  { prompt, systemPrompt?, model?, effort? } — runs in a fresh private dir
     if (url.pathname === "/api/copilot-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
         const COPILOT = resolveBin("copilot");
+        const cpRefusal = devLockdownError(COPILOT, ["--help"], ["--available-tools", "--disable-builtin-mcps"],
+          "This Copilot CLI cannot restrict its tools: update it with `copilot update`", "copilot");
+        if (cpRefusal) return jsonResponse(req, res, { error: cpRefusal }, 500);
         const fullPrompt = body.systemPrompt && body.systemPrompt.trim()
           ? `# System\n${body.systemPrompt.trim()}\n\n# User\n${(body.prompt || "").trim()}`
           : (body.prompt || "");
-        const cpArgs = ["--no-color", "--deny-tool=shell", "--deny-tool=write", "--no-ask-user"];
+        // Mirrors copilot_prompt_args: only the file viewer, no built-in MCP,
+        // the prompt in the run directory's prompt.md, never on the argv.
+        const cpArgs = [
+          "--no-color", "-s", "--no-ask-user", "--no-custom-instructions", "--disable-builtin-mcps",
+          "--available-tools", "view", "--deny-tool=shell", "--deny-tool=write", "--deny-tool=url",
+        ];
         if (body.model && String(body.model).trim()) {
           cpArgs.push("--model", String(body.model).trim());
         }
-        cpArgs.push("-p", fullPrompt);
-        const cpEnv = { ...process.env };
+        const cpEffort = validEffort(body.effort);
+        if (cpEffort) cpArgs.push("--reasoning-effort", cpEffort);
+        cpArgs.push("-p", "Read the file prompt.md in the current directory and do exactly what it asks. Reply with your answer only.");
+        const cpEnv = aiSpawnEnv("copilot");
         delete cpEnv.COPILOT_ALLOW_ALL;
-        const r = spawnSync(COPILOT, cpArgs, {
-          cwd: body.cwd || undefined,
+        const r = spawnAiSync(COPILOT, cpArgs, { // fresh per-run dir — mirrors ai_prompt_cmd
           env: cpEnv,
           encoding: "utf-8",
+          input: "",
           timeout: 5 * 60 * 1000,
           maxBuffer: 20 * 1024 * 1024,
-        });
+        }, { files: { "prompt.md": fullPrompt } });
         if (r.status !== 0) {
           const detail = (r.stderr || r.stdout || "").trim() || "Copilot CLI a échoué sans message";
           return jsonResponse(req, res, { error: detail }, 500);
@@ -5462,6 +8946,32 @@ async function handleRequest(req, res) {
         return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // GET /api/copilot-models  → { models: string[] }
+    // Copilot has no `models` command; the list is the `model` setting's
+    // `- "<id>"` lines in `copilot help config` — same parse as the Rust side.
+    if (url.pathname === "/api/copilot-models" && req.method === "GET") {
+      try {
+        const COPILOT = resolveBin("copilot");
+        const r = spawnSync(COPILOT, ["help", "config"], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, timeout: 15000 });
+        if (r.status !== 0) {
+          return jsonResponse(req, res, { models: [] });
+        }
+        const lines = (r.stdout || "").split(/\r?\n/);
+        const start = lines.findIndex((l) => l.trimStart().startsWith("`model`:"));
+        const models = [];
+        if (start !== -1) {
+          for (const l of lines.slice(start + 1)) {
+            const m = l.trim().match(/^- "([^"]+)"$/);
+            if (!m) break;
+            models.push(m[1]);
+          }
+        }
+        return jsonResponse(req, res, { models });
+      } catch {
+        return jsonResponse(req, res, { models: [] });
       }
     }
 
@@ -5512,30 +9022,64 @@ async function handleRequest(req, res) {
       }
     }
 
-    // POST /api/antigravity-cli-prompt  { prompt, systemPrompt?, cwd?, model? }
+    // GET /api/antigravity-models  → { models: { id, name }[] }
+    if (url.pathname === "/api/antigravity-models" && req.method === "GET") {
+      try {
+        const AGY = resolveBin("agy");
+        const r = spawnSync(AGY, ["models"], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, timeout: 15000 });
+        if (r.status !== 0) {
+          return jsonResponse(req, res, { models: [] });
+        }
+        // `<id>\t<name>` per line; the "Fetching available models..." banner has no tab.
+        const models = (r.stdout || "")
+          .split(/\r?\n/)
+          .map((l) => l.split("\t"))
+          .filter((parts) => parts.length >= 2 && parts[0].trim())
+          .map(([id, name]) => ({ id: id.trim(), name: name.trim() || id.trim() }));
+        return jsonResponse(req, res, { models });
+      } catch {
+        return jsonResponse(req, res, { models: [] });
+      }
+    }
+
+    // POST /api/antigravity-cli-prompt  { prompt, systemPrompt?, model? } — runs in a fresh private dir
     if (url.pathname === "/api/antigravity-cli-prompt" && req.method === "POST") {
       try {
         const body = await readBody(req);
         const AGY = resolveBin("agy");
+        const agyRefusal = devLockdownError(AGY, ["--help"], ["--input-format", "--mode"],
+          "This Antigravity CLI cannot read a prompt from stdin nor run in plan mode: update it with `agy update`", "antigravity");
+        if (agyRefusal) return jsonResponse(req, res, { error: agyRefusal }, 500);
         const fullPrompt = body.systemPrompt && body.systemPrompt.trim()
           ? `# System\n${body.systemPrompt.trim()}\n\n# User\n${(body.prompt || "").trim()}`
           : (body.prompt || "");
-        const agyArgs = [];
+        // Mirrors antigravity_cli_prompt: plan mode (a headless run denies
+        // commands, edits and URL fetches there), the prompt as one
+        // stream-json turn on stdin, never on the argv.
+        const agyArgs = ["--mode", "plan", "--input-format", "stream-json", "--output-format", "stream-json"];
         if (body.model && String(body.model).trim()) {
           agyArgs.push("--model", String(body.model).trim());
         }
-        agyArgs.push("-p", fullPrompt);
-        const r = spawnSync(AGY, agyArgs, {
-          cwd: body.cwd || undefined,
+        agyArgs.push("-p=");
+        const r = spawnAiSync(AGY, agyArgs, { // fresh per-run dir — mirrors ai_prompt_cmd
+          env: aiSpawnEnv("antigravity"),
           encoding: "utf-8",
+          input: JSON.stringify({ event: "user", message: { content: fullPrompt } }) + "\n",
           timeout: 5 * 60 * 1000,
           maxBuffer: 20 * 1024 * 1024,
         });
-        if (r.status !== 0) {
-          const detail = (r.stderr || r.stdout || "").trim() || "Antigravity CLI a échoué sans message";
-          return jsonResponse(req, res, { error: detail }, 500);
+        let result = null;
+        for (const line of String(r.stdout || "").split("\n")) {
+          try {
+            const v = JSON.parse(line.trim());
+            if (v?.event === "result") result = v.result;
+          } catch { /* not JSON */ }
         }
-        return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(r.stdout);
+        if (r.status === 0 && result?.status === "SUCCESS") {
+          return res.writeHead(200, { ...corsHeaders(req), "Content-Type": "text/plain" }).end(result.response ?? "");
+        }
+        const detail = result?.error || (r.stderr || "").trim() || "Antigravity CLI a échoué sans message";
+        return jsonResponse(req, res, { error: detail }, 500);
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -5583,11 +9127,15 @@ async function handleRequest(req, res) {
       try {
         const { cwd, number, method } = await readBody(req);
         if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
         const mergeFlag = method === "squash" ? "--squash"
           : method === "rebase" ? "--rebase"
           : "--merge";
-        const r = spawnSync(GH, ["pr", "merge", String(number), mergeFlag, "--delete-branch"], {
+        const spawn = await ghMergeSpawn(resolve(cwd), prNumber, ["pr", "merge", String(prNumber), mergeFlag, "--delete-branch"]);
+        const r = spawnSync(GH, spawn.args, {
           cwd: resolve(cwd),
+          env: spawn.env,
           encoding: "utf-8",
         });
         if (r.status !== 0) {
@@ -5605,14 +9153,15 @@ async function handleRequest(req, res) {
       try {
         const { cwd, number, method } = await readBody(req);
         if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
         const mergeFlag = method === "squash" ? "--squash"
           : method === "rebase" ? "--rebase"
           : "--merge";
-        const r = spawnSync(
-          GH,
-          ["pr", "merge", String(number), "--auto", mergeFlag, "--delete-branch"],
-          { cwd: resolve(cwd), encoding: "utf-8" },
-        );
+        // Through ghMergeSpawn: an already-mergeable PR is merged at once and
+        // then gets the same --delete-branch local cleanup.
+        const spawn = await ghMergeSpawn(resolve(cwd), prNumber, ["pr", "merge", String(prNumber), "--auto", mergeFlag, "--delete-branch"]);
+        const r = spawnSync(GH, spawn.args, { cwd: resolve(cwd), env: spawn.env, encoding: "utf-8" });
         if (r.status !== 0) {
           const detail = spawnFailureDetail(r, "gh pr merge --auto failed");
           return jsonResponse(req, res, { error: detail }, 500);
@@ -5628,8 +9177,11 @@ async function handleRequest(req, res) {
       try {
         const { cwd, number } = await readBody(req);
         if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
-        const r = spawnSync(GH, ["pr", "merge", String(number), "--disable-auto"], {
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const r = spawnSync(GH, ["pr", "merge", String(prNumber), "--disable-auto"], {
           cwd: resolve(cwd),
+          env: await ghPrEnv(resolve(cwd), prNumber),
           encoding: "utf-8",
         });
         if (r.status !== 0) {
@@ -5691,6 +9243,120 @@ async function handleRequest(req, res) {
       }
     }
 
+    // GET /api/gh-pr-review-threads?cwd=&number=  → [{ thread_id, root_comment_id, resolved }]
+    if (url.pathname === "/api/gh-pr-review-threads" && req.method === "GET") {
+      const cwd = url.searchParams.get("cwd");
+      const number = url.searchParams.get("number");
+      if (!cwd || !number) return jsonResponse(req, res, { error: "Missing cwd or number" }, 400);
+      try {
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
+        if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
+        const [owner, name] = nwo.split("/");
+        const query = "query($owner: String!, $name: String!, $n: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $n) { reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { databaseId } } } } } } }";
+        const out = [];
+        let after = null;
+        for (let page = 0; page < 20; page++) {
+          const data = await githubGraphql(token, query, { owner, name, n: prNumber, after });
+          const threads = data?.repository?.pullRequest?.reviewThreads;
+          for (const t of threads?.nodes ?? []) {
+            const root = t.comments?.nodes?.[0]?.databaseId;
+            if (root == null) continue;
+            out.push({ thread_id: t.id, root_comment_id: root, resolved: !!t.isResolved });
+          }
+          if (!threads?.pageInfo?.hasNextPage) break;
+          after = threads.pageInfo.endCursor;
+        }
+        return jsonResponse(req, res, out);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // POST /api/gh-set-review-thread-resolved  { cwd, threadId, resolved }
+    if (url.pathname === "/api/gh-set-review-thread-resolved" && req.method === "POST") {
+      try {
+        const { threadId, resolved } = await readBody(req);
+        if (!threadId) return jsonResponse(req, res, { error: "Missing threadId" }, 400);
+        const token = getGithubToken();
+        if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
+        const mutation = resolved
+          ? "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id } } }"
+          : "mutation($id: ID!) { unresolveReviewThread(input: { threadId: $id }) { thread { id } } }";
+        await githubGraphql(token, mutation, { id: threadId });
+        return jsonResponse(req, res, { ok: true });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.message }, 500);
+      }
+    }
+
+    // POST /api/gh-branch-pr  { cwd, branch, state }  -> BranchPr | null
+    // Mirrors `gh_branch_pr` (commands/gh.rs) on its gh CLI path: the same
+    // argument checks, `gh pr list --head`, then only the PRs whose head repo
+    // belongs to origin's owner (`--head` has no owner), and `merged` never
+    // falls back to an unmerged PR. PRs are listed from the base repo (the
+    // fork parent when origin is a fork), as `gh_base_cmd` does; github.com
+    // origins only, like every dev-server gh route.
+    if (url.pathname === "/api/gh-branch-pr" && req.method === "POST") {
+      const { cwd, branch, state } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const resolvedCwd = resolve(cwd);
+      try {
+        if (typeof branch !== "string" || branch.startsWith("-")) throw new Error(`invalid branch name: ${branch}`);
+        if (state !== "open" && state !== "merged") throw new Error(`invalid PR state: ${state}`);
+        const nwo = getRepoNwo(resolvedCwd);
+        const baseNwo = devGhBaseNwo(resolvedCwd);
+        const r = spawnSync(GH, [
+          "pr", "list", "--state", state, "--head", branch,
+          "--json", "number,baseRefName,headRefOid,mergedAt,url,headRepositoryOwner,mergeCommit",
+          "--limit", "100",
+        ], { cwd: resolvedCwd, encoding: "utf-8", env: ghRepoEnv(baseNwo), timeout: 20_000 });
+        if (r.error) throw new Error(`Failed to run gh pr list (is GitHub CLI installed?): ${r.error.message}`);
+        if (r.status !== 0) throw new Error(`gh pr list failed: ${r.stderr || ""}`);
+        const owner = nwo ? nwo.split("/")[0] : "";
+        if (!owner) throw new Error("Could not resolve the owner of this repository's origin");
+        return jsonResponse(req, res, devParseGhBranchPr(r.stdout || "", state, owner));
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
+    // POST /api/gh-pr-set-base  { cwd, number, base }  -> null
+    // Mirrors `gh_pr_set_base` (commands/gh.rs) on its gh CLI path:
+    // `gh api -X PATCH repos/<nwo>/pulls/<n> -f base=<base>`, <nwo> being the
+    // base repo (`gh_base_nwo`: the fork parent when origin is a fork), else
+    // the repo gh itself picks.
+    if (url.pathname === "/api/gh-pr-set-base" && req.method === "POST") {
+      const { cwd, number, base } = await readBody(req);
+      if (!cwd) return jsonResponse(req, res, { error: "Missing cwd" }, 400);
+      const resolvedCwd = resolve(cwd);
+      try {
+        if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`invalid PR number: ${number}`);
+        if (typeof base !== "string" || base === "") throw new Error("base must not be empty");
+        if (base.startsWith("-")) throw new Error(`invalid branch name: ${base}`);
+        let nwo = devGhBaseNwo(resolvedCwd);
+        const env = nwo ? { ...process.env, GH_HOST: "github.com" } : process.env;
+        if (!nwo) {
+          const v = spawnSync(GH, ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], {
+            cwd: resolvedCwd, encoding: "utf-8", timeout: 20_000,
+          });
+          nwo = v.status === 0 ? (v.stdout || "").trim() : "";
+          if (!nwo) throw new Error("Could not resolve the GitHub owner/repo of this repository");
+        }
+        const r = spawnSync(GH, ["api", "-X", "PATCH", `repos/${nwo}/pulls/${number}`, "-f", `base=${base}`], {
+          cwd: resolvedCwd, encoding: "utf-8", env,
+        });
+        if (r.error) throw new Error(`gh api write: ${r.error.message}`);
+        if (r.status !== 0) throw new Error(devGhApiFailure("gh api PATCH", r.stderr || "", r.stdout || ""));
+        return jsonResponse(req, res, null);
+      } catch (e) {
+        return jsonResponse(req, res, { error: e.message }, 400);
+      }
+    }
+
     // POST /api/gh-dismiss-review  { cwd, number, reviewId, message } (B4, v3.6.0)
     if (url.pathname === "/api/gh-dismiss-review" && req.method === "POST") {
       try {
@@ -5698,9 +9364,12 @@ async function handleRequest(req, res) {
         if (!cwd || !number || !reviewId) return jsonResponse(req, res, { error: "Missing cwd, number, or reviewId" }, 400);
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${number}/reviews/${reviewId}/dismissals`, {
+        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${prNumber}/reviews/${reviewId}/dismissals`, {
           method: "PUT",
           headers: {
             Authorization: `Bearer ${token}`,
@@ -5727,9 +9396,12 @@ async function handleRequest(req, res) {
         if (!cwd || !number || !Array.isArray(logins)) return jsonResponse(req, res, { error: "Missing cwd, number, or logins" }, 400);
         const token = getGithubToken();
         if (!token) return jsonResponse(req, res, { error: "No GitHub token" }, 401);
-        const nwo = getRepoNwo(resolve(cwd));
+        // The repo PR `number` lives in (`get_pr_json`: the base repo).
+        const prNumber = devPrNumber(number);
+        if (prNumber === null) return jsonResponse(req, res, { error: "Missing or invalid PR number" }, 400);
+        const nwo = await resolvePrNwo(resolve(cwd), prNumber, token);
         if (!nwo) return jsonResponse(req, res, { error: "Could not determine GitHub repo" }, 400);
-        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${number}/requested_reviewers`, {
+        const resp = await fetch(`https://api.github.com/repos/${nwo}/pulls/${prNumber}/requested_reviewers`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${token}`,
@@ -5846,6 +9518,175 @@ async function handleRequest(req, res) {
           stderr: r.stderr ?? "",
           exitCode: r.status ?? -1,
         });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-hooks-trust  { cwd } — mirrors worktree_trust.rs
+    if (url.pathname === "/api/worktree-hooks-trust" && req.method === "POST") {
+      try {
+        const { cwd } = await readBody(req);
+        return jsonResponse(req, res, devTrustStatus(resolve(cwd)));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-hooks-trust-set  { cwd, hash } — 409 when the hooks changed
+    if (url.pathname === "/api/worktree-hooks-trust-set" && req.method === "POST") {
+      try {
+        const { cwd, hash } = await readBody(req);
+        devTrustSet(resolve(cwd), String(hash ?? ""));
+        return jsonResponse(req, res, {});
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, err.stale ? 409 : 500);
+      }
+    }
+
+    // POST /api/worktree-stop-processes  { cwd, path, killForeign } — best-effort
+    // mirror of worktree_stop_processes (see dev-worktree-processes.mjs)
+    if (url.pathname === "/api/worktree-stop-processes" && req.method === "POST") {
+      try {
+        const { cwd, path, killForeign } = await readBody(req);
+        const left = await devStopProcessesIn(resolve(cwd), resolve(String(path ?? "")), killForeign === true, devPtys);
+        return jsonResponse(req, res, left);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-resolve-base  { cwd } — mirrors worktree_resolve_base
+    if (url.pathname === "/api/worktree-resolve-base" && req.method === "POST") {
+      try {
+        const { cwd } = await readBody(req);
+        const main = mainWorktreeRoot(resolve(cwd));
+        return jsonResponse(req, res, {
+          base: devResolveBase(main),
+          dir: devWorktreesDir(main, devReadSettings(main)),
+        });
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-create  { cwd, name, base?, branch?, path?, kind } — mirrors worktree_create
+    if (url.pathname === "/api/worktree-create" && req.method === "POST") {
+      try {
+        const { cwd, name, base, branch, path, kind } = await readBody(req);
+        return jsonResponse(req, res, devCreateWorktree(resolve(cwd), { name, base, branch, path, kind }));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-url  { cwd, path, hash } — mirrors worktree_url
+    if (url.pathname === "/api/worktree-url" && req.method === "POST") {
+      try {
+        const { cwd, path, hash } = await readBody(req);
+        const value = devWorktreeUrl(resolve(cwd), resolve(String(path ?? "")), String(hash ?? ""), { baseEnv: claudeSpawnEnv });
+        return jsonResponse(req, res, value);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-guard  { cwd, path } — mirrors worktree_guard
+    if (url.pathname === "/api/worktree-guard" && req.method === "POST") {
+      try {
+        const { cwd, path } = await readBody(req);
+        return jsonResponse(req, res, devWorktreeGuard(resolve(cwd), resolve(String(path ?? ""))));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-remove-prepare  { cwd, path, killForeign } — mirrors worktree_remove_prepare
+    if (url.pathname === "/api/worktree-remove-prepare" && req.method === "POST") {
+      try {
+        const { cwd, path, killForeign } = await readBody(req);
+        const repo = resolve(cwd);
+        const value = await devRemovePrepare(repo, resolve(String(path ?? "")), {
+          createSnapshot,
+          stop: (wt) => devStopProcessesIn(repo, wt, killForeign === true, devPtys),
+        });
+        return jsonResponse(req, res, value);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-remove  { cwd, path, opts } — mirrors worktree_remove
+    if (url.pathname === "/api/worktree-remove" && req.method === "POST") {
+      try {
+        const { cwd, path, opts } = await readBody(req);
+        return jsonResponse(req, res, devRemoveWorktree(resolve(cwd), resolve(String(path ?? "")), opts ?? {}));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-merge-back-check  { cwd, path, target? } — mirrors worktree_merge_back_check
+    if (url.pathname === "/api/worktree-merge-back-check" && req.method === "POST") {
+      try {
+        const { cwd, path, target } = await readBody(req);
+        return jsonResponse(req, res, devMergeBackCheck(resolve(cwd), resolve(String(path ?? "")), target ?? null));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-merge-back-prepare  { cwd, path, target } — mirrors worktree_merge_back_prepare
+    if (url.pathname === "/api/worktree-merge-back-prepare" && req.method === "POST") {
+      try {
+        const { cwd, path, target } = await readBody(req);
+        const repo = resolve(cwd);
+        const value = await devMergeBackPrepare(repo, resolve(String(path ?? "")), String(target ?? ""), {
+          createSnapshot,
+          stop: (wt) => devStopProcessesIn(repo, wt, false, devPtys),
+        });
+        return jsonResponse(req, res, value);
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-merge-back-squash  { cwd, path, target } — mirrors worktree_merge_back_squash
+    if (url.pathname === "/api/worktree-merge-back-squash" && req.method === "POST") {
+      try {
+        const { cwd, path, target } = await readBody(req);
+        return jsonResponse(req, res, devMergeBackSquash(resolve(cwd), resolve(String(path ?? "")), String(target ?? "")));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-merge-back-fast-forward  { cwd, path, target } — mirrors worktree_merge_back_fast_forward
+    if (url.pathname === "/api/worktree-merge-back-fast-forward" && req.method === "POST") {
+      try {
+        const { cwd, path, target } = await readBody(req);
+        return jsonResponse(req, res, devMergeBackFastForward(resolve(cwd), resolve(String(path ?? "")), String(target ?? "")));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/snapshot-restore-as-worktree  { cwd, id, name? } — mirrors snapshot_restore_as_worktree
+    if (url.pathname === "/api/snapshot-restore-as-worktree" && req.method === "POST") {
+      try {
+        const { cwd, id, name } = await readBody(req);
+        return jsonResponse(req, res, devRestoreAsWorktree(resolve(cwd), String(id ?? ""), name ?? null, { listSnapshots, applySnapshotState }));
+      } catch (err) {
+        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+      }
+    }
+
+    // POST /api/worktree-unlock  { cwd, path } — mirrors worktree_unlock
+    if (url.pathname === "/api/worktree-unlock" && req.method === "POST") {
+      try {
+        const { cwd, path } = await readBody(req);
+        devUnlockWorktree(resolve(cwd), resolve(String(path ?? "")));
+        return jsonResponse(req, res, {});
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
       }
@@ -6208,10 +10049,20 @@ async function handleRequest(req, res) {
             // CI flips, review requests and new comments. Mirror of the Rust
             // change in `commands/workspace.rs`. This runs on the background
             // Launchpad poller (~60 s), so the extra cost is acceptable.
-            const raw = execSync(
-              "gh pr list --state open --json number,title,state,author,headRefName,baseRefName,isDraft,createdAt,updatedAt,url,labels,assignees,reviewRequests,reviewDecision,mergeStateStatus,statusCheckRollup,comments --limit 10",
-              { cwd: repo.path, encoding: "utf-8" }
+            // The base repo (`gh_base_cmd`, like `workspace_list_prs_all`):
+            // the numbers the nudge then comments on resolve there (#262).
+            const r = spawnSync(
+              GH,
+              [
+                "pr", "list", "--state", "open",
+                "--json", "number,title,state,author,headRefName,baseRefName,isDraft,createdAt,updatedAt,url,labels,assignees,reviewRequests,reviewDecision,mergeStateStatus,statusCheckRollup,comments",
+                "--limit", "10",
+              ],
+              { cwd: repo.path, encoding: "utf-8", env: ghRepoEnv(devGhBaseNwo(repo.path)) },
             );
+            if (r.error) throw r.error;
+            if (r.status !== 0) throw new Error((r.stderr || "gh pr list failed").trim());
+            const raw = r.stdout;
             const ghPrs = JSON.parse(raw || "[]");
             const prs = ghPrs.map(pr => ({
               number: pr.number,
@@ -6439,13 +10290,14 @@ async function handleRequest(req, res) {
           mkdirSync(parentDir, { recursive: true });
         }
 
-        let cmd = `git worktree add "${wtPath}"`;
-        if (new_branch) cmd += ` -b "${new_branch}" "${branch}"`;
-        else cmd += ` "${branch}"`;
-        execSync(cmd, { cwd: resolvedCwd, encoding: "utf-8", shell: true });
+        // Argument array, like the Rust command: no shell, no interpolation.
+        const args = ["worktree", "add", wtPath];
+        if (new_branch) args.push("-b", new_branch, branch);
+        else args.push(branch);
+        execFileSync("git", args, { cwd: resolvedCwd, encoding: "utf-8" });
         const resolvedBranch = new_branch || branch;
         let head = "";
-        try { head = execSync("git rev-parse HEAD", { cwd: wtPath, encoding: "utf-8" }).trim(); } catch {}
+        try { head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: wtPath, encoding: "utf-8" }).trim(); } catch {}
         return jsonResponse(req, res, { path: wtPath, branch: resolvedBranch, head, is_main: false, is_locked: false, lock_reason: null, is_bare: false, is_prunable: false, prunable_reason: null });
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
@@ -6457,8 +10309,17 @@ async function handleRequest(req, res) {
       try {
         const { cwd, path: wtPath, force } = await readBody(req);
         const resolvedCwd = resolve(cwd);
-        const forceFlag = force ? "--force " : "";
-        execSync(`git worktree remove ${forceFlag}"${wtPath}"`, { cwd: resolvedCwd, encoding: "utf-8", shell: true });
+        // Mirrors git_worktree_remove_impl: an untouchable worktree is refused.
+        try {
+          const report = devWorktreeGuard(resolvedCwd, resolve(String(wtPath)));
+          if (report.untouchable) {
+            return jsonResponse(req, res, { error: `untouchable: ${wtPath} (${report.reasons.join(", ")}) — GitWand will not remove or modify it.` }, 500);
+          }
+        } catch { /* not a linked worktree: git answers below */ }
+        const args = ["worktree", "remove"];
+        if (force) args.push("--force");
+        args.push(wtPath);
+        execFileSync("git", args, { cwd: resolvedCwd, encoding: "utf-8" });
         return jsonResponse(req, res, {});
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
@@ -6480,8 +10341,7 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/git-worktree-repair" && req.method === "POST") {
       try {
         const { cwd, paths = [] } = await readBody(req);
-        const extraPaths = paths.map(p => `"${p}"`).join(" ");
-        execSync(`git worktree repair ${extraPaths}`.trim(), { cwd: resolve(cwd), encoding: "utf-8", shell: true });
+        execFileSync("git", ["worktree", "repair", ...paths.map(String)], { cwd: resolve(cwd), encoding: "utf-8" });
         return jsonResponse(req, res, {});
       } catch (err) {
         return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
@@ -6922,13 +10782,26 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/git-reset-to-commit" && req.method === "POST") {
       const { cwd, sha, mode, snapshotsEnabled } = await readBody(req);
       if (!cwd || !sha) return jsonResponse(req, res, { error: "Missing cwd or sha" }, 400);
-      const flag = mode === "soft" ? "--soft" : mode === "hard" ? "--hard" : "--mixed";
+      const RESET_FLAGS = { soft: "--soft", mixed: "--mixed", hard: "--hard", keep: "--keep" };
+      const flag = RESET_FLAGS[mode];
+      if (!flag) return jsonResponse(req, res, { error: `Unknown reset mode: ${mode}` }, 400);
       try {
         const snapshot = snapshotBefore(resolve(cwd), snapshotsEnabled, "reset", `Reset ${mode} to ${sha}`);
-        execFileSync(GIT, ["reset", flag, sha], { cwd: resolve(cwd) });
+        execFileSync(GIT, ["reset", flag, sha], {
+          cwd: resolve(cwd),
+          stdio: ["ignore", "pipe", "pipe"],
+          // resetKeepBlockedFiles matches git's English wording; pin the
+          // locale for --keep only, other modes keep translated messages.
+          env: flag === "--keep" ? { ...process.env, LC_ALL: "C", LANGUAGE: "" } : process.env,
+        });
         return jsonResponse(req, res, { ok: true, snapshot });
       } catch (err) {
-        return jsonResponse(req, res, { error: err.stderr?.toString() || err.message }, 500);
+        const stderr = err.stderr?.toString() || "";
+        if (flag === "--keep") {
+          const files = resetKeepBlockedFiles(stderr);
+          if (files) return jsonResponse(req, res, { error: `reset-keep-blocked:${files.join("\n")}` }, 500);
+        }
+        return jsonResponse(req, res, { error: stderr || err.message }, 500);
       }
     }
 
@@ -7359,7 +11232,7 @@ async function handleRequest(req, res) {
         const raw = execFileSync(
           GH,
           ["pr", "view", prNumber, "--json", "files", "--jq", "[.files[].path]"],
-          { cwd: repoPath, encoding: "utf-8" }
+          { cwd: repoPath, env: await ghPrEnv(repoPath, prNumber), encoding: "utf-8" }
         );
         return jsonResponse(req, res, JSON.parse(raw.trim() || "[]"));
       } catch (err) {
@@ -7613,11 +11486,61 @@ async function handleRequest(req, res) {
       proc.onData((chunk) => {
         if (!res.writableEnded) res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
       });
-      proc.onExit(() => {
-        if (!res.writableEnded) res.write(`data: ${JSON.stringify({ eof: true })}\n\n`);
+      proc.onExit(({ exitCode }) => {
+        if (!res.writableEnded) res.write(`data: ${JSON.stringify({ eof: true, code: exitCode ?? null })}\n\n`);
         devPtys.delete(id);
       });
-      devPtys.set(id, { proc });
+      let ptyCwd = null;
+      try { ptyCwd = realpathSync.native(cwd); } catch (_) {}
+      devPtys.set(id, { proc, cwd: ptyCwd });
+      req.on("close", () => { try { proc.kill(); } catch (_) {} devPtys.delete(id); });
+      return;
+    }
+    // GET /api/worktree-run-hook?cwd&path&hook&hash&cols&rows — mirrors
+    // worktree_run_hook, same SSE protocol as /api/terminal-open.
+    if (url.pathname === "/api/worktree-run-hook" && req.method === "GET") {
+      if (rejectCrossOrigin(req, res)) return;
+      const cols = Math.max(1, parseInt(url.searchParams.get("cols") || "80", 10));
+      const rows = Math.max(1, parseInt(url.searchParams.get("rows") || "24", 10));
+      const sseOrigin = req.headers.origin;
+      const sseAllowOrigin = sseOrigin && ALLOWED_ORIGINS.has(sseOrigin) ? sseOrigin : "";
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...(sseAllowOrigin ? { "Access-Control-Allow-Origin": sseAllowOrigin, Vary: "Origin" } : {}),
+      });
+      let spec;
+      try {
+        spec = devSetupSpawn(
+          resolve(url.searchParams.get("cwd") || ""),
+          resolve(url.searchParams.get("path") || ""),
+          url.searchParams.get("hook") || "",
+          url.searchParams.get("hash") || "",
+        );
+      } catch (err) {
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        res.end();
+        return;
+      }
+      const id = devPtyNextId++;
+      let proc;
+      try {
+        proc = nodePty.spawn(spec.program, spec.args, { name: "xterm-256color", cols, rows, cwd: spec.cwd, env: { ...claudeSpawnEnv, ...spec.env } });
+      } catch (spawnErr) {
+        res.write(`data: ${JSON.stringify({ error: String(spawnErr) })}\n\n`);
+        res.end();
+        return;
+      }
+      res.write(`data: ${JSON.stringify({ id })}\n\n`);
+      proc.onData((chunk) => {
+        if (!res.writableEnded) res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
+      });
+      proc.onExit(({ exitCode }) => {
+        if (!res.writableEnded) res.write(`data: ${JSON.stringify({ eof: true, code: exitCode ?? null })}\n\n`);
+        devPtys.delete(id);
+      });
+      devPtys.set(id, { proc, cwd: spec.cwd });
       req.on("close", () => { try { proc.kill(); } catch (_) {} devPtys.delete(id); });
       return;
     }
@@ -7753,13 +11676,38 @@ async function handleRequest(req, res) {
         branchName = `gitwand-scratch-${slug}-${Math.floor(ts / 1000)}`;
       }
       const scratchPath = join(resolve(resolvedCwd, ".."), branchName);
-      const ref = sourceBranch ?? "HEAD";
+      // Same rule as Rust: a blank source means HEAD, i.e. an AI task.
+      const fromHead = !sourceBranch?.trim();
+      const ref = fromHead ? "HEAD" : sourceBranch;
       try {
         execFileSync("git", ["worktree", "add", "-b", branchName, scratchPath, ref], { cwd: resolvedCwd, encoding: "utf-8" });
+        // Mirror Rust: an AI task (no explicit source) records the commit it
+        // starts from, for merge-back's base guard; `branch -D` drops it.
+        if (fromHead) {
+          try {
+            const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: resolvedCwd, encoding: "utf-8" }).trim();
+            let source = base;
+            try {
+              source = execFileSync("git", ["symbolic-ref", "--short", "-q", "HEAD"], { cwd: resolvedCwd, encoding: "utf-8" }).trim() || base;
+            } catch {}
+            execFileSync("git", ["config", `branch.${branchName}.gitwandBase`, base], { cwd: resolvedCwd });
+            execFileSync("git", ["config", `branch.${branchName}.gitwandSource`, source], { cwd: resolvedCwd });
+          } catch (e) {
+            // As Rust does: no half-created task left behind.
+            try { execFileSync("git", ["worktree", "remove", "--force", scratchPath], { cwd: resolvedCwd }); } catch {}
+            try { execFileSync("git", ["branch", "-D", branchName], { cwd: resolvedCwd }); } catch {}
+            throw e;
+          }
+        } else {
+          // A stale record a same-named branch may have left.
+          for (const key of ["gitwandBase", "gitwandSource"]) {
+            try { execFileSync("git", ["config", "--unset", `branch.${branchName}.${key}`], { cwd: resolvedCwd }); } catch {}
+          }
+        }
         return jsonResponse(req, res, {
           path: scratchPath,
           branch: branchName,
-          source_branch: sourceBranch ?? "HEAD",
+          source_branch: ref,
           created_at: Math.floor(ts / 1000),
         });
       } catch (e) {
@@ -7941,6 +11889,15 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`    GET  /api/gh-pr-count?cwd=<path>&state=<state>`);
   console.log(`    GET  /api/gh-pr-freshness?cwd=<path>`);
   console.log(`    POST /api/gh-create-pr  { cwd, title, body, base?, draft?, reviewers? }`);
+  console.log(`    GET  /api/gh-issue-available?cwd=<path>`);
+  console.log(`    GET  /api/gh-issue-targets?cwd=<path>`);
+  console.log(`    POST /api/gh-create-issue  { cwd, input }`);
+  console.log(`    GET  /api/gh-gitwand-writable`);
+  console.log(`    POST /api/gh-create-gitwand-issue  { input }`);
+  console.log(`    GET  /api/gh-list-labels?cwd=<path>&repo=<owner/repo>`);
+  console.log(`    GET  /api/gh-issue-templates?cwd=<path>&repo=<owner/repo>`);
+  console.log(`    GET  /api/gh-list-milestones?cwd=<path>&repo=<owner/repo>`);
+  console.log(`    GET  /api/gh-list-assignees?cwd=<path>&repo=<owner/repo>`);
   console.log(`    GET  /api/gh-reviewer-candidates?cwd=<path>`);
   console.log(`    GET  /api/gh-pr-detail?cwd=<path>&number=<n>`);
   console.log(`    GET  /api/gh-pr-diff?cwd=<path>&number=<n>`);

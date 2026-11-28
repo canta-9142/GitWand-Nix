@@ -14,12 +14,19 @@
  * Ne JAMAIS imprimer la valeur brute d'un secret — uniquement `redactedExcerpt` (déjà masqué).
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  classifyHunkLine,
+  diffFileLineName,
+  hunkBodyFromHeader,
+  noHunkBody,
   parseGitwandrc,
+  DEFAULT_ENTROPY_THRESHOLD,
+  parseHunkHeader,
   scanSecrets,
+  type HunkBody,
   type ScanFileInput,
   type SecretFinding,
   type SecretsScanConfig,
@@ -28,22 +35,55 @@ import {
 import { c } from "../ui.js";
 import { findGitRoot } from "../llm-config.js";
 
-/** Matches the desktop default (useSettings.ts `secretsEntropyThreshold`). */
-const DEFAULT_ENTROPY_THRESHOLD = 4.0;
+/**
+ * The git to run without a shell. On Windows, `where git` can list a
+ * `git.cmd` wrapper before `git.exe`: the first `.exe` is taken, so a shim
+ * earlier on PATH does not stop the scan when the real executable is there.
+ */
+function gitExecutable(): string {
+  if (process.platform !== "win32") return "git";
+  try {
+    const found = execFileSync("where", ["git"], { encoding: "utf-8" })
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => /\.exe$/i.test(l));
+    return found ?? "git";
+  } catch {
+    return "git";
+  }
+}
 
 /**
- * Runs `git diff --cached --unified=0 --no-color`, tolerant on failure (returns "" if git is
- * unavailable or we're not in a repo — same tolerant style as `getConflictedFiles()`).
+ * The staged bytes as a patch, tolerant on failure (returns "" when we're not in a repo —
+ * same tolerant style as `getConflictedFiles()`), but `null` when the output was not seen
+ * (git not runnable, output over the buffer): a scan that saw nothing must not pass as clean. The user's patch
+ * config is pinned away as in the desktop backend (`PATCH_CONFIG` / `PATCH_FLAGS` in
+ * apps/desktop/src-tauri/src/git/cmd.rs): an external diff tool or colour codes would
+ * hide every added line, other prefixes would misname files, and textconv would scan a
+ * rendering instead of the staged content.
  */
-function getStagedDiff(cwd: string): string {
+function getStagedDiff(cwd: string): string | null {
   try {
-    return execSync("git diff --cached --unified=0 --no-color", {
-      encoding: "utf-8",
-      cwd,
-      maxBuffer: 1024 * 1024 * 32,
-    });
-  } catch {
-    return "";
+    return execFileSync(
+      gitExecutable(),
+      [
+        "-c", "core.quotePath=false",
+        "-c", "diff.noprefix=false",
+        "-c", "diff.mnemonicPrefix=false",
+        "-c", "diff.srcPrefix=a/",
+        "-c", "diff.dstPrefix=b/",
+        "-c", "diff.submodule=short",
+        "diff", "--cached", "--unified=0", "--no-textconv", "--no-color", "--no-ext-diff",
+      ],
+      { encoding: "utf-8", cwd, maxBuffer: 1024 * 1024 * 32 },
+    );
+  } catch (err) {
+    // git ran and exited non-zero (not a repository): nothing staged to scan.
+    // Anything else (git not found, output over maxBuffer, killed) means the
+    // staged changes were not seen at all.
+    const e = err as NodeJS.ErrnoException & { status?: number | null };
+    if (typeof e?.code !== "string" && typeof e?.status === "number" && e.status !== 0) return "";
+    return null;
   }
 }
 
@@ -65,23 +105,35 @@ export function extractStagedAddedLines(diffText: string): ScanFileInput[] {
     currentLines = [];
   }
 
+  // Remaining body of the current hunk, from its `@@` counts: inside it an added `++ token`
+  // is the line `+++ token`, a hunk line — neither dropped nor read as a `+++ b/<path>` header.
+  let body: HunkBody = noHunkBody();
+
   for (const line of diffText.split("\n")) {
-    if (line.startsWith("diff --git ")) {
+    const kind = classifyHunkLine(body, line);
+    if (kind) {
+      if (kind === "add") {
+        if (currentPath !== null) {
+          currentLines.push({ line: newLineNo, text: line.slice(1) });
+        }
+        newLineNo++;
+      }
+      // `-`-prefixed removed lines are irrelevant for the added-lines-only scan surface.
+    } else if (line.startsWith("diff --git ")) {
+      body = noHunkBody();
       flush();
     } else if (line.startsWith("+++ ")) {
-      // "+++ b/<path>" for a file with new-side content, "+++ /dev/null" for a deletion.
+      // "+++ b/<path>" for a file with new-side content, "+++ /dev/null" for a deletion;
+      // a name holding a space ends with a tab, an unusual one is C-quoted.
+      // One it cannot read still names the file as printed: scanned, never skipped.
       const rest = line.slice(4);
-      currentPath = rest === "/dev/null" ? null : rest.replace(/^b\//, "");
+      const raw = rest.endsWith("\t") ? rest.slice(0, -1) : rest;
+      currentPath = diffFileLineName(rest, "b/") ?? (raw === "/dev/null" ? null : raw);
     } else if (line.startsWith("@@")) {
-      const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-      newLineNo = match ? parseInt(match[1], 10) : 0;
-    } else if (line.startsWith("+") && !line.startsWith("+++")) {
-      if (currentPath !== null) {
-        currentLines.push({ line: newLineNo, text: line.slice(1) });
-      }
-      newLineNo++;
+      const range = parseHunkHeader(line);
+      newLineNo = range ? range.newStart : 0;
+      body = hunkBodyFromHeader(line);
     }
-    // `-`-prefixed removed lines are irrelevant for the added-lines-only scan surface.
   }
   flush();
 
@@ -139,6 +191,17 @@ export async function cmdScan(flags: Record<string, boolean | string>): Promise<
   const repoRoot = findGitRoot();
   const cwd = repoRoot ?? process.cwd();
   const diffText = getStagedDiff(cwd);
+  if (diffText === null) {
+    // On Windows a `git.cmd` / `git.bat` wrapper is not an executable git can
+    // be run as without a shell (and a shell would break the argv rule).
+    const message =
+      "git could not be run, or its output was too large: the staged changes could not be scanned " +
+      "(on Windows, put git.exe itself on PATH: a git.cmd wrapper is not run).";
+    if (isJson) console.log(JSON.stringify({ error: message, findings: [] }, null, 2));
+    else console.error(`${c.red}${message}${c.reset}`);
+    process.exitCode = 2;
+    return;
+  }
   const files = extractStagedAddedLines(diffText);
   const config = loadSecretsConfig(repoRoot);
 

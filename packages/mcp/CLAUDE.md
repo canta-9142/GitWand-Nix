@@ -28,9 +28,10 @@ src/
 | `gitwand_preview_merge` | Simuler un merge sans l'appliquer |
 | `gitwand_resolve_conflicts` | Résoudre les conflits d'un fichier ou de tout le repo |
 | `gitwand_explain_hunk` | DecisionTrace complet pour un hunk précis |
-| `gitwand_apply_resolution` | Appliquer une résolution fournie par l'agent à un hunk |
+| `gitwand_apply_resolution` | Appliquer une résolution fournie par l'agent à un hunk, sans validation (chaîne vide = supprimer le bloc) |
 | `gitwand_resolve_hunk` | v2.5 — inverser la boucle : GitWand demande à l'agent connecté de proposer la résolution (retourne un prompt structuré, l'agent répond `{resolution, reasoning}`) |
-| `gitwand_resolve_hunk_llm` | v2.5 — valider + appliquer une résolution proposée par un LLM (markers résiduels, syntaxe JSON/YAML, score) |
+| `gitwand_resolve_hunk_llm` | v2.5 — valider + appliquer une résolution proposée par un LLM (markers résiduels, syntaxe JSON/YAML/TOML via `validateMergedContent` du core, score ; chaîne vide = supprimer le bloc) |
+| `gitwand_create_issue` | #301 — créer une issue GitHub sur `origin` (ou le parent du fork si `origin` n'en prend pas) via `gh` ; aperçu par défaut, création seulement avec `dry_run: false` ; un motif de secret connu (`scanReportBody` du core) refuse l'envoi (`tools/create_issue.ts`) |
 
 ## Resources disponibles
 

@@ -1,8 +1,9 @@
 import { ref } from "vue";
 import { gitExec } from "../utils/backend";
 import { useAIProvider } from "./useAIProvider";
-import { localeLabels, type SupportedLocale } from "../locales";
+import { localeToAiLanguage } from "./prAiLocale";
 import { t } from "./useI18n";
+import { patchDiffArgs } from "../utils/patchArgs";
 
 /**
  * Generates a stash message from the current working-tree diff.
@@ -19,18 +20,8 @@ export interface StashMessageOptions {
   maxDiffChars?: number;
 }
 
-function localeToEnglishName(code: string): string {
-  const map: Record<string, string> = {
-    fr: "French", en: "English", es: "Spanish", de: "German",
-    it: "Italian", pt: "Portuguese", ja: "Japanese", ko: "Korean",
-    zh: "Chinese", nl: "Dutch", ru: "Russian", ar: "Arabic",
-    pl: "Polish", sv: "Swedish", da: "Danish", nb: "Norwegian",
-  };
-  return map[code] ?? localeLabels[code as SupportedLocale] ?? code;
-}
-
 function buildSystemPrompt(locale: string): string {
-  const lang = localeToEnglishName(locale);
+  const lang = localeToAiLanguage(locale);
   return `You are a senior software engineer writing a short stash label.
 
 A stash label is a one-line description of a work-in-progress change that will
@@ -99,7 +90,7 @@ export function useStashMessage() {
       let diffRes, statusRes;
       try {
         [diffRes, statusRes] = await Promise.all([
-          gitExec(cwd, ["diff", "HEAD", "--no-color"]),
+          gitExec(cwd, patchDiffArgs("HEAD")),
           gitExec(cwd, ["status", "--short"]),
         ]);
       } catch (execErr: unknown) {

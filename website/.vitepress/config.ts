@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
 import { extractFaq } from './seo'
 import { fileURLToPath } from 'node:url'
+import { applyAdventMeta, applyShareImage } from './advent-page'
 
 
 export default defineConfig({
@@ -26,6 +27,10 @@ export default defineConfig({
         // with no `pnpm --filter @gitwand/core build` step, so dist/ does not
         // exist in CI. Same reasoning as apps/desktop/vite.config.ts.
         '@gitwand/core': fileURLToPath(new URL('../../packages/core/src/index.ts', import.meta.url)),
+        // The advent calendar data is shared with the CLI (`gitwand advent`) and
+        // lives in packages/cli/src/advent, which imports nothing from Node, so
+        // the browser bundle can use it directly instead of a copy that drifts.
+        '@gitwand/advent': fileURLToPath(new URL('../../packages/cli/src/advent/index.ts', import.meta.url)),
       },
     },
     build: {
@@ -58,12 +63,12 @@ export default defineConfig({
     // Open Graph
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:site_name', content: 'GitWand' }],
-    ['meta', { property: 'og:image', content: 'https://gitwand.app/og-image.png' }],
+    // og:image / twitter:image are added per page in transformPageData: a global
+    // entry would sit next to a page-specific one and crawlers keep the first.
     ['meta', { property: 'og:image:width', content: '1200' }],
     ['meta', { property: 'og:image:height', content: '630' }],
     // Twitter / X
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-    ['meta', { name: 'twitter:image', content: 'https://gitwand.app/og-image.png' }],
     // Misc
     ['meta', { name: 'theme-color', content: '#0d0f1a' }],
     // Google Search Console verification
@@ -164,11 +169,16 @@ export default defineConfig({
       ([tag, attrs]: [string, Record<string, string>]) => tag === 'link' && attrs?.rel === 'canonical'
     )
 
+    // Advent title/description/share image come from DOORS, before the canonical
+    // block and the structured data read them; every page then gets its share
+    // image (the global head entries are gone).
+    applyAdventMeta(pageData)
+    applyShareImage(pageData)
+
     const canonicalUrl = `https://gitwand.app/${pageData.relativePath}`
       .replace(/\/?index\.md$/, '/')
       .replace(/\.md$/, '')
 
-    pageData.frontmatter.head ??= []
     // A page that already declares its own canonical (a post cross-posted from
     // elsewhere, pointing back at the original) keeps it — but it still gets the
     // structured data below. An earlier version of this returned here, which
@@ -351,6 +361,14 @@ export default defineConfig({
           text: 'Blog',
           items: [
             { text: 'All articles', link: '/blog/' },
+            { text: 'Connecting GitWand MCP to your agent', link: '/blog/gitwand-mcp-setup' },
+            { text: 'Parallel AI agents with worktrees', link: '/blog/parallel-ai-agents-git-worktrees' },
+            { text: 'Lockfile conflicts, per ecosystem', link: '/blog/lockfile-conflicts-by-ecosystem' },
+            { text: 'AI agents and conflicts: the rules', link: '/blog/ai-agent-conflict-rules' },
+            { text: 'Git worktrees, step by step (v3.13)', link: '/blog/worktrees-step-by-step' },
+            { text: 'Rebase or merge: fewer conflicts?', link: '/blog/rebase-vs-merge-conflicts' },
+            { text: 'Trivial conflicts: a taxonomy', link: '/blog/trivial-conflicts-taxonomy' },
+            { text: 'Reading a Git conflict marker', link: '/blog/reading-git-conflict-markers' },
             { text: 'Three outcomes, not two (v3.11)', link: '/blog/v3-11-three-outcomes-not-two' },
             { text: 'What WebMCP is, and the first Git tool on it', link: '/blog/webmcp-gitwand-merge-room' },
             { text: 'Best Git GUI clients in 2026', link: '/blog/best-git-gui-clients-2026' },
